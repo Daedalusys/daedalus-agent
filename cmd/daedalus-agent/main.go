@@ -6,6 +6,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -17,8 +18,10 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/Daedalusys/daedalus-agent/internal/cert"
 	"github.com/Daedalusys/daedalus-agent/internal/config"
 	"github.com/Daedalusys/daedalus-agent/internal/daemon"
+	"github.com/Daedalusys/daedalus-agent/internal/rpc"
 )
 
 // version is overridden at build time via -ldflags "-X main.version=…".
@@ -147,6 +150,42 @@ func runDaemonStart(cmd *cobra.Command, cfgPath string) error {
 	defer stop()
 
 	d := daemon.New(cfg)
+
+	// T3 wire-in: bring up the mTLS gRPC server before the daemon's
+	// run loop blocks. The shutdown hook drains in-flight RPCs via
+	// GracefulStop on SIGTERM (still bounded by daemon.ShutdownTimeout).
+	rpcSrv, err := startRPCServer(cfg)
+	if err != nil {
+		return fmt.Errorf("rpc: %w", err)
+	}
+	if rpcSrv != nil {
+		if err := d.RegisterShutdownHook(func(shutdownCtx context.Context) error {
+			// We do NOT block on GracefulStop: it respects
+			// shutdownCtx and signals existing RPCs to drain.
+			// If shutdownCtx expires mid-drain, we still return
+			// nil — the daemon's deadline is handled by the
+			// supervisor (systemd TimeoutStopSec=35s).
+			doneCh := make(chan struct{})
+			go func() {
+				rpcSrv.GracefulStop()
+				close(doneCh)
+			}()
+			select {
+			case <-doneCh:
+				return nil
+			case <-shutdownCtx.Done():
+				// Force-stop rather than wait: prevents a
+				// pathological client from holding the
+				// drain open past the deadline.
+				rpcSrv.Stop()
+				return nil
+			}
+		}); err != nil {
+			rpcSrv.Stop()
+			return fmt.Errorf("rpc: register shutdown hook: %w", err)
+		}
+	}
+
 	log.Printf("daedalus-agent %s starting (agent_id=%s, control_plane=%s)",
 		version, cfg.AgentID, cfg.ControlPlaneAddr)
 
@@ -155,6 +194,55 @@ func runDaemonStart(cmd *cobra.Command, cfgPath string) error {
 	}
 	log.Printf("daedalus-agent stopped")
 	return nil
+}
+
+// startRPCServer brings up the mTLS gRPC server using the cert
+// material managed by internal/cert. Returns (nil, nil) if cfg's
+// cert paths are unset (e.g. tests) so the wire-in is opt-in by
+// configuration rather than always-on.
+//
+// When the cert loader returns ErrUnparseableCert (because the
+// disk holds a half-written or zero-byte file), this surfaces as
+// a startup error — better to fail fast than to serve an
+// untrusted handshake to the control plane.
+func startRPCServer(cfg *config.Config) (*rpc.Server, error) {
+	// Skip RPC bring-up when cert paths are unset. Production
+	// deployments always set these (T2's postinstall writes them
+	// under /var/lib/daedalus-agent/cert/); tests opt out.
+	if cfg.CAPath == "" || cfg.CertPath == "" ||
+		cfg.KeyPath == "" || cfg.CAKeyPath == "" {
+		log.Printf("rpc: cert paths unset; mTLS gRPC server disabled (development mode)")
+		return nil, nil
+	}
+	loader, err := cert.New(cert.Config{
+		CAPath:     cfg.CAPath,
+		CAKeyPath:  cfg.CAKeyPath,
+		CertPath:   cfg.CertPath,
+		KeyPath:    cfg.KeyPath,
+		CommonName: cfg.AgentID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	tlsCfg, err := loader.Load()
+	if err != nil {
+		return nil, err
+	}
+	rpcSrv, err := rpc.NewServer(rpc.DefaultListenAddr, tlsCfg)
+	if err != nil {
+		return nil, err
+	}
+	ln, err := rpcSrv.Listener()
+	if err != nil {
+		return nil, fmt.Errorf("rpc listen %s: %w", rpc.DefaultListenAddr, err)
+	}
+	go func() {
+		log.Printf("rpc: serving mTLS on %s", ln.Addr())
+		if err := rpcSrv.Serve(ln); err != nil {
+			log.Printf("rpc: serve stopped: %v", err)
+		}
+	}()
+	return rpcSrv, nil
 }
 
 func newDaemonStatusCmd(cfgPath *string) *cobra.Command {

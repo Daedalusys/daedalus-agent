@@ -14,6 +14,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -29,12 +30,34 @@ var (
 	// ErrNotRunning is returned when Stop is called while the daemon
 	// is in StateStopped (or after it has shut down).
 	ErrNotRunning = errors.New("daemon: not running")
+
+	// ErrHookAlreadyStarted is returned by RegisterShutdownHook
+	// when called after the daemon has begun running (or
+	// completed a Start). Hooks must be installed before the
+	// run loop begins, mirroring the "construct → start" idiom.
+	ErrHookAlreadyStarted = errors.New("daemon: hooks may only be registered before Start")
 )
 
 // ShutdownTimeout bounds the graceful shutdown window. Once a shutdown
 // is initiated (via Stop or context cancellation), the daemon has this
 // long to drain in-flight work before returning.
 const ShutdownTimeout = 30 * time.Second
+
+// ShutdownHook is the contract for code that wants to participate
+// in graceful daemon shutdown.
+//
+// The ctx passed to a hook is bounded by ShutdownTimeout (30s); a
+// well-behaved hook watches ctx.Done() to bound its own work. Errors
+// are surfaced to Start()'s return value; subsequent hooks still
+// run — the daemon runs ALL hooks even if one fails, so a stuck
+// cert writer cannot prevent the gRPC server from closing.
+//
+// Hooks are called in REVERSE registration order (LIFO). This
+// mirrors the standard "teardown unwinds init" pattern: the most
+// recently added resource (e.g. the gRPC server added right before
+// daemon.Start) gets drained first, freeing the resource it
+// depended on next (e.g. the cert loader).
+type ShutdownHook func(ctx context.Context) error
 
 // State represents the lifecycle state of the daemon.
 type State int32
@@ -90,6 +113,12 @@ type Daemon struct {
 	// finished is true once finishShutdown has run. After this the
 	// Daemon is dead and Start will refuse with ErrAlreadyStarted.
 	finished bool
+
+	// shutdownHooks are the registered ShutdownHook funcs. Run in
+	// LIFO order during gracefulShutdown. Mutable only via
+	// RegisterShutdownHook (which itself requires the daemon be
+	// in StateStopped).
+	shutdownHooks []ShutdownHook
 }
 
 // New constructs a Daemon in the StateStopped state, ready for Start.
@@ -113,6 +142,33 @@ func (d *Daemon) State() State {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.state
+}
+
+// RegisterShutdownHook installs hook to run during graceful
+// shutdown. Hooks execute in LIFO order (the most recently
+// registered runs first), so callers should register them in the
+// same order they would construct dependencies: construction
+// goes root → leaf, teardown goes leaf → root.
+//
+// Calling RegisterShutdownHook after the daemon has begun Start
+// returns ErrHookAlreadyStarted; hooks can only be installed
+// before the run loop is entered. This is a guard against race
+// conditions where a hook could fire mid-shutdown while another
+// goroutine is mid-Register.
+//
+// Returns nil on success. (ErrHookAlreadyStarted is the only
+// error path; documented explicitly so callers can errors.Is.)
+func (d *Daemon) RegisterShutdownHook(hook ShutdownHook) error {
+	if hook == nil {
+		return errors.New("daemon: nil hook")
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.state != StateStopped {
+		return ErrHookAlreadyStarted
+	}
+	d.shutdownHooks = append(d.shutdownHooks, hook)
+	return nil
 }
 
 // Start runs the daemon's main loop.
@@ -186,14 +242,26 @@ func (d *Daemon) finishShutdown() {
 	close(d.done)
 }
 
-// gracefulShutdown runs the shutdown hooks. T1 is a no-op because there
-// is no real work to drain; T3 will hook in here for mTLS connection
-// draining, T5 for in-flight RPC draining.
+// gracefulShutdown runs the registered shutdown hooks in LIFO order.
+// All hooks run regardless of individual errors so a single failing
+// hook cannot leave later hooks orphaned. Errors are aggregated and
+// the first non-nil is returned; subsequent errors are joined.
 //
-// The ctx is bounded by ShutdownTimeout (30s); shutdown hooks should
-// honour it. Errors are returned to the Start caller.
+// The ctx is bounded by ShutdownTimeout (30s); hooks should honour it.
 func (d *Daemon) gracefulShutdown(ctx context.Context) error {
-	// Skeleton: nothing to drain. T3+ will register hooks here.
-	_ = ctx
+	d.mu.Lock()
+	hooks := make([]ShutdownHook, len(d.shutdownHooks))
+	copy(hooks, d.shutdownHooks)
+	d.mu.Unlock()
+
+	var errs []error
+	for i := len(hooks) - 1; i >= 0; i-- {
+		if err := hooks[i](ctx); err != nil {
+			errs = append(errs, fmt.Errorf("hook[%d]: %w", i, err))
+		}
+	}
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
 	return nil
 }

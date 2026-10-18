@@ -25,6 +25,7 @@ type Config struct {
 	CertPath         string `yaml:"cert_path"`
 	KeyPath          string `yaml:"key_path"`
 	CAPath           string `yaml:"ca_path"`
+	CAKeyPath        string `yaml:"ca_key_path"`
 	DataDir          string `yaml:"data_dir"`
 	AuditDir         string `yaml:"audit_dir"`
 }
@@ -98,6 +99,7 @@ func (c *Config) ResolveDirs(baseDir string) {
 	c.CertPath = resolvePath(c.CertPath, baseDir)
 	c.KeyPath = resolvePath(c.KeyPath, baseDir)
 	c.CAPath = resolvePath(c.CAPath, baseDir)
+	c.CAKeyPath = resolvePath(c.CAKeyPath, baseDir)
 }
 
 func resolvePath(p, base string) string {
