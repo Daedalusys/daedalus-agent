@@ -22,6 +22,7 @@ import (
 	"github.com/Daedalusys/daedalus-agent/internal/config"
 	"github.com/Daedalusys/daedalus-agent/internal/daemon"
 	"github.com/Daedalusys/daedalus-agent/internal/rpc"
+	"github.com/Daedalusys/daedalus-agent/internal/snapshot"
 )
 
 // version is overridden at build time via -ldflags "-X main.version=…".
@@ -228,7 +229,15 @@ func startRPCServer(cfg *config.Config) (*rpc.Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	rpcSrv, err := rpc.NewServer(rpc.DefaultListenAddr, tlsCfg)
+	info, err := cert.LoaderInfo(loader)
+	if err != nil {
+		return nil, fmt.Errorf("cert info: %w", err)
+	}
+	rpcSrv, err := rpc.NewServer(rpc.DefaultListenAddr, tlsCfg, rpc.ServiceDeps{
+		Cfg:      cfg,
+		CertInfo: info,
+		Snapshot: snapshot.NewDetector(),
+	})
 	if err != nil {
 		return nil, err
 	}

@@ -109,7 +109,7 @@ func TestServer_TLSHandshake_SucceedsWithMutualTLS(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = listener.Close() })
 
-	srv, err := rpc.NewServer(listener.Addr().String(), tlsCfg)
+	srv, err := rpc.NewServer(listener.Addr().String(), tlsCfg, rpc.ServiceDeps{})
 	if err != nil {
 		t.Fatalf("rpc.NewServer: %v", err)
 	}
@@ -190,7 +190,7 @@ func TestServer_ExpiredCertReturnsClearError(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = listener.Close() })
 
-	srv, err := rpc.NewServer(listener.Addr().String(), tlsCfg)
+	srv, err := rpc.NewServer(listener.Addr().String(), tlsCfg, rpc.ServiceDeps{})
 	if err != nil {
 		t.Fatalf("rpc.NewServer: %v", err)
 	}
@@ -264,7 +264,7 @@ func TestServer_GRPCWithoutClientCert_Rejected(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = listener.Close() })
 
-	srv, err := rpc.NewServer(listener.Addr().String(), loaderCfg)
+	srv, err := rpc.NewServer(listener.Addr().String(), loaderCfg, rpc.ServiceDeps{})
 	if err != nil {
 		t.Fatalf("rpc.NewServer: %v", err)
 	}
@@ -307,7 +307,7 @@ func TestNewServer_NilTLSConfig_ReturnsError(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = listener.Close() })
 
-	_, err = rpc.NewServer(listener.Addr().String(), nil)
+	_, err = rpc.NewServer(listener.Addr().String(), nil, rpc.ServiceDeps{})
 	if err == nil {
 		t.Fatal("NewServer accepted nil TLS config; want error")
 	}

@@ -1,24 +1,9 @@
 // Package rpc owns the daedalus-agent gRPC server.
 //
-// The server is a thin shell: it accepts a listener address and a
-// *tls.Config, registers the unimplemented AgentService stub (T5
-// will graft the real handlers on), and exposes the standard
+// The server is a thin shell: it accepts a listener address, a
+// *tls.Config, and a ServiceDeps bundle; registers the
+// agentService implementation; and exposes the standard
 // grpc.Server lifecycle (Serve / GracefulStop / Stop).
-//
-// T3 does NOT implement Register / Heartbeat / ApplyIntent /
-// SnapshotRequest / ReportStatus handlers; those are T5 work.
-// T3's job is the wire-protocol scaffolding:
-//
-//   - mTLS server (RequireAndVerifyClientCert).
-//   - Listener bound to :9443 (configurable via Config).
-//   - GracefulStop wired into the daemon's lifecycle.
-//
-// Spec refs:
-//
-//   - §4.4 wire protocol, transport mTLS.
-//   - §7.3 C3 cert lifecycle, validated by the embedded cert
-//     package; this package only consumes the resulting
-//     *tls.Config.
 //
 // Why a separate package rather than folding into internal/daemon:
 // gRPC has its own opinions about graceful shutdown that we want
@@ -36,6 +21,10 @@ import (
 	"google.golang.org/grpc/credentials"
 
 	agentv1 "github.com/Daedalusys/daedalus-sdk/proto/agent/v1"
+
+	"github.com/Daedalusys/daedalus-agent/internal/cert"
+	"github.com/Daedalusys/daedalus-agent/internal/config"
+	"github.com/Daedalusys/daedalus-agent/internal/snapshot"
 )
 
 // DefaultListenAddr is the port the gRPC server binds to. The
@@ -43,10 +32,37 @@ import (
 // tests and the systemd unit agree on one source of truth.
 const DefaultListenAddr = ":9443"
 
+// ServiceDeps bundles the dependencies the agentService needs.
+// All three fields are required for a production server; tests
+// can pass nil for CertInfo (no cert metadata in Register
+// responses) and a stub snapshot.Detector (force a specific
+// capability via SetCapability).
+//
+// Cfg, CertInfo and Snapshot are retained by reference — the
+// caller must not mutate them after passing them in.
+type ServiceDeps struct {
+	// Cfg is the daemon's runtime config. The Register handler
+	// reads agent_id from here. nil is permitted only in tests
+	// that don't reach Register; production always supplies a
+	// non-nil cfg.
+	Cfg *config.Config
+
+	// CertInfo carries the cert's NotAfter + SHA-256
+	// fingerprint for the Register response. nil is permitted
+	// (Register then emits CertValidUntilUnix=0 and an empty
+	// fingerprint).
+	CertInfo *cert.Info
+
+	// Snapshot is the agent's snapshot-capability probe.
+	// nil is treated as a fresh, empty cache (first
+	// Capability() call probes the host).
+	Snapshot *snapshot.Detector
+}
+
 // Server wraps a *grpc.Server with the daedalus-agent defaults
 // already wired in: TLS credentials from the supplied *tls.Config
 // (which the cert.Loader populates from PEM files) and the
-// AgentService stub registered as the handler.
+// AgentService implementation registered as the handler.
 //
 // Server is safe to call Serve / GracefulStop / Stop from any
 // goroutine; the underlying grpc.Server serialises these.
@@ -61,23 +77,26 @@ type Server struct {
 // function does NOT add defaults — the cert.Loader is the source
 // of truth for mTLS posture.
 //
-// The AgentService stub is registered immediately. At T5 the
-// caller may replace the stub by adding a real handler alongside
-// (RegisterAgentServiceServer panics if called twice, so the
-// production wiring is "register the real handler in main, no
-// stub"). For T3 the stub exists so a freshly-built agent can
-// answer gRPC health checks or be probed for liveness even before
-// T5 lands.
-func NewServer(addr string, tlsCfg *tls.Config) (*Server, error) {
+// The agentService implementation is registered immediately
+// against the gRPC server. At T5 the production wiring is
+// "construct the deps, call NewServer, no further registration
+// needed"; tests that want to drive a specific snapshot
+// capability pre-load it via detector.SetCapability before
+// calling NewServer.
+func NewServer(addr string, tlsCfg *tls.Config, deps ServiceDeps) (*Server, error) {
 	if addr == "" {
 		addr = DefaultListenAddr
 	}
 	if tlsCfg == nil {
 		return nil, fmt.Errorf("rpc: tls config is required")
 	}
+	det := deps.Snapshot
+	if det == nil {
+		det = snapshot.NewDetector()
+	}
 	creds := credentials.NewTLS(tlsCfg)
 	gs := grpc.NewServer(grpc.Creds(creds))
-	agentv1.RegisterAgentServiceServer(gs, &agentService{})
+	agentv1.RegisterAgentServiceServer(gs, newAgentService(deps.Cfg, deps.CertInfo, det))
 	return &Server{grpc: gs, addr: addr}, nil
 }
 
