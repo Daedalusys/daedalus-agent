@@ -6,7 +6,6 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -89,11 +88,26 @@ func loadConfig(path string) (*config.Config, error) {
 }
 
 // --- daemon subcommand tree -------------------------------------------------
+//
+// `daemon` with no subcommand defaults to `start` (per the brief:
+// "start (后台跑, 默认)"). Both the explicit `daemon start` and the
+// bare `daemon` invocation route through runDaemonStart so the body
+// is single-sourced.
+//
+// Bare `daedalus-agent` (no subcommand) does NOT auto-start the
+// daemon: it prints help. Auto-starting a fleet agent on bare
+// invocation is a production-surprise hazard ("I just typed --help
+// and now my agent is running"), so the operator must opt in to
+// `daemon` explicitly.
 
 func newDaemonCmd(cfgPath *string) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "daemon",
-		Short: "Run the long-lived daemon",
+		Short: "Run the long-lived daemon (default subcommand: start)",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runDaemonStart(cmd, *cfgPath)
+		},
+		SilenceUsage: true,
 	}
 	cmd.AddCommand(newDaemonStartCmd(cfgPath))
 	cmd.AddCommand(newDaemonStatusCmd(cfgPath))
@@ -105,28 +119,37 @@ func newDaemonStartCmd(cfgPath *string) *cobra.Command {
 		Use:   "start",
 		Short: "Start the daemon (default subcommand under daemon)",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, err := loadConfig(*cfgPath)
-			if err != nil {
-				return err
-			}
-
-			// SIGINT/SIGTERM cancel the parent context; the daemon
-			// then has up to ShutdownTimeout to drain.
-			ctx, stop := signal.NotifyContext(cmd.Context(),
-				syscall.SIGINT, syscall.SIGTERM)
-			defer stop()
-
-			d := daemon.New(cfg)
-			log.Printf("daedalus-agent %s starting (agent_id=%s, control_plane=%s)",
-				version, cfg.AgentID, cfg.ControlPlaneAddr)
-
-			if err := d.Start(ctx); err != nil {
-				return fmt.Errorf("daemon: %w", err)
-			}
-			log.Printf("daedalus-agent stopped")
-			return nil
+			return runDaemonStart(cmd, *cfgPath)
 		},
 	}
+}
+
+// runDaemonStart holds the body of the `daemon start` subcommand.
+// It is invoked by both newDaemonStartCmd (when the user types
+// `daemon start` explicitly) and newDaemonCmd (when the user types
+// `daemon` with no subcommand, per the brief's "default" clause).
+// Single-sourcing the body prevents the two paths from drifting.
+func runDaemonStart(cmd *cobra.Command, cfgPath string) error {
+	cfg, err := loadConfig(cfgPath)
+	if err != nil {
+		return err
+	}
+
+	// SIGINT/SIGTERM cancel the parent context; the daemon then has
+	// up to ShutdownTimeout to drain.
+	ctx, stop := signal.NotifyContext(cmd.Context(),
+		syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	d := daemon.New(cfg)
+	log.Printf("daedalus-agent %s starting (agent_id=%s, control_plane=%s)",
+		version, cfg.AgentID, cfg.ControlPlaneAddr)
+
+	if err := d.Start(ctx); err != nil {
+		return fmt.Errorf("daemon: %w", err)
+	}
+	log.Printf("daedalus-agent stopped")
+	return nil
 }
 
 func newDaemonStatusCmd(cfgPath *string) *cobra.Command {
@@ -228,6 +251,3 @@ func newReportCmd(cfgPath *string) *cobra.Command {
 func errNotImplemented(cmd, task string) error {
 	return errors.New(cmd + ": not implemented (planned for " + task + ")")
 }
-
-// unused import guard for context (kept for the signal-driven lifecycle).
-var _ = context.Background
