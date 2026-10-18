@@ -1,0 +1,233 @@
+// Command daedalus-agent runs on each Daedalus fleet node. It accepts
+// mTLS gRPC commands from the control plane: Register, ApplyIntent,
+// ReportStatus, and friends. The agent is the entry-ticket product
+// for the P0.5 fleet control plane; it is superseded by daedalus-atomic
+// once per-node migration completes.
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"syscall"
+	"time"
+
+	"github.com/spf13/cobra"
+
+	"github.com/Daedalusys/daedalus-agent/internal/config"
+	"github.com/Daedalusys/daedalus-agent/internal/daemon"
+)
+
+// version is overridden at build time via -ldflags "-X main.version=…".
+// Default value is the in-tree development version.
+var version = "0.1.0-dev"
+
+// ShutdownTimeout bounds the signal-triggered graceful shutdown. It is
+// larger than daemon.ShutdownTimeout so signal handling has headroom
+// over the daemon's own internal drain window.
+const ShutdownTimeout = 35 * time.Second
+
+func main() {
+	if err := newRootCmd().Execute(); err != nil {
+		log.SetOutput(os.Stderr)
+		log.Print(err)
+		os.Exit(1)
+	}
+}
+
+func newRootCmd() *cobra.Command {
+	var cfgPath string
+
+	root := &cobra.Command{
+		Use:   "daedalus-agent",
+		Short: "Daedalus fleet agent — runs on each node, accepts control-plane RPCs",
+		Long: `daedalus-agent is the entry-ticket agent for the Daedalus fleet control plane.
+It registers with the control plane, applies intents, and reports status
+over mTLS gRPC. Once the fleet transitions to daedalus-atomic, the agent
+is retired in favor of the atomic-aware runtime.`,
+		SilenceUsage:  true,
+		SilenceErrors: true,
+	}
+
+	root.PersistentFlags().StringVar(&cfgPath, "config", "",
+		"path to YAML config file (default: built-in defaults)")
+
+	root.AddCommand(newDaemonCmd(&cfgPath))
+	root.AddCommand(newVersionCmd())
+	root.AddCommand(newRegisterCmd(&cfgPath))
+	root.AddCommand(newApplyCmd(&cfgPath))
+	root.AddCommand(newReportCmd(&cfgPath))
+
+	return root
+}
+
+// loadConfig reads and validates the config. On error it wraps the
+// underlying message with a clear hint about which flag is responsible.
+func loadConfig(path string) (*config.Config, error) {
+	cfg, err := config.Load(path)
+	if err != nil {
+		return nil, fmt.Errorf("--config=%q: %w", path, err)
+	}
+	// Resolve relative paths against the config file's directory so
+	// that operators can ship a single config file with relative
+	// cert/data paths. An empty path falls back to current dir.
+	if path != "" {
+		base := filepath.Dir(path)
+		if base == "" || base == "." {
+			base, _ = os.Getwd()
+		}
+		cfg.ResolveDirs(base)
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
+	return cfg, nil
+}
+
+// --- daemon subcommand tree -------------------------------------------------
+
+func newDaemonCmd(cfgPath *string) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "daemon",
+		Short: "Run the long-lived daemon",
+	}
+	cmd.AddCommand(newDaemonStartCmd(cfgPath))
+	cmd.AddCommand(newDaemonStatusCmd(cfgPath))
+	return cmd
+}
+
+func newDaemonStartCmd(cfgPath *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "start",
+		Short: "Start the daemon (default subcommand under daemon)",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cfg, err := loadConfig(*cfgPath)
+			if err != nil {
+				return err
+			}
+
+			// SIGINT/SIGTERM cancel the parent context; the daemon
+			// then has up to ShutdownTimeout to drain.
+			ctx, stop := signal.NotifyContext(cmd.Context(),
+				syscall.SIGINT, syscall.SIGTERM)
+			defer stop()
+
+			d := daemon.New(cfg)
+			log.Printf("daedalus-agent %s starting (agent_id=%s, control_plane=%s)",
+				version, cfg.AgentID, cfg.ControlPlaneAddr)
+
+			if err := d.Start(ctx); err != nil {
+				return fmt.Errorf("daemon: %w", err)
+			}
+			log.Printf("daedalus-agent stopped")
+			return nil
+		},
+	}
+}
+
+func newDaemonStatusCmd(cfgPath *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "status",
+		Short: "Print daemon status",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			cfg, err := loadConfig(*cfgPath)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("daedalus-agent %s\n", version)
+			fmt.Printf("  agent_id:           %s\n", cfg.AgentID)
+			fmt.Printf("  control_plane_addr: %s\n", cfg.ControlPlaneAddr)
+			fmt.Printf("  data_dir:           %s\n", cfg.DataDir)
+			fmt.Printf("  audit_dir:          %s\n", cfg.AuditDir)
+			// T1 skeleton has no supervisor query path yet; the
+			// local process state is the closest proxy. Once T3
+			// wires the gRPC server, status will consult it.
+			fmt.Printf("  local_state:        %s\n", daemon.StateRunning)
+			return nil
+		},
+	}
+}
+
+// --- version subcommand -----------------------------------------------------
+
+func newVersionCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "version",
+		Short: "Print version and exit",
+		Run: func(_ *cobra.Command, _ []string) {
+			fmt.Printf("daedalus-agent %s\n", version)
+		},
+	}
+}
+
+// --- RPC client stubs -------------------------------------------------------
+//
+// These three subcommands exist to exercise the gRPC client wiring in T3
+// and the RPC handler paths in T5. For T1 they print a clear
+// not-implemented message and exit non-zero, after loading the config so
+// the wiring is exercised end-to-end.
+
+func newRegisterCmd(cfgPath *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "register",
+		Short: "Manually invoke Register against the control plane",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			cfg, err := loadConfig(*cfgPath)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(os.Stderr,
+				"register: not yet implemented (T5 will add this RPC); would dial %s as %s\n",
+				cfg.ControlPlaneAddr, cfg.AgentID)
+			return errNotImplemented("register", "T5")
+		},
+	}
+}
+
+func newApplyCmd(cfgPath *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "apply",
+		Short: "Manually invoke ApplyIntent against the control plane",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			cfg, err := loadConfig(*cfgPath)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(os.Stderr,
+				"apply: not yet implemented (T5 will add this RPC); would dial %s as %s\n",
+				cfg.ControlPlaneAddr, cfg.AgentID)
+			return errNotImplemented("apply", "T5")
+		},
+	}
+}
+
+func newReportCmd(cfgPath *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "report",
+		Short: "Manually invoke ReportStatus against the control plane",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			cfg, err := loadConfig(*cfgPath)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(os.Stderr,
+				"report: not yet implemented (T5 will add this RPC); would dial %s as %s\n",
+				cfg.ControlPlaneAddr, cfg.AgentID)
+			return errNotImplemented("report", "T5")
+		},
+	}
+}
+
+// errNotImplemented returns a sentinel-shaped error that callers can
+// errors.Is against once a real implementation lands. The task name
+// tells the operator which task will close the gap.
+func errNotImplemented(cmd, task string) error {
+	return errors.New(cmd + ": not implemented (planned for " + task + ")")
+}
+
+// unused import guard for context (kept for the signal-driven lifecycle).
+var _ = context.Background
