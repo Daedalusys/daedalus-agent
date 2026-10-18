@@ -66,8 +66,13 @@ is retired in favor of the atomic-aware runtime.`,
 
 // loadConfig reads and validates the config. On error it wraps the
 // underlying message with a clear hint about which flag is responsible.
+//
+// Loader precedence (T2): env vars (DAEDALUS_AGENT_*) beat YAML beat
+// built-in defaults. This lets ops override a single field without
+// editing /etc/daedalus-agent/config.yaml — see internal/config
+// loader.go for the exact mapping.
 func loadConfig(path string) (*config.Config, error) {
-	cfg, err := config.Load(path)
+	cfg, err := config.LoadWithEnvOverride(path)
 	if err != nil {
 		return nil, fmt.Errorf("--config=%q: %w", path, err)
 	}
