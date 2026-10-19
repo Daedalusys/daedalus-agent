@@ -20,7 +20,7 @@
 //     events + final_seq=0. Matches the T5 stub's wire
 //     shape so clients don't see a regression.
 //   - since_audit_seq >= current tip: return empty events
-//     + final_seq = current tip. (The client is caught up.)
+//   + final_seq = current tip. (The client is caught up.)
 //   - max_events == 0: no cap. T7 returns everything > since.
 //
 // Concurrency: the audit chain is safe for concurrent reads
