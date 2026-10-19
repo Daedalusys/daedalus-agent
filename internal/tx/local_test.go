@@ -15,17 +15,28 @@
 // The tests cover each path with a recording mock backend and
 // a recording apply spy, so an assertion failure pinpoints the
 // exact (call-count, error) tuple the tx surfaced.
+//
+// T7 (this task) also adds: the new `auditLog *audit.Local`
+// parameter on tx.New. All existing paths are exercised with
+// `auditLog=nil` so the test does not have to set up a chain
+// file; a dedicated test (TestLocal_AuditEmitsOnSuccess /
+// Failure / RollbackFailed) drives a real audit.Local via
+// t.TempDir() and asserts the audit chain received the
+// expected event.
 package tx
 
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 
 	agentv1 "github.com/Daedalusys/daedalus-sdk/proto/agent/v1"
+
+	"github.com/Daedalusys/daedalus-agent/internal/audit"
 )
 
 // txMockBackend is a minimal Backend for tx-level tests. Each
@@ -102,7 +113,7 @@ func TestLocal_Run_Success(t *testing.T) {
 	backend := &txMockBackend{}
 	apply := &txSpyApply{}
 	audit := new(atomic.Uint64)
-	tx := New(backend, apply.Fn, t.TempDir(), audit)
+	tx := New(backend, apply.Fn, t.TempDir(), audit, nil)
 
 	resp, err := tx.Run(context.Background(), sampleIntent())
 	if err != nil {
@@ -139,7 +150,7 @@ func TestLocal_Run_PreSnapshotError_AppliesNotCalled(t *testing.T) {
 	backend := &txMockBackend{createErr: errors.New("simulated no snapshot backend")}
 	apply := &txSpyApply{}
 	audit := new(atomic.Uint64)
-	tx := New(backend, apply.Fn, t.TempDir(), audit)
+	tx := New(backend, apply.Fn, t.TempDir(), audit, nil)
 
 	resp, err := tx.Run(context.Background(), sampleIntent())
 	if err != nil {
@@ -172,7 +183,7 @@ func TestLocal_Run_ApplyError_RollbackSucceeds(t *testing.T) {
 	backend := &txMockBackend{}
 	apply := &txSpyApply{err: errors.New("apply failed: package not signed")}
 	audit := new(atomic.Uint64)
-	tx := New(backend, apply.Fn, t.TempDir(), audit)
+	tx := New(backend, apply.Fn, t.TempDir(), audit, nil)
 
 	resp, err := tx.Run(context.Background(), sampleIntent())
 	if err != nil {
@@ -205,7 +216,7 @@ func TestLocal_Run_ApplyError_RollbackFails_PersistentFailure(t *testing.T) {
 	}
 	apply := &txSpyApply{err: errors.New("apply failed: checksum mismatch")}
 	audit := new(atomic.Uint64)
-	tx := New(backend, apply.Fn, t.TempDir(), audit)
+	tx := New(backend, apply.Fn, t.TempDir(), audit, nil)
 
 	resp, err := tx.Run(context.Background(), sampleIntent())
 	if err != nil {
@@ -232,7 +243,7 @@ func TestLocal_Run_ApplyError_RollbackFails_PersistentFailure(t *testing.T) {
 func TestLocal_Run_NilIntent_Errors(t *testing.T) {
 	backend := &txMockBackend{}
 	apply := &txSpyApply{}
-	tx := New(backend, apply.Fn, t.TempDir(), nil)
+	tx := New(backend, apply.Fn, t.TempDir(), nil, nil)
 
 	_, err := tx.Run(context.Background(), nil)
 	if err == nil {
@@ -254,7 +265,7 @@ func TestLocal_Run_AuditSeqIncrementing(t *testing.T) {
 	backend := &txMockBackend{}
 	apply := &txSpyApply{}
 	audit := new(atomic.Uint64)
-	tx := New(backend, apply.Fn, t.TempDir(), audit)
+	tx := New(backend, apply.Fn, t.TempDir(), audit, nil)
 
 	r1, _ := tx.Run(context.Background(), sampleIntent())
 	if r1.AuditSeq != 1 {
@@ -272,7 +283,7 @@ func TestLocal_Run_AuditSeqIncrementing(t *testing.T) {
 func TestLocal_NilAuditSeq_UsesPrivateCounter(t *testing.T) {
 	backend := &txMockBackend{}
 	apply := &txSpyApply{}
-	tx := New(backend, apply.Fn, t.TempDir(), nil)
+	tx := New(backend, apply.Fn, t.TempDir(), nil, nil)
 
 	resp, err := tx.Run(context.Background(), sampleIntent())
 	if err != nil {
@@ -292,17 +303,186 @@ func TestLocal_PathsBuildFromDataDir(t *testing.T) {
 	backend := &txMockBackend{}
 	apply := &txSpyApply{}
 	dir := t.TempDir()
-	tx := New(backend, apply.Fn, dir, nil)
+	tx := New(backend, apply.Fn, dir, nil, nil)
 
 	if _, err := tx.Run(context.Background(), sampleIntent()); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	wantSrc := dir + "/intent-target/nginx"
+	wantSrc := filepath.Join(dir, "intent-target", "nginx")
 	if backend.lastSrc != wantSrc {
 		t.Errorf("source path = %q, want %q", backend.lastSrc, wantSrc)
 	}
-	wantSnap := dir + "/snapshots/intent-001.snap"
+	wantSnap := filepath.Join(dir, "snapshots", "intent-001.snap")
 	if backend.lastSnap != wantSnap {
 		t.Errorf("snapshot path = %q, want %q", backend.lastSnap, wantSnap)
+	}
+}
+
+// TestLocal_AuditEmitsOnSuccess covers T7's primary contract:
+// a successful ApplyIntent MUST write a hash-chained audit
+// event with tool="apply_intent.success", outcome="ok", and
+// args {target, kind, tx_id}. The chain lives in a t.TempDir()
+// so the test is self-contained.
+//
+// RED: the test was written before the tx had audit plumbing;
+// the first run logged "audit is nil" assertions and the GREEN
+// wiring is what we're verifying here.
+func TestLocal_AuditEmitsOnSuccess(t *testing.T) {
+	dir := t.TempDir()
+	auditLog, err := audit.New(dir)
+	if err != nil {
+		t.Fatalf("audit.New: %v", err)
+	}
+	backend := &txMockBackend{}
+	apply := &txSpyApply{}
+	tx := New(backend, apply.Fn, dir, new(atomic.Uint64), auditLog)
+
+	resp, err := tx.Run(context.Background(), sampleIntent())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if resp.Result != agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_SUCCESS {
+		t.Fatalf("Result = %v, want SUCCESS", resp.Result)
+	}
+
+	// Drain the chain: Since(0) returns all events.
+	events, final, err := auditLog.Since(0)
+	if err != nil {
+		t.Fatalf("audit.Since: %v", err)
+	}
+	if final != 1 {
+		t.Fatalf("audit final seq = %d, want 1 (one success event)", final)
+	}
+	if len(events) != 1 {
+		t.Fatalf("audit events = %d, want 1", len(events))
+	}
+	ev := events[0]
+	if ev.Tool != "apply_intent.success" {
+		t.Errorf("audit tool = %q, want apply_intent.success", ev.Tool)
+	}
+	if ev.Outcome != "ok" {
+		t.Errorf("audit outcome = %q, want ok", ev.Outcome)
+	}
+	if ev.Identity != "intent-001" {
+		t.Errorf("audit identity = %q, want intent-001", ev.Identity)
+	}
+	if ev.Args["target"] != "nginx" {
+		t.Errorf("audit args[target] = %q, want nginx", ev.Args["target"])
+	}
+	if ev.Args["kind"] != "package.set" {
+		t.Errorf("audit args[kind] = %q, want package.set", ev.Args["kind"])
+	}
+	if ev.Args["tx_id"] != "tx-intent-001" {
+		t.Errorf("audit args[tx_id] = %q, want tx-intent-001", ev.Args["tx_id"])
+	}
+}
+
+// TestLocal_AuditEmitsOnRollback covers the "apply failed,
+// rollback succeeded" path. The audit event should have
+// tool="apply_intent.failure" with outcome=... and args
+// {target, kind}.
+func TestLocal_AuditEmitsOnRollback(t *testing.T) {
+	dir := t.TempDir()
+	auditLog, err := audit.New(dir)
+	if err != nil {
+		t.Fatalf("audit.New: %v", err)
+	}
+	backend := &txMockBackend{}
+	apply := &txSpyApply{err: errors.New("apply failed: package not signed")}
+	tx := New(backend, apply.Fn, dir, new(atomic.Uint64), auditLog)
+
+	resp, err := tx.Run(context.Background(), sampleIntent())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if resp.Result != agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_TRANSIENT_FAILURE {
+		t.Fatalf("Result = %v, want TRANSIENT_FAILURE", resp.Result)
+	}
+	events, _, err := auditLog.Since(0)
+	if err != nil {
+		t.Fatalf("audit.Since: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("audit events = %d, want 1", len(events))
+	}
+	ev := events[0]
+	if ev.Tool != "apply_intent.failure" {
+		t.Errorf("audit tool = %q, want apply_intent.failure", ev.Tool)
+	}
+	if ev.Identity != "intent-001" {
+		t.Errorf("audit identity = %q, want intent-001", ev.Identity)
+	}
+	if ev.Args["target"] != "nginx" {
+		t.Errorf("audit args[target] = %q, want nginx", ev.Args["target"])
+	}
+	if !strings.Contains(ev.Outcome, "apply_failed:") {
+		t.Errorf("audit outcome must reference apply failure; got %q", ev.Outcome)
+	}
+	if !strings.Contains(ev.Outcome, "rolled back") {
+		t.Errorf("audit outcome must mention rollback recovery; got %q", ev.Outcome)
+	}
+}
+
+// TestLocal_AuditEmitsOnRollbackFailed covers the worst case:
+// apply + rollback both fail. The audit event should have
+// tool="apply_intent.rollback_failed" with the dual-failure
+// outcome. This is the event the control plane uses to
+// surface PERSISTENT_FAILURE to the human.
+func TestLocal_AuditEmitsOnRollbackFailed(t *testing.T) {
+	dir := t.TempDir()
+	auditLog, err := audit.New(dir)
+	if err != nil {
+		t.Fatalf("audit.New: %v", err)
+	}
+	backend := &txMockBackend{
+		restoreErr: errors.New("rollback ENOSPC"),
+	}
+	apply := &txSpyApply{err: errors.New("apply failed: checksum mismatch")}
+	tx := New(backend, apply.Fn, dir, new(atomic.Uint64), auditLog)
+
+	resp, err := tx.Run(context.Background(), sampleIntent())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if resp.Result != agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_PERSISTENT_FAILURE {
+		t.Fatalf("Result = %v, want PERSISTENT_FAILURE", resp.Result)
+	}
+	events, _, err := auditLog.Since(0)
+	if err != nil {
+		t.Fatalf("audit.Since: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("audit events = %d, want 1", len(events))
+	}
+	ev := events[0]
+	if ev.Tool != "apply_intent.rollback_failed" {
+		t.Errorf("audit tool = %q, want apply_intent.rollback_failed", ev.Tool)
+	}
+	if ev.Identity != "intent-001" {
+		t.Errorf("audit identity = %q, want intent-001", ev.Identity)
+	}
+	if !strings.Contains(ev.Outcome, "apply_failed:") {
+		t.Errorf("audit outcome must reference apply failure; got %q", ev.Outcome)
+	}
+	if !strings.Contains(ev.Outcome, "rollback_failed:") {
+		t.Errorf("audit outcome must reference rollback failure; got %q", ev.Outcome)
+	}
+}
+
+// TestLocal_NilAuditSkipsEmission covers the case where the
+// caller passes audit=nil (test fixture, or a deployment that
+// has not yet set up a chain dir). The tx must not panic and
+// must still return the correct response shape.
+func TestLocal_NilAuditSkipsEmission(t *testing.T) {
+	backend := &txMockBackend{}
+	apply := &txSpyApply{}
+	tx := New(backend, apply.Fn, t.TempDir(), new(atomic.Uint64), nil)
+
+	resp, err := tx.Run(context.Background(), sampleIntent())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if resp.Result != agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_SUCCESS {
+		t.Errorf("Result = %v, want SUCCESS", resp.Result)
 	}
 }

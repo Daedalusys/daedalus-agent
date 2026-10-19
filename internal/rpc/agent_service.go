@@ -22,6 +22,7 @@ import (
 
 	agentv1 "github.com/Daedalusys/daedalus-sdk/proto/agent/v1"
 
+	"github.com/Daedalusys/daedalus-agent/internal/audit"
 	"github.com/Daedalusys/daedalus-agent/internal/cert"
 	"github.com/Daedalusys/daedalus-agent/internal/config"
 	"github.com/Daedalusys/daedalus-agent/internal/rollback"
@@ -103,6 +104,15 @@ type agentService struct {
 	// otherwise.
 	auditSeq *atomic.Uint64
 
+	// audit is the per-process hash-chained audit log (T7).
+	// ReportStatus streams events from it; tx.Local writes
+	// success / failure events to it on every ApplyIntent
+	// outcome. nil is permitted for tests that don't
+	// exercise ReportStatus / ApplyIntent; the
+	// report_status handler then returns an empty response
+	// (the documented "no audit yet" wire shape).
+	audit *audit.Local
+
 	// backend is an optional override for the per-RPC backend
 	// selection. If non-nil, it is used as-is by ApplyIntent
 	// and SnapshotRequest (skipping SelectBackend). Production
@@ -154,10 +164,17 @@ var _ agentv1.AgentServiceServer = (*agentService)(nil)
 //     the default tx.New with the T6 apply stub. Tests can
 //     substitute a fake.
 //
+// T7 adds audit:
+//   - audit is the per-process hash-chained audit log. nil
+//     is permitted for tests that don't exercise
+//     ReportStatus / ApplyIntent; the corresponding handlers
+//     then return empty responses (or no audit writes,
+//     respectively).
+//
 // startedAt is captured here so uptime is measured from
 // construction (which is shortly before serve, modulo
 // listener-bind time).
-func newAgentService(cfg *config.Config, certInfo *cert.Info, det *snapshot.Detector, auditSeq *atomic.Uint64, backend rollback.Backend, txFactory TxFactory) *agentService {
+func newAgentService(cfg *config.Config, certInfo *cert.Info, det *snapshot.Detector, auditSeq *atomic.Uint64, backend rollback.Backend, txFactory TxFactory, auditLog *audit.Local) *agentService {
 	if auditSeq == nil {
 		auditSeq = new(atomic.Uint64)
 	}
@@ -168,6 +185,7 @@ func newAgentService(cfg *config.Config, certInfo *cert.Info, det *snapshot.Dete
 		auditSeq:  auditSeq,
 		backend:   backend,
 		txFactory: txFactory,
+		audit:     auditLog,
 		startedAt: time.Now().UTC(),
 	}
 }
@@ -192,11 +210,15 @@ func (s *agentService) selectedBackend() (rollback.Backend, error) {
 // test-injected txFactory is set, it is used; otherwise the
 // production default (tx.New with the T6 apply stub) is used.
 // The passed backend and auditSeq are forwarded to the tx.
+//
+// T7: also forwards the per-process hash-chained audit log
+// (shared with report_status.go). tx.Local writes success /
+// failure events to it on every ApplyIntent outcome.
 func (s *agentService) buildTx(backend rollback.Backend) tx.Tx {
 	if s.txFactory != nil {
-		return s.txFactory(backend, s.cfg.DataDir, s.auditSeq)
+		return s.txFactory(backend, s.cfg.DataDir, s.auditSeq, s.audit)
 	}
-	return tx.New(backend, applyStub, s.cfg.DataDir, s.auditSeq)
+	return tx.New(backend, applyStub, s.cfg.DataDir, s.auditSeq, s.audit)
 }
 
 // applyStub is the T6 apply step. It only logs the intent and

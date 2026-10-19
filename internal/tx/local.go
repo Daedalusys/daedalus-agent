@@ -60,6 +60,7 @@ import (
 
 	agentv1 "github.com/Daedalusys/daedalus-sdk/proto/agent/v1"
 
+	"github.com/Daedalusys/daedalus-agent/internal/audit"
 	"github.com/Daedalusys/daedalus-agent/internal/rollback"
 )
 
@@ -105,6 +106,7 @@ type Local struct {
 	apply    ApplyFunc
 	dataDir  string
 	auditSeq *atomic.Uint64
+	audit    *audit.Local
 }
 
 // New constructs a Local transaction. The backend MUST be
@@ -113,7 +115,12 @@ type Local struct {
 // auditSeq may be nil — in that case the tx uses a private
 // counter. Production wires a shared *atomic.Uint64 so audit
 // sequence numbers are unique across all RPCs.
-func New(backend rollback.Backend, apply ApplyFunc, dataDir string, auditSeq *atomic.Uint64) *Local {
+//
+// audit may be nil — the tx then skips audit-event emission
+// (no error). Production wires the per-process *audit.Local
+// shared with report_status.go; tests pass nil to avoid
+// the chain file.
+func New(backend rollback.Backend, apply ApplyFunc, dataDir string, auditSeq *atomic.Uint64, auditLog *audit.Local) *Local {
 	if auditSeq == nil {
 		auditSeq = new(atomic.Uint64)
 	}
@@ -122,6 +129,7 @@ func New(backend rollback.Backend, apply ApplyFunc, dataDir string, auditSeq *at
 		apply:    apply,
 		dataDir:  dataDir,
 		auditSeq: auditSeq,
+		audit:    auditLog,
 	}
 }
 
@@ -156,6 +164,23 @@ func (t *Local) Run(ctx context.Context, intent *agentv1.ApplyIntentRequest) (*a
 	if err := t.backend.CreateSnapshot(sourcePath, snapshotPath); err != nil {
 		log.Printf("agent: tx pre-snapshot failed: intent_id=%q target=%q err=%v audit_seq=%d",
 			intent.IntentId, intent.Target, err, seq)
+		// Audit the pre-snapshot failure too: without
+		// the pre-snapshot we did NOT modify the host,
+		// but we still want a tamper-evident record of
+		// "tx was attempted, pre-snapshot broke".
+		if t.audit != nil {
+			if _, aerr := t.audit.Log(audit.Event{
+				Identity: intent.IntentId,
+				Tool:     "apply_intent.presnapshot_failed",
+				Args: map[string]string{
+					"target": intent.Target,
+					"kind":   intent.Kind,
+				},
+				Outcome: fmt.Sprintf("presnapshot_failed: %v", err),
+			}); aerr != nil {
+				log.Printf("agent: audit log (presnapshot_failed) failed: %v", aerr)
+			}
+		}
 		return &agentv1.ApplyIntentResponse{
 			Result:       agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_TRANSIENT_FAILURE,
 			ErrorMessage: fmt.Sprintf("pre-snapshot failed: %v", err),
@@ -176,6 +201,19 @@ func (t *Local) Run(ctx context.Context, intent *agentv1.ApplyIntentRequest) (*a
 			rbSeq := t.auditSeq.Add(1)
 			log.Printf("agent: tx apply failed AND rollback failed: intent_id=%q apply_err=%v rollback_err=%v audit_seq=%d",
 				intent.IntentId, err, rbErr, rbSeq)
+			if t.audit != nil {
+				if _, aerr := t.audit.Log(audit.Event{
+					Identity: intent.IntentId,
+					Tool:     "apply_intent.rollback_failed",
+					Args: map[string]string{
+						"target": intent.Target,
+						"kind":   intent.Kind,
+					},
+					Outcome: fmt.Sprintf("apply_failed: %v; rollback_failed: %v", err, rbErr),
+				}); aerr != nil {
+					log.Printf("agent: audit log (rollback_failed) failed: %v", aerr)
+				}
+			}
 			return &agentv1.ApplyIntentResponse{
 				Result:       agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_PERSISTENT_FAILURE,
 				ErrorMessage: fmt.Sprintf("apply failed AND rollback failed (host may be in undefined state): apply=%v rollback=%v", err, rbErr),
@@ -187,6 +225,19 @@ func (t *Local) Run(ctx context.Context, intent *agentv1.ApplyIntentRequest) (*a
 		rbSeq := t.auditSeq.Add(1)
 		log.Printf("agent: tx apply failed, rolled back: intent_id=%q apply_err=%v audit_seq=%d",
 			intent.IntentId, err, rbSeq)
+		if t.audit != nil {
+			if _, aerr := t.audit.Log(audit.Event{
+				Identity: intent.IntentId,
+				Tool:     "apply_intent.failure",
+				Args: map[string]string{
+					"target": intent.Target,
+					"kind":   intent.Kind,
+				},
+				Outcome: fmt.Sprintf("apply_failed: %v (rolled back)", err),
+			}); aerr != nil {
+				log.Printf("agent: audit log (failure) failed: %v", aerr)
+			}
+		}
 		return &agentv1.ApplyIntentResponse{
 			Result:       agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_TRANSIENT_FAILURE,
 			ErrorMessage: fmt.Sprintf("apply failed, rolled back successfully: %v", err),
@@ -199,6 +250,20 @@ func (t *Local) Run(ctx context.Context, intent *agentv1.ApplyIntentRequest) (*a
 	// the same intent yields the same tx_id — useful for
 	// the audit chain in T7).
 	txID := "tx-" + intent.IntentId
+	if t.audit != nil {
+		if _, aerr := t.audit.Log(audit.Event{
+			Identity: intent.IntentId,
+			Tool:     "apply_intent.success",
+			Args: map[string]string{
+				"target": intent.Target,
+				"kind":   intent.Kind,
+				"tx_id":  txID,
+			},
+			Outcome: "ok",
+		}); aerr != nil {
+			log.Printf("agent: audit log (success) failed: %v", aerr)
+		}
+	}
 	return &agentv1.ApplyIntentResponse{
 		Result:   agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_SUCCESS,
 		TxId:     txID,

@@ -23,6 +23,7 @@ import (
 
 	agentv1 "github.com/Daedalusys/daedalus-sdk/proto/agent/v1"
 
+	"github.com/Daedalusys/daedalus-agent/internal/audit"
 	"github.com/Daedalusys/daedalus-agent/internal/cert"
 	"github.com/Daedalusys/daedalus-agent/internal/config"
 	"github.com/Daedalusys/daedalus-agent/internal/rollback"
@@ -89,12 +90,25 @@ type ServiceDeps struct {
 	// (tx.New with the T6 apply stub). Tests can substitute a
 	// canned-response Tx.
 	TxFactory TxFactory
+
+	// Audit is the per-process hash-chained audit log. nil is
+	// permitted — ReportStatus then returns an empty response
+	// (the documented "no audit yet" wire shape). Production
+	// always supplies a non-nil audit (constructed in main()
+	// from cfg.AuditDir / cfg.DataDir). Tests may pass nil
+	// when they don't exercise ReportStatus.
+	Audit *audit.Local
 }
 
 // TxFactory constructs a per-RPC ApplyIntent transaction. Tests
 // inject a canned-response fake; production passes nil to
 // ServiceDeps and accepts the default tx.New.
-type TxFactory func(rollback.Backend, string, *atomic.Uint64) tx.Tx
+//
+// The audit parameter is the per-process hash-chained audit
+// log; tx.Local writes success / failure events to it. Tests
+// may pass nil to opt out of audit (handy for unit tests
+// that don't want to set up a chain file).
+type TxFactory func(rollback.Backend, string, *atomic.Uint64, *audit.Local) tx.Tx
 
 // Server wraps a *grpc.Server with the daedalus-agent defaults
 // already wired in: TLS credentials from the supplied *tls.Config
@@ -136,7 +150,7 @@ func NewServer(addr string, tlsCfg *tls.Config, deps ServiceDeps) (*Server, erro
 	}
 	creds := credentials.NewTLS(tlsCfg)
 	gs := grpc.NewServer(grpc.Creds(creds))
-	agentv1.RegisterAgentServiceServer(gs, newAgentService(deps.Cfg, deps.CertInfo, det, deps.AuditSeq, deps.Backend, deps.TxFactory))
+	agentv1.RegisterAgentServiceServer(gs, newAgentService(deps.Cfg, deps.CertInfo, det, deps.AuditSeq, deps.Backend, deps.TxFactory, deps.Audit))
 	return &Server{grpc: gs, addr: addr}, nil
 }
 

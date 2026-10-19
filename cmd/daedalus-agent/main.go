@@ -18,6 +18,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/Daedalusys/daedalus-agent/internal/audit"
 	"github.com/Daedalusys/daedalus-agent/internal/cert"
 	"github.com/Daedalusys/daedalus-agent/internal/config"
 	"github.com/Daedalusys/daedalus-agent/internal/daemon"
@@ -206,6 +207,13 @@ func runDaemonStart(cmd *cobra.Command, cfgPath string) error {
 // disk holds a half-written or zero-byte file), this surfaces as
 // a startup error — better to fail fast than to serve an
 // untrusted handshake to the control plane.
+//
+// T7: the audit chain is constructed here from cfg.DataDir (the
+// chain lives at <DataDir>/audit/chain.jsonl). It's passed to
+// the RPC server so ReportStatus can stream events from it. If
+// construction fails the agent fails to start — the audit
+// chain is mandatory for production (a silent loss of audit
+// events would be a compliance hole).
 func startRPCServer(cfg *config.Config) (*rpc.Server, error) {
 	// Skip RPC bring-up when cert paths are unset. Production
 	// deployments always set these (T2's postinstall writes them
@@ -233,10 +241,15 @@ func startRPCServer(cfg *config.Config) (*rpc.Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cert info: %w", err)
 	}
+	auditLog, err := audit.New(cfg.DataDir)
+	if err != nil {
+		return nil, fmt.Errorf("audit: %w", err)
+	}
 	rpcSrv, err := rpc.NewServer(rpc.DefaultListenAddr, tlsCfg, rpc.ServiceDeps{
 		Cfg:      cfg,
 		CertInfo: info,
 		Snapshot: snapshot.NewDetector(),
+		Audit:    auditLog,
 	})
 	if err != nil {
 		return nil, err
