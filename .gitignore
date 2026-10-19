@@ -1,0 +1,21 @@
+# Build artifacts
+# Top-level `bin/daedalus-agent` is a go build output. Pin the pattern
+# to the root so a hypothetical scripts/bin/ (script helper bin dir) is
+# not accidentally ignored.
+/bin/
+dist/
+
+# Go test/coverage artifacts
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Editor / OS noise
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local scratch (SDD review packages, test scaffolding)
+/.superpowers/
