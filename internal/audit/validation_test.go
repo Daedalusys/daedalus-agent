@@ -11,7 +11,8 @@
 // regardless of path).
 //
 // Run with -v to capture the dumped chain.jsonl content:
-//   go test -race -count=1 -run TestValidation ./internal/audit/ -v
+//
+//	go test -race -count=1 -run TestValidation ./internal/audit/ -v
 //
 // The captured output is the literal bytes of the on-disk chain
 // after one successful + one failed transaction — reported in

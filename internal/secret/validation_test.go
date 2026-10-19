@@ -9,7 +9,8 @@
 // a real goroutine context with real panic propagation.
 //
 // Run with -v to capture the dumped cache state:
-//   go test -race -count=1 -run TestValidation ./internal/secret/ -v
+//
+//	go test -race -count=1 -run TestValidation ./internal/secret/ -v
 //
 // Captured output goes into the T7 task report.
 package secret_test

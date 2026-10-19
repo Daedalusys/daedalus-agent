@@ -28,11 +28,17 @@ readonly CONFIG_DIR="/etc/${BIN_NAME}"
 
 # Default config.yaml body. Mirrors config.Default() in Go; if either
 # drifts the daemon will log a warning at startup. Keep this in sync.
+# All four TLS paths are required — main.go's startRPCServer checks
+# cfg.CAKeyPath and silently downgrades to "mTLS gRPC server disabled
+# (development mode)" if any is empty (T8 review I1). The paths
+# under /etc/daedalus-agent/tls/ match the cert.Loader's bootstrap
+# behaviour (it writes the CA / server keypair on first start).
 readonly DEFAULT_CONFIG="agent_id: agent-local
 control_plane_addr: https://control.daedalusys.local:7443
 cert_path: /etc/daedalus-agent/tls/agent.pem
 key_path: /etc/daedalus-agent/tls/agent.key
 ca_path: /etc/daedalus-agent/tls/ca.pem
+ca_key_path: /etc/daedalus-agent/tls/ca.key
 data_dir: /var/lib/daedalus-agent
 audit_dir: /var/log/daedalus-agent
 "

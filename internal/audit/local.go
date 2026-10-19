@@ -27,9 +27,17 @@
 //     before unlocking. A crash mid-Log may leave a partial
 //     line on disk; Since skips empty / un-parseable lines
 //     the same way Verify does.
-//   - Concurrency: Log is safe to call from multiple
-//     goroutines (sdkAudit.LogAudit takes an exclusive flock
-//     on the file fd). Since is read-only.
+//   - Concurrency: the SDK's flock serialises the on-disk
+//     write across goroutines. The in-memory seq counter is
+//     a best-effort cache (consistent under serial use of
+//     Log). P0.5 only calls Log from tx.Local.Run, which is
+//     serialised per stream, so the production call path is
+//     race-free; a future caller invoking Log concurrently
+//     from unrelated goroutines would observe the seq
+//     decrement-on-failure race and should fix the call-site
+//     before relying on the returned seq across calls.
+//     Since is read-only and opens its own file handle, so
+//     it does not contend with Log.
 package audit
 
 import (

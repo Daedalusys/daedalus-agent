@@ -16,13 +16,14 @@
 // Why this is *not* used directly in RFC-level code:
 //
 //	The btrfs CLI requires CAP_SYS_ADMIN to manage subvolumes
-//	on most distros. The daedalus-agent runs as a non-root
-//	user (the install.sh in T2 sets up a dedicated
-//	daedalus-agent system user). Wrapping the btrfs calls in
-//	a small sudo helper or setcap binary is out of scope for
-//	P0.5 (tracked in followup). The Rust + Go backends are
-//	exercised by the Step 7 真机 run, which runs as root in a
-//	private container.
+//	on most distros. P0.5 runs the agent as root via the
+//	systemd unit (install.sh T2 — User=root); no dedicated
+//	daedalus-agent system user is created. Wrapping the btrfs
+//	calls in a small sudo helper or setcap binary so the
+//	production daemon can drop to a non-root user is out of
+//	scope for P0.5 (tracked in followup). The Rust + Go
+//	backends are exercised by the Step 7 真机 run, which runs
+//	as root in a private container.
 //
 // Restoration semantics:
 //

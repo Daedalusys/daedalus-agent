@@ -38,8 +38,6 @@ package rpc
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"log"
 	"path/filepath"
 	"time"
@@ -107,7 +105,7 @@ func (s *agentService) SnapshotRequest(ctx context.Context, req *agentv1.Snapsho
 	// intent-target directory (the same target ApplyIntent
 	// modifies). The snapshot_id is randomised so concurrent
 	// SnapshotRequest calls don't collide on the snapshot path.
-	snapID := "snap-" + randomHexID(8)
+	snapID := "snap-" + randomHex(8)
 	sourcePath := filepath.Join(s.cfg.DataDir, "intent-target")
 	snapshotPath := filepath.Join(s.cfg.DataDir, "snapshots", snapID)
 
@@ -125,15 +123,4 @@ func (s *agentService) SnapshotRequest(ctx context.Context, req *agentv1.Snapsho
 		BackendUsed:   capability,
 		CreatedAtUnix: time.Now().UTC().Unix(),
 	}, nil
-}
-
-// randomHexID is a small helper for synthetic IDs. It panics if
-// crypto/rand fails; we keep it unexported because handlers are
-// the only callers and the panic surface is local.
-func randomHexID(n int) string {
-	buf := make([]byte, n)
-	if _, err := rand.Read(buf); err != nil {
-		return "deadbeef"
-	}
-	return hex.EncodeToString(buf)
 }

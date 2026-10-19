@@ -6,21 +6,21 @@
 //
 // Behaviour (T7 replaces T5 stub):
 //
-//   1. Validate req is non-nil.
-//   2. Read events from the per-process audit chain whose
-//      seq > since_audit_seq, capped at max_events.
-//   3. Convert each audit record to the wire AuditEvent
-//      proto (Seq, TimestampUnix, EventType, PayloadJson,
-//      PrevHash, CurrentHash).
-//   4. Return events + final_seq = the highest seq we
-//      returned (= the chain's current tip).
+//  1. Validate req is non-nil.
+//  2. Read events from the per-process audit chain whose
+//     seq > since_audit_seq, capped at max_events.
+//  3. Convert each audit record to the wire AuditEvent
+//     proto (Seq, TimestampUnix, EventType, PayloadJson,
+//     PrevHash, CurrentHash).
+//  4. Return events + final_seq = the highest seq we
+//     returned (= the chain's current tip).
 //
 // Edge cases:
 //   - audit is nil (test / development mode): return empty
 //     events + final_seq=0. Matches the T5 stub's wire
 //     shape so clients don't see a regression.
 //   - since_audit_seq >= current tip: return empty events
-//   + final_seq = current tip. (The client is caught up.)
+//   - final_seq = current tip. (The client is caught up.)
 //   - max_events == 0: no cap. T7 returns everything > since.
 //
 // Concurrency: the audit chain is safe for concurrent reads
