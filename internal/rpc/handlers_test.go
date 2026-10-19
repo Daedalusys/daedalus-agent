@@ -59,9 +59,9 @@ type testRig struct {
 // in-memory state and returns the configured createErr /
 // restoreErr. Defaults to nil errors (happy path).
 type rigMockBackend struct {
-	mu                    sync.Mutex
-	createErr             error
-	restoreErr            error
+	mu                        sync.Mutex
+	createErr                 error
+	restoreErr                error
 	createCalls, restoreCalls int
 	lastSrc, lastSnap         string
 	lastSnapPath, lastTarget  string
@@ -100,8 +100,6 @@ func startTestServerWithSnapshot(t *testing.T, cap agentv1.SnapshotCapability) *
 	t.Helper()
 
 	mockBackend := &rigMockBackend{}
-	// ... caller-provided content preserved below
-	t.Helper()
 
 	caCertPEM, caKeyPEM, serverCertPEM, serverKeyPEM := buildPKIAt(t,
 		time.Now().Add(-1*time.Hour),

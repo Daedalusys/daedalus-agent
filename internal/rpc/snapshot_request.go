@@ -24,16 +24,16 @@
 //
 // Rationale for the FailedPrecondition (not body-refusal) split:
 //
-//   ApplyIntent's refusal carries useful information (the
-//   intent_id was received, the audit row was emitted) that
-//   the control plane should record even on refusal. Hence the
-//   in-body refusal code.
+//	ApplyIntent's refusal carries useful information (the
+//	intent_id was received, the audit row was emitted) that
+//	the control plane should record even on refusal. Hence the
+//	in-body refusal code.
 //
-//   SnapshotRequest's refusal carries no useful information —
-//   no snapshot was taken, no audit row makes sense. The
-//   control plane's "we wanted a snapshot, did we get one?"
-//   question is best answered by gRPC status codes; codes.OK +
-//   an empty SnapshotResponse would mask the failure.
+//	SnapshotRequest's refusal carries no useful information —
+//	no snapshot was taken, no audit row makes sense. The
+//	control plane's "we wanted a snapshot, did we get one?"
+//	question is best answered by gRPC status codes; codes.OK +
+//	an empty SnapshotResponse would mask the failure.
 package rpc
 
 import (
@@ -73,11 +73,11 @@ import (
 //
 // Failure paths:
 //
-//   A real backend failure (btrfs subvolume command error,
-//   rsync ENOSPC, etc.) returns codes.Internal with the
-//   wrapped error so the control plane's log distinguishes
-//   "agent can't reach the snapshot primitive" from
-//   "agent has no snapshot primitive at all".
+//	A real backend failure (btrfs subvolume command error,
+//	rsync ENOSPC, etc.) returns codes.Internal with the
+//	wrapped error so the control plane's log distinguishes
+//	"agent can't reach the snapshot primitive" from
+//	"agent has no snapshot primitive at all".
 func (s *agentService) SnapshotRequest(ctx context.Context, req *agentv1.SnapshotRequestRequest) (*agentv1.SnapshotResponse, error) {
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "SnapshotRequest: nil request")

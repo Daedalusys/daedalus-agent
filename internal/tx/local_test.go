@@ -3,14 +3,14 @@
 // The state machine wired in internal/tx/local.go has four
 // observable paths:
 //
-//   1. Success: pre-snapshot → apply (nil) → return SUCCESS.
-//   2. Pre-snapshot failure: backend.CreateSnapshot errors; tx
-//      returns TRANSIENT_FAILURE without calling apply.
-//   3. Apply failure + rollback success: apply errors, rollback
-//      succeeds; tx returns TRANSIENT_FAILURE.
-//   4. Apply failure + rollback failure: apply errors, rollback
-//      also errors; tx returns PERSISTENT_FAILURE and logs the
-//      dual failure loudly.
+//  1. Success: pre-snapshot → apply (nil) → return SUCCESS.
+//  2. Pre-snapshot failure: backend.CreateSnapshot errors; tx
+//     returns TRANSIENT_FAILURE without calling apply.
+//  3. Apply failure + rollback success: apply errors, rollback
+//     succeeds; tx returns TRANSIENT_FAILURE.
+//  4. Apply failure + rollback failure: apply errors, rollback
+//     also errors; tx returns PERSISTENT_FAILURE and logs the
+//     dual failure loudly.
 //
 // The tests cover each path with a recording mock backend and
 // a recording apply spy, so an assertion failure pinpoints the
@@ -37,11 +37,11 @@ import (
 type txMockBackend struct {
 	mu sync.Mutex
 
-	createCalls    int
-	restoreCalls   int
-	createErr      error
-	restoreErr     error
-	lastSrc, lastSnap       string
+	createCalls              int
+	restoreCalls             int
+	createErr                error
+	restoreErr               error
+	lastSrc, lastSnap        string
 	lastSnapPath, lastTarget string
 }
 

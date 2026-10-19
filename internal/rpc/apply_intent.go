@@ -15,10 +15,10 @@
 //     "this machine has no rollback path" and not "best-effort
 //     will handle it". The error message is structured:
 //
-//        "this machine has no snapshot backend
-//         (btrfs/rsync/lvm/snapper all absent);
-//         ApplyIntent refused per fail-closed policy;
-//         only local audit + state report available"
+//     "this machine has no snapshot backend
+//     (btrfs/rsync/lvm/snapper all absent);
+//     ApplyIntent refused per fail-closed policy;
+//     only local audit + state report available"
 //
 //     Note we say "fail-closed policy", not "best-effort policy" —
 //     the spec's "best-effort rollback" phrasing reads to a hurried

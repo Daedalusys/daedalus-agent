@@ -32,12 +32,12 @@
 //
 // Trailing-slash invariant:
 //
-//   Both CreateSnapshot and Restore use trailing-slash paths
-//   (`<src>/` and `<snap>/`). Slipping this would copy
-//   <src> as a subdirectory of <snap> rather than copying
-//   <src>'s contents into <snap>. The tests in
-//   rsync_test.go assert the trailing-slash form so a future
-//   refactor that drops it gets caught.
+//	Both CreateSnapshot and Restore use trailing-slash paths
+//	(`<src>/` and `<snap>/`). Slipping this would copy
+//	<src> as a subdirectory of <snap> rather than copying
+//	<src>'s contents into <snap>. The tests in
+//	rsync_test.go assert the trailing-slash form so a future
+//	refactor that drops it gets caught.
 package rollback
 
 import (

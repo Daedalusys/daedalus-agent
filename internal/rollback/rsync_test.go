@@ -4,10 +4,10 @@
 // unavailable. Unlike btrfs, rsync has no native snapshot
 // primitive — we approximate one with:
 //
-//   CreateSnapshot: `mkdir -p <snap_dir>` followed by
-//                   `rsync -a --delete <src>/ <snap_dir>/`.
+//	CreateSnapshot: `mkdir -p <snap_dir>` followed by
+//	                `rsync -a --delete <src>/ <snap_dir>/`.
 //
-//   Restore:        `rsync -a --delete <snap_dir>/ <target>/`.
+//	Restore:        `rsync -a --delete <snap_dir>/ <target>/`.
 //
 // The trailing slash in the source / destination paths matters:
 // it tells rsync to copy *contents* (so <snap_dir> ends up

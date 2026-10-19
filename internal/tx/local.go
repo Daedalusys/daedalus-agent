@@ -28,28 +28,27 @@
 //
 // RF3 surface (plan §RF3 + spec §5.2):
 //
-//   The handler-level "snap_capability == NONE → refuse"
-//   check lives in internal/rpc/apply_intent.go, not here.
-//   Tx assumes the caller has already admitted the intent
-//   (i.e. selected a non-nil backend). Defence in depth: even
-//   if a future caller forgets the admission check, the tx's
-//   pre-snapshot step on a nil backend will panic with a
-//   clear nil-deref — surfaced loudly, not silently swallowed
-//   as "best-effort".
+//	The handler-level "snap_capability == NONE → refuse"
+//	check lives in internal/rpc/apply_intent.go, not here.
+//	Tx assumes the caller has already admitted the intent
+//	(i.e. selected a non-nil backend). Defence in depth: even
+//	if a future caller forgets the admission check, the tx's
+//	pre-snapshot step on a nil backend will panic with a
+//	clear nil-deref — surfaced loudly, not silently swallowed
+//	as "best-effort".
 //
 // Audit / audit_seq:
 //
-//   T6 uses a process-local atomic.Uint64 counter as the
-//   audit_seq source. T7 (issue in followup queue) replaces
-//   this with the JSONL audit chain — see internal/rpc/
-//   handlers_test.go for the placeholder stub.
+//	T6 uses a process-local atomic.Uint64 counter as the
+//	audit_seq source. T7 (issue in followup queue) replaces
+//	this with the JSONL audit chain — see internal/rpc/
+//	handlers_test.go for the placeholder stub.
 //
 // Apply stub:
 //
-//   T6 wires applyFn as a no-op (log + nil). T7+ replaces it
-//   with the real package manager / filesystem executor. The
-//   tx interface itself does not change between T6 and T7+.
-//
+//	T6 wires applyFn as a no-op (log + nil). T7+ replaces it
+//	with the real package manager / filesystem executor. The
+//	tx interface itself does not change between T6 and T7+.
 package tx
 
 import (

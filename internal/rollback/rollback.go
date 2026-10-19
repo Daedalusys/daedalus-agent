@@ -24,12 +24,12 @@
 //
 // RF3 surface (see plan §RF3 + spec §5.2):
 //
-//   SelectBackend(capability=NONE) returns (nil, ErrNoBackend).
-//   The local tx state machine (internal/tx) treats ErrNoBackend
-//   as an immediate refusal — no apply step, no fallback to
-//   "best-effort", no silent success. The wording in the refusal
-//   message is in internal/rpc/apply_intent.go (kept there so
-//   the agent and control plane agree on the exact phrasing).
+//	SelectBackend(capability=NONE) returns (nil, ErrNoBackend).
+//	The local tx state machine (internal/tx) treats ErrNoBackend
+//	as an immediate refusal — no apply step, no fallback to
+//	"best-effort", no silent success. The wording in the refusal
+//	message is in internal/rpc/apply_intent.go (kept there so
+//	the agent and control plane agree on the exact phrasing).
 package rollback
 
 import (
