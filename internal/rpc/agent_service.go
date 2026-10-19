@@ -14,14 +14,19 @@
 package rpc
 
 import (
+	"context"
+	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	agentv1 "github.com/Daedalusys/daedalus-sdk/proto/agent/v1"
 
 	"github.com/Daedalusys/daedalus-agent/internal/cert"
 	"github.com/Daedalusys/daedalus-agent/internal/config"
+	"github.com/Daedalusys/daedalus-agent/internal/rollback"
 	"github.com/Daedalusys/daedalus-agent/internal/snapshot"
+	"github.com/Daedalusys/daedalus-agent/internal/tx"
 )
 
 // heartbeatIntervalSeconds is the interval the agent advertises
@@ -90,6 +95,28 @@ type agentService struct {
 	// SnapshotRequest with FailedPrecondition.
 	snapshot *snapshot.Detector
 
+	// auditSeq is the per-process monotonic audit sequence
+	// counter. ApplyIntent (via the tx state machine) bumps it
+	// on each tx outcome (success / transient / persistent).
+	// nil is permitted only in tests that don't reach
+	// ApplyIntent; the constructor seeds a private counter
+	// otherwise.
+	auditSeq *atomic.Uint64
+
+	// backend is an optional override for the per-RPC backend
+	// selection. If non-nil, it is used as-is by ApplyIntent
+	// and SnapshotRequest (skipping SelectBackend). Production
+	// leaves this nil; tests inject a mock backend so the
+	// handler exercises the wired-up state machine without
+	// requiring real btrfs/rsync on the test runner.
+	backend rollback.Backend
+
+	// txFactory, if non-nil, is used instead of tx.New to
+	// construct the per-RPC ApplyIntent transaction. nil
+	// means use the production default (tx.New with the T6
+	// apply stub).
+	txFactory TxFactory
+
 	// nodeID is the control-plane-assigned identifier for
 	// this agent. It is empty until the first successful
 	// Register, then stable for the daemon's lifetime. The
@@ -114,14 +141,72 @@ var _ agentv1.AgentServiceServer = (*agentService)(nil)
 // supplied dependencies. main() (or a test helper) calls this
 // when bringing up the RPC server.
 //
+// T6 adds auditSeq / backend / txFactory:
+//   - auditSeq is bumped by tx.Local on every ApplyIntent outcome
+//     (success / transient / persistent). Tests may pass nil —
+//     the agentService seeds a private counter in that case.
+//   - backend is an optional override for ApplyIntent /
+//     SnapshotRequest. Production passes nil and the handler
+//     selects via rollback.SelectBackend per RPC. Tests pass a
+//     fake that records invocations without touching the host.
+//   - txFactory is the injection point for ApplyIntent's tx
+//     construction. Production passes nil and the handler uses
+//     the default tx.New with the T6 apply stub. Tests can
+//     substitute a fake.
+//
 // startedAt is captured here so uptime is measured from
 // construction (which is shortly before serve, modulo
 // listener-bind time).
-func newAgentService(cfg *config.Config, certInfo *cert.Info, det *snapshot.Detector) *agentService {
+func newAgentService(cfg *config.Config, certInfo *cert.Info, det *snapshot.Detector, auditSeq *atomic.Uint64, backend rollback.Backend, txFactory TxFactory) *agentService {
+	if auditSeq == nil {
+		auditSeq = new(atomic.Uint64)
+	}
 	return &agentService{
 		cfg:       cfg,
 		certInfo:  certInfo,
 		snapshot:  det,
+		auditSeq:  auditSeq,
+		backend:   backend,
+		txFactory: txFactory,
 		startedAt: time.Now().UTC(),
 	}
+}
+
+// selectedBackend returns the rollback backend for the
+// current RPC invocation. If a test-injected backend is set,
+// it is returned as-is (the detector is bypassed). Otherwise
+// the agent selects via rollback.SelectBackend based on the
+// live detector capability.
+//
+// Returns ErrNoBackend when the capability is NONE / UNSPECIFIED
+// / an unknown enum value. Callers are responsible for checking
+// the snapshot capability separately (RF3 admission check).
+func (s *agentService) selectedBackend() (rollback.Backend, error) {
+	if s.backend != nil {
+		return s.backend, nil
+	}
+	return rollback.SelectBackend(s.snapshot.Capability())
+}
+
+// buildTx constructs the per-RPC ApplyIntent transaction. If a
+// test-injected txFactory is set, it is used; otherwise the
+// production default (tx.New with the T6 apply stub) is used.
+// The passed backend and auditSeq are forwarded to the tx.
+func (s *agentService) buildTx(backend rollback.Backend) tx.Tx {
+	if s.txFactory != nil {
+		return s.txFactory(backend, s.cfg.DataDir, s.auditSeq)
+	}
+	return tx.New(backend, applyStub, s.cfg.DataDir, s.auditSeq)
+}
+
+// applyStub is the T6 apply step. It only logs the intent and
+// returns nil; T7+ replaces it with a real package manager /
+// filesystem executor that respects ctx.Done().
+//
+// Exported at package scope (not method) so tx.New can capture
+// it as an ApplyFunc without instantiating agentService.
+func applyStub(_ context.Context, intent *agentv1.ApplyIntentRequest) error {
+	log.Printf("agent: apply stub (T6): intent_id=%q kind=%q target=%q (T7+ replaces with real ops)",
+		intent.IntentId, intent.Kind, intent.Target)
+	return nil
 }

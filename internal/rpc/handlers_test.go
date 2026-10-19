@@ -24,6 +24,7 @@ import (
 	"errors"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -42,19 +43,64 @@ import (
 
 // testRig bundles a live *rpc.Server with a *grpc.ClientConn
 // already wired up to it. Tests defer rig.Cleanup() and use
-// rig.Client to invoke RPCs.
+// rig.Client to invoke RPCs. Backend is the rigMockBackend
+// pre-wired into the server (tests can mutate its createErr /
+// restoreErr to exercise failure paths).
 type testRig struct {
 	Server  *rpc.Server
 	Conn    *grpc.ClientConn
 	Client  agentv1.AgentServiceClient
+	Backend *rigMockBackend
 	Cleanup func()
+}
+
+// rigMockBackend is a hermetic rollback.Backend used by the
+// T6 handler-level tests. It satisfies rollback.Backend via
+// in-memory state and returns the configured createErr /
+// restoreErr. Defaults to nil errors (happy path).
+type rigMockBackend struct {
+	mu                    sync.Mutex
+	createErr             error
+	restoreErr            error
+	createCalls, restoreCalls int
+	lastSrc, lastSnap         string
+	lastSnapPath, lastTarget  string
+}
+
+func (m *rigMockBackend) CreateSnapshot(src, snap string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.createCalls++
+	m.lastSrc = src
+	m.lastSnap = snap
+	return m.createErr
+}
+
+func (m *rigMockBackend) Restore(snap, target string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.restoreCalls++
+	m.lastSnapPath = snap
+	m.lastTarget = target
+	return m.restoreErr
 }
 
 // startTestServerWithSnapshot stands up a fully-wired agentServer
 // with a preset snapshot capability, then dials it as a real gRPC
 // client. The PKI is fresh per test (60h TTL, well outside the
 // loader's 24h rotation window).
+//
+// The rig pre-wires a hermetic rigMockBackend as the rollback
+// backend (injected via ServiceDeps.Backend) so the handler
+// exercises the wired-up state machine without requiring real
+// btrfs / rsync on the test runner. The mock defaults to
+// success — tests that need failure paths reach into
+// rig.Backend to substitute.
 func startTestServerWithSnapshot(t *testing.T, cap agentv1.SnapshotCapability) *testRig {
+	t.Helper()
+
+	mockBackend := &rigMockBackend{}
+	// ... caller-provided content preserved below
 	t.Helper()
 
 	caCertPEM, caKeyPEM, serverCertPEM, serverKeyPEM := buildPKIAt(t,
@@ -110,6 +156,7 @@ func startTestServerWithSnapshot(t *testing.T, cap agentv1.SnapshotCapability) *
 		Cfg:      cfg,
 		CertInfo: info,
 		Snapshot: detector,
+		Backend:  mockBackend,
 	})
 	if err != nil {
 		t.Fatalf("rpc.NewServer: %v", err)
@@ -142,9 +189,10 @@ func startTestServerWithSnapshot(t *testing.T, cap agentv1.SnapshotCapability) *
 	_, _ = client.Register(probeCtx, &agentv1.RegisterRequest{AgentId: "agent-probe"})
 	probeCancel()
 	return &testRig{
-		Server: srv,
-		Conn:   conn,
-		Client: client,
+		Server:  srv,
+		Conn:    conn,
+		Client:  client,
+		Backend: mockBackend,
 		Cleanup: func() {
 			srv.Stop()
 			_ = conn.Close()

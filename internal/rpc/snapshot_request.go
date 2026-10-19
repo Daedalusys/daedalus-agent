@@ -15,9 +15,12 @@
 //     was acknowledged and recorded; a refused SnapshotRequest
 //     means the control plane's plan gate cannot proceed at
 //     all — it is structurally equivalent to "RPC failed").
-//  2. For non-NONE capabilities, T5 stubs a synthetic
-//     snapshot_id. T6 will replace this stub with the real
-//     btrfs / rsync filesystem primitives.
+//  2. For non-NONE capabilities, T6 invokes the snapshot
+//     backend (btrfs / rsync via internal/rollback) to take
+//     a real snapshot and returns the snapshot_id derived
+//     from the snapshot path. The btrfs / rsync split is
+//     transparent to the control plane — only backend_used
+//     names which one was used.
 //
 // Rationale for the FailedPrecondition (not body-refusal) split:
 //
@@ -38,6 +41,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"log"
+	"path/filepath"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -55,15 +59,25 @@ import (
 //     ApplyIntent-vs-SnapshotRequest split).
 //
 // Response (success path):
-//   - snapshot_id: synthetic, "snap-<8-hex>". T6 replaces with
-//     the real snapshot identifier (btrfs subvolume path or
-//     rsync target path).
-//   - backend_used: the agent's detected snapshot capability.
+//   - snapshot_id: derived from the snapshot path, "snap-<hex>".
+//     The hex portion is random; the path on disk is
+//     <dataDir>/snapshots/<id>.snap (btrfs subvolume) or
+//     <dataDir>/snapshots/<id>/ (rsync file-copy dir).
+//   - backend_used: the agent's detected snapshot capability
+//     (BTRFS_SUBVOLUME or RSYNC_TARGET for P0.5).
 //   - created_at_unix: time.Now().Unix().
 //
 // Response (refusal path, NONE):
 //   - gRPC status codes.FailedPrecondition with a clear
 //     message naming the missing backends.
+//
+// Failure paths:
+//
+//   A real backend failure (btrfs subvolume command error,
+//   rsync ENOSPC, etc.) returns codes.Internal with the
+//   wrapped error so the control plane's log distinguishes
+//   "agent can't reach the snapshot primitive" from
+//   "agent has no snapshot primitive at all".
 func (s *agentService) SnapshotRequest(ctx context.Context, req *agentv1.SnapshotRequestRequest) (*agentv1.SnapshotResponse, error) {
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "SnapshotRequest: nil request")
@@ -80,12 +94,32 @@ func (s *agentService) SnapshotRequest(ctx context.Context, req *agentv1.Snapsho
 			"SnapshotRequest: agent has no snapshot backend (btrfs/rsync/lvm/snapper all absent)")
 	}
 
-	// Stub success. T6 wires the real snapshot primitives in
-	// this branch (btrfs subvolume create / rsync to target
-	// directory).
+	backend, err := s.selectedBackend()
+	if err != nil {
+		// Defensive — should not happen given the NONE check.
+		log.Printf("agent: SnapshotRequest backend selection failed after RF3 admission: reason=%q cap=%v err=%v",
+			req.Reason, capability, err)
+		return nil, status.Error(codes.FailedPrecondition,
+			"SnapshotRequest: backend selection failed after RF3 admission")
+	}
+
+	// Build snapshot paths. We snapshot the dataDir's
+	// intent-target directory (the same target ApplyIntent
+	// modifies). The snapshot_id is randomised so concurrent
+	// SnapshotRequest calls don't collide on the snapshot path.
 	snapID := "snap-" + randomHexID(8)
-	log.Printf("agent: SnapshotRequest stub success: snapshot_id=%q backend=%v reason=%q (T5 stub; T6 wires real snapshot primitives)",
-		snapID, capability, req.Reason)
+	sourcePath := filepath.Join(s.cfg.DataDir, "intent-target")
+	snapshotPath := filepath.Join(s.cfg.DataDir, "snapshots", snapID)
+
+	if err := backend.CreateSnapshot(sourcePath, snapshotPath); err != nil {
+		log.Printf("agent: SnapshotRequest backend CreateSnapshot failed: snapshot_id=%q backend=%v err=%v",
+			snapID, capability, err)
+		return nil, status.Error(codes.Internal,
+			"SnapshotRequest: backend CreateSnapshot failed: "+err.Error())
+	}
+
+	log.Printf("agent: SnapshotRequest success: snapshot_id=%q backend=%v reason=%q path=%q",
+		snapID, capability, req.Reason, snapshotPath)
 	return &agentv1.SnapshotResponse{
 		SnapshotId:    snapID,
 		BackendUsed:   capability,

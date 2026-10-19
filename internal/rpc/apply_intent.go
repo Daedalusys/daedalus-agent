@@ -25,25 +25,24 @@
 //     reviewer as "we will handle it" (false); the actual contract
 //     is "ApplyIntent refuses; the host has no recovery path".
 //
-//  2. For non-NONE capabilities, T5 stubs success with a
-//     synthetic tx_id. T6 will replace this stub with the real
-//     pre-snapshot → apply → post-snapshot → rollback state
-//     machine. The stub exists so the gRPC wire + audit shape
-//     can be exercised end-to-end at T5 without dragging in T6's
-//     filesystem primitives.
+//  2. For non-NONE capabilities, T6 wires the real pre-snapshot
+//     → apply → post-snapshot / rollback state machine via
+//     internal/tx.Local. The state machine handles pre-snapshot
+//     failure, apply failure with rollback success (TRANSIENT_FAILURE,
+//     safe to retry), and apply failure with rollback failure
+//     (PERSISTENT_FAILURE, host may be in undefined state).
 //
 // Audit logging:
 //
-// Both the refusal and the stub-success paths emit a single log
-// line tagged with the intent_id. T7 will move this into the
-// JSONL audit chain (issue #8 in followup); T5 uses the standard
-// log package to keep the surface minimal.
+// Every state-machine outcome emits a log line tagged with the
+// intent_id (the apply stub also emits its own log line). T7
+// will move this into the JSONL audit chain (issue #8 in
+// followup); T6 uses the standard log package to keep the
+// surface minimal.
 package rpc
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"log"
 
 	"google.golang.org/grpc/codes"
@@ -73,16 +72,22 @@ const rf3RefusalMessage = "this machine has no snapshot backend (btrfs/rsync/lvm
 //
 // Response (success path):
 //   - result: APPLY_INTENT_RESULT_SUCCESS.
-//   - tx_id: synthetic, "tx-<8-hex>". T6 replaces with the real
-//     transaction ID after the apply state machine completes.
-//   - audit_seq: 0 in T5 (T7 fills from the JSONL audit chain).
+//   - tx_id: deterministic from intent_id, "tx-<intent_id>".
+//   - audit_seq: monotonic counter (per-process).
 //   - error_message: empty on success.
 //
 // Response (refusal path, RF3):
 //   - result: APPLY_INTENT_RESULT_REFUSED_SNAPSHOT_CAPABILITY_NONE.
 //   - tx_id: "" (no transaction was started).
-//   - audit_seq: 0.
+//   - audit_seq: monotonic counter at the refusal point.
 //   - error_message: rf3RefusalMessage.
+//
+// Response (failure paths via tx state machine):
+//   - pre-snapshot fail: TRANSIENT_FAILURE with explanation.
+//   - apply fail + rollback ok: TRANSIENT_FAILURE
+//     ("rolled back successfully").
+//   - apply fail + rollback fail: PERSISTENT_FAILURE
+//     (host may be in undefined state).
 //
 // Error semantics:
 //
@@ -93,6 +98,10 @@ const rf3RefusalMessage = "this machine has no snapshot backend (btrfs/rsync/lvm
 // codes.FailedPrecondition here would force the control plane
 // to distinguish "RPC transport failure" from "logical refusal",
 // and the proto is explicit that the latter lives in the body.
+//
+// True transport failures (e.g. the tx state machine panicking)
+// DO return a non-nil error — they map to codes.Internal via
+// the gRPC default handler.
 func (s *agentService) ApplyIntent(ctx context.Context, req *agentv1.ApplyIntentRequest) (*agentv1.ApplyIntentResponse, error) {
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "ApplyIntent: nil request")
@@ -102,36 +111,38 @@ func (s *agentService) ApplyIntent(ctx context.Context, req *agentv1.ApplyIntent
 
 	// RF3: refuse on NONE with a clear explanation.
 	if capability == agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE {
-		log.Printf("agent: ApplyIntent refused (RF3): intent_id=%q kind=%q target=%q — %s",
-			req.IntentId, req.Kind, req.Target, rf3RefusalMessage)
+		// audit_seq is bumped even on refusal so the
+		// control plane's audit log shows every
+		// admission-control event.
+		auditSeq := s.auditSeq.Add(1)
+		log.Printf("agent: ApplyIntent refused (RF3): intent_id=%q kind=%q target=%q audit_seq=%d — %s",
+			req.IntentId, req.Kind, req.Target, auditSeq, rf3RefusalMessage)
 		return &agentv1.ApplyIntentResponse{
 			Result:       agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_REFUSED_SNAPSHOT_CAPABILITY_NONE,
 			ErrorMessage: rf3RefusalMessage,
+			AuditSeq:     auditSeq,
 		}, nil
 	}
 
-	// Stub success. T6 wires the real pre-snapshot → apply →
-	// post-snapshot → rollback state machine in this branch.
-	txID := "tx-" + randomHex(8)
-	log.Printf("agent: ApplyIntent stub success: intent_id=%q tx_id=%q backend=%v (T5 stub; T6 wires real state machine)",
-		req.IntentId, txID, capability)
-	return &agentv1.ApplyIntentResponse{
-		Result: agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_SUCCESS,
-		TxId:   txID,
-	}, nil
-}
-
-// randomHex returns n random bytes encoded as hex. It panics if
-// crypto/rand fails (which it doesn't on linux/darwin in
-// practice — same rationale as Register's nodeID fallback).
-func randomHex(n int) string {
-	buf := make([]byte, n)
-	if _, err := rand.Read(buf); err != nil {
-		// Fall back to a deterministic-but-unique-enough
-		// string so the daemon doesn't crash on a hypothetical
-		// rand failure. The actual hex value is irrelevant —
-		// T5's tx_id is a stub, T6 replaces it.
-		return "deadbeef"
+	// Non-NONE path: build a per-RPC tx and run it. The
+	// tx-local state machine handles snapshot / apply /
+	// rollback semantically — we just forward the outcome.
+	backend, err := s.selectedBackend()
+	if err != nil {
+		// Should not happen given the RF3 admission check
+		// above, but the tx-local surface MUST be defended
+		// against a malformed detector state (e.g. an
+		// unexpected enum from a future proto change).
+		auditSeq := s.auditSeq.Add(1)
+		log.Printf("agent: ApplyIntent backend selection failed after RF3 admission: intent_id=%q cap=%v err=%v audit_seq=%d",
+			req.IntentId, capability, err, auditSeq)
+		return &agentv1.ApplyIntentResponse{
+			Result:       agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_REFUSED_SNAPSHOT_CAPABILITY_NONE,
+			ErrorMessage: rf3RefusalMessage,
+			AuditSeq:     auditSeq,
+		}, nil
 	}
-	return hex.EncodeToString(buf)
+
+	tx := s.buildTx(backend)
+	return tx.Run(ctx, req)
 }

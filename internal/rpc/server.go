@@ -16,6 +16,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"sync/atomic"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -24,7 +25,9 @@ import (
 
 	"github.com/Daedalusys/daedalus-agent/internal/cert"
 	"github.com/Daedalusys/daedalus-agent/internal/config"
+	"github.com/Daedalusys/daedalus-agent/internal/rollback"
 	"github.com/Daedalusys/daedalus-agent/internal/snapshot"
+	"github.com/Daedalusys/daedalus-agent/internal/tx"
 )
 
 // DefaultListenAddr is the port the gRPC server binds to. The
@@ -33,17 +36,26 @@ import (
 const DefaultListenAddr = ":9443"
 
 // ServiceDeps bundles the dependencies the agentService needs.
-// All three fields are required for a production server; tests
-// can pass nil for CertInfo (no cert metadata in Register
-// responses) and a stub snapshot.Detector (force a specific
-// capability via SetCapability).
 //
-// Cfg, CertInfo and Snapshot are retained by reference — the
-// caller must not mutate them after passing them in.
+// Required for production: Cfg, CertInfo, Snapshot, AuditSeq.
+// Optional (zero-value defaults apply):
+//   - Backend:  if non-nil, used as the rollback backend
+//     instead of SelectBackend(capability) for both ApplyIntent
+//     and SnapshotRequest. Tests use this to inject a mock
+//     backend that does not require a real btrfs / rsync on
+//     the host.
+//   - TxFactory: if non-nil, used instead of tx.New to
+//     construct the per-RPC transaction in ApplyIntent.
+//     Production leaves this nil (handler falls through to
+//     tx.New with a stub apply step).
+//
+// Cfg, CertInfo, Snapshot and Backend are retained by reference —
+// the caller must not mutate them after passing them in.
 type ServiceDeps struct {
 	// Cfg is the daemon's runtime config. The Register handler
-	// reads agent_id from here. nil is permitted only in tests
-	// that don't reach Register; production always supplies a
+	// reads agent_id from here; ApplyIntent reads DataDir for
+	// snapshot paths. nil is permitted only in tests that
+	// don't reach those handlers; production always supplies a
 	// non-nil cfg.
 	Cfg *config.Config
 
@@ -57,7 +69,32 @@ type ServiceDeps struct {
 	// nil is treated as a fresh, empty cache (first
 	// Capability() call probes the host).
 	Snapshot *snapshot.Detector
+
+	// AuditSeq is the per-process monotonic audit sequence
+	// counter shared by ApplyIntent (and future audit-emitting
+	// handlers). nil is permitted — the constructor allocates
+	// a private counter in that case (only useful in tests
+	// that don't care about absolute sequence numbers).
+	AuditSeq *atomic.Uint64
+
+	// Backend, if non-nil, overrides the per-RPC backend
+	// selection in ApplyIntent and SnapshotRequest. Tests use
+	// this to inject a recording fake (avoids requiring real
+	// btrfs / rsync on the test runner). Production leaves
+	// this nil — handlers call SelectBackend per RPC.
+	Backend rollback.Backend
+
+	// TxFactory, if non-nil, overrides tx.New in ApplyIntent.
+	// Production leaves this nil and accepts the default
+	// (tx.New with the T6 apply stub). Tests can substitute a
+	// canned-response Tx.
+	TxFactory TxFactory
 }
+
+// TxFactory constructs a per-RPC ApplyIntent transaction. Tests
+// inject a canned-response fake; production passes nil to
+// ServiceDeps and accepts the default tx.New.
+type TxFactory func(rollback.Backend, string, *atomic.Uint64) tx.Tx
 
 // Server wraps a *grpc.Server with the daedalus-agent defaults
 // already wired in: TLS credentials from the supplied *tls.Config
@@ -94,9 +131,12 @@ func NewServer(addr string, tlsCfg *tls.Config, deps ServiceDeps) (*Server, erro
 	if det == nil {
 		det = snapshot.NewDetector()
 	}
+	if deps.AuditSeq == nil {
+		deps.AuditSeq = new(atomic.Uint64)
+	}
 	creds := credentials.NewTLS(tlsCfg)
 	gs := grpc.NewServer(grpc.Creds(creds))
-	agentv1.RegisterAgentServiceServer(gs, newAgentService(deps.Cfg, deps.CertInfo, det))
+	agentv1.RegisterAgentServiceServer(gs, newAgentService(deps.Cfg, deps.CertInfo, det, deps.AuditSeq, deps.Backend, deps.TxFactory))
 	return &Server{grpc: gs, addr: addr}, nil
 }
 
