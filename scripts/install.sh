@@ -43,7 +43,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-ExecStart=${BIN_PATH} start --config /etc/daedalus-agent/config.yaml
+ExecStart=${BIN_PATH} daemon start --config /etc/daedalus-agent/config.yaml
 KillSignal=SIGTERM
 TimeoutStopSec=35
 Restart=on-failure
