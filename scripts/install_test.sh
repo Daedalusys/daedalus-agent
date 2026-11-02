@@ -118,6 +118,11 @@ log "using tarball: $TARBALL"
     && fail "uninstall.sh accepted --bogus-flag" \
     || log "uninstall.sh correctly rejects unknown args"
 
+# 单元 argv 与命令树必须一致（`start` 是 `daemon` 的子命令）;免 docker 也能守。
+grep -q 'ExecStart=.*daemon start --config' "${SCRIPTS_DIR}/install.sh" \
+    || fail "install.sh 的 ExecStart 未走 daemon start 子命令"
+pass "install.sh ExecStart 使用 daemon start"
+
 if [ "${SKIP_DOCKER:-0}" -eq 1 ]; then
     log "SKIP_DOCKER=1; skipping container validation"
     log "(install.sh was NOT executed end-to-end; this is a smoke test only)"
@@ -199,6 +204,15 @@ docker exec "$CONTAINER_NAME" test -d "/var/lib/${BIN_NAME}" \
 docker exec "$CONTAINER_NAME" test -e "/etc/${BIN_NAME}/config.yaml" \
     || fail "default config.yaml not at /etc/${BIN_NAME}/config.yaml"
 pass "install artifacts present"
+
+# 断言服务真的起来了 —— 只查产物存在会漏掉「单元写了但 argv 必崩」。
+AGENT_STATE="$(docker exec "$CONTAINER_NAME" systemctl is-active "${BIN_NAME}.service" 2>&1 || true)"
+assert_eq "$AGENT_STATE" "active" "daemon 未 active（ExecStart argv 可能写错）"
+if docker exec "$CONTAINER_NAME" journalctl -u "${BIN_NAME}.service" --no-pager -n 20 2>&1 \
+    | grep -q 'unknown command'; then
+    fail "daemon 日志出现 unknown command（子命令路径写错）"
+fi
+pass "daemon is active"
 
 # --- RF1: install.sh is idempotent -------------------------------------------
 

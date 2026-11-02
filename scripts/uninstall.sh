@@ -116,6 +116,9 @@ else
     log "binary not present at ${BIN_PATH}"
 fi
 
+# 删掉二进制后 bin/ 会空着,导致下面的"根非空"判定永远为真、留下空目录。
+sudo_if_needed rmdir --ignore-fail-on-non-empty "$INSTALL_ROOT/bin" 2>/dev/null || true
+
 # Remove the install root if empty (defensive — a half-removed install
 # shouldn't leave a stale /opt/daedalus-agent/ dir behind).
 if [ -d "$INSTALL_ROOT" ]; then
