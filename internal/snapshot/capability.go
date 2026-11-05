@@ -7,7 +7,7 @@
 // root filesystem is btrfs and the `btrfs` CLI is on PATH, an
 // rsync target if rsync is available but btrfs is not, or NONE
 // if neither is present. LVM-snap and snapper backends are out
-// of scope for P0.5 (deferred to issue #10) and are not probed
+// of scope for P0.5 (deferred to daedalus-agent#8) and are not probed
 // here — they are tracked separately.
 //
 // The result of Detect() flows into the gRPC Register response

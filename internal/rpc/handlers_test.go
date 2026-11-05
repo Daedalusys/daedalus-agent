@@ -19,10 +19,14 @@ package rpc_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -97,6 +101,14 @@ func (m *rigMockBackend) Restore(snap, target string) error {
 // success — tests that need failure paths reach into
 // rig.Backend to substitute.
 func startTestServerWithSnapshot(t *testing.T, cap agentv1.SnapshotCapability) *testRig {
+	return startTestServerConfigured(t, cap, nil)
+}
+
+// startTestServerConfigured is startTestServerWithSnapshot plus a hook
+// that mutates the agent's Config before the server is built. Tests that
+// need a non-default Config field (e.g. PolicyPath) use this seam; every
+// other test keeps calling the wrapper and stays untouched.
+func startTestServerConfigured(t *testing.T, cap agentv1.SnapshotCapability, mutate func(*config.Config)) *testRig {
 	t.Helper()
 
 	mockBackend := &rigMockBackend{}
@@ -139,6 +151,9 @@ func startTestServerWithSnapshot(t *testing.T, cap agentv1.SnapshotCapability) *
 		KeyPath:          mustWrite(t, dir, "noop-c.key", []byte("")),
 		CAPath:           mustWrite(t, dir, "noop-ca.crt", []byte("")),
 		CAKeyPath:        mustWrite(t, dir, "noop-ca.key", []byte("")),
+	}
+	if mutate != nil {
+		mutate(cfg)
 	}
 
 	detector := snapshot.NewDetector()
@@ -266,6 +281,57 @@ func TestRegister_EmptyAgentID_ReturnsInvalidArgument(t *testing.T) {
 	}
 	if st.Code() != codes.InvalidArgument {
 		t.Errorf("code = %v, want InvalidArgument", st.Code())
+	}
+}
+
+// TestRegister_PolicyHashIsRealDigest pins the "configured + readable"
+// arm: when cfg.PolicyPath points at a readable file, the response's
+// policy_hash must be that file's sha256(hex) — not a placeholder.
+func TestRegister_PolicyHashIsRealDigest(t *testing.T) {
+	dir := t.TempDir()
+	policyPath := filepath.Join(dir, "policy.toml")
+	content := []byte("schema = \"daedalus.policy/v0\"\nmode = \"enforce\"\n")
+	if err := os.WriteFile(policyPath, content, 0o600); err != nil {
+		t.Fatalf("write policy: %v", err)
+	}
+	sum := sha256.Sum256(content)
+	want := hex.EncodeToString(sum[:])
+
+	rig := startTestServerConfigured(t, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_RSYNC_TARGET,
+		func(c *config.Config) { c.PolicyPath = policyPath })
+	defer rig.Cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := rig.Client.Register(ctx, &agentv1.RegisterRequest{AgentId: "agent-test-1"})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if resp.PolicyHash != want {
+		t.Errorf("PolicyHash = %q, want sha256 %q", resp.PolicyHash, want)
+	}
+}
+
+// TestRegister_FailedPreconditionWhenPolicyMissing pins the
+// "configured + unreadable" arm: a configured path whose file is gone
+// is a deployment accident, not a dev shape, so Register must surface
+// FailedPrecondition rather than silently falling back to "".
+func TestRegister_FailedPreconditionWhenPolicyMissing(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "absent.toml")
+
+	rig := startTestServerConfigured(t, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_RSYNC_TARGET,
+		func(c *config.Config) { c.PolicyPath = missing })
+	defer rig.Cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := rig.Client.Register(ctx, &agentv1.RegisterRequest{AgentId: "agent-test-1"})
+	if err == nil {
+		t.Fatal("Register with missing policy file: nil err; want FailedPrecondition")
+	}
+	st, _ := status.FromError(err)
+	if st.Code() != codes.FailedPrecondition {
+		t.Errorf("code = %v, want FailedPrecondition", st.Code())
 	}
 }
 

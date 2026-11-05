@@ -56,8 +56,10 @@ import (
 //   - snapshot_capability: from the snapshot detector.
 //   - cert_valid_until_unix: from cert.Info (0 if certInfo is
 //     nil — tests that don't care about cert metadata).
-//   - policy_hash: placeholder string (real hash is a future
-//     task).
+//   - policy_hash: sha256(hex) of the configured policy file.
+//     Empty when no policy path is configured (a supported dev
+//     shape); FailedPrecondition when a configured path is
+//     unreadable (a deployment accident — never a silent "").
 //   - heartbeat_interval_seconds: heartbeatIntervalSeconds.
 func (s *agentService) Register(ctx context.Context, req *agentv1.RegisterRequest) (*agentv1.RegisterResponse, error) {
 	if req == nil {
@@ -71,11 +73,16 @@ func (s *agentService) Register(ctx context.Context, req *agentv1.RegisterReques
 
 	nodeID := s.assignOrReuseNodeID(req.AgentId)
 
+	policyDigest, err := policyHash(s.cfg.PolicyPath)
+	if err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "Register: policy hash: %v", err)
+	}
+
 	resp := &agentv1.RegisterResponse{
 		NodeId:                   nodeID,
 		SnapshotCapability:       capability,
 		HeartbeatIntervalSeconds: heartbeatIntervalSeconds,
-		PolicyHash:               policyHashPlaceholder,
+		PolicyHash:               policyDigest,
 	}
 	if s.certInfo != nil {
 		resp.CertValidUntilUnix = s.certInfo.ValidUntil.Unix()

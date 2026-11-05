@@ -94,7 +94,7 @@ func TestSelectBackend_Unspecified_ReturnsErrNoBackend(t *testing.T) {
 // nothing" so the upgrade signal is preserved.
 func TestSelectBackend_DeferredCapabilities_ReturnsError(t *testing.T) {
 	// The current proto doesn't define LVM / snapper values
-	// (deferred to issue #10); use a high-numbered unknown
+	// (deferred to daedalus-agent#8); use a high-numbered unknown
 	// enum value to exercise the default branch.
 	unknown := agentv1.SnapshotCapability(99)
 	b, err := SelectBackend(unknown)

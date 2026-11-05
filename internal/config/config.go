@@ -28,6 +28,12 @@ type Config struct {
 	CAKeyPath        string `yaml:"ca_key_path"`
 	DataDir          string `yaml:"data_dir"`
 	AuditDir         string `yaml:"audit_dir"`
+
+	// PolicyPath is the path to the agent's active policy file. It is
+	// optional: an empty value means "no policy configured" — a
+	// supported development shape that hashes to "". It is deliberately
+	// NOT part of Validate()'s required set.
+	PolicyPath string `yaml:"policy_path"`
 }
 
 // Default returns a Config populated with sane defaults for local

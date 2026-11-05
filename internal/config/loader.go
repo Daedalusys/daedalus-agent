@@ -71,6 +71,7 @@ func applyEnvOverrides(cfg *Config) {
 		EnvKeyFor("CAPath"):           cfg.CAPath,
 		EnvKeyFor("DataDir"):          cfg.DataDir,
 		EnvKeyFor("AuditDir"):         cfg.AuditDir,
+		EnvKeyFor("PolicyPath"):       cfg.PolicyPath,
 	}
 	for key, fallback := range overrides {
 		if v, ok := lookupEnv(key); ok {
@@ -111,6 +112,8 @@ func applyOverride(cfg *Config, key, value, _ string) {
 		cfg.DataDir = value
 	case EnvKeyFor("AuditDir"):
 		cfg.AuditDir = value
+	case EnvKeyFor("PolicyPath"):
+		cfg.PolicyPath = value
 	}
 }
 
@@ -145,6 +148,8 @@ func EnvKeyFor(field string) string {
 		return EnvPrefix + "DATA_DIR"
 	case "AuditDir":
 		return EnvPrefix + "AUDIT_DIR"
+	case "PolicyPath":
+		return EnvPrefix + "POLICY_PATH"
 	}
 	// Unknown field — return a name that will never match an env var
 	// so applyEnvOverride silently skips it. We do NOT panic: callers

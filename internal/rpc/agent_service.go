@@ -44,19 +44,6 @@ import (
 // if the control plane flags false-positive dead nodes.
 const heartbeatIntervalSeconds = 30
 
-// policyHashPlaceholder is the placeholder policy_hash the
-// agent returns in Register. The real policy hash comes from
-// hashing the active /etc/daedalus-agent/policy.toml file; T5
-// stubs the placeholder because the policy loader itself is
-// out of scope for P0.5 (issue #8 in the followup queue).
-//
-// We deliberately return a recognisable, non-empty string
-// rather than an empty field so the control plane can tell
-// "agent does not yet compute the real hash" apart from
-// "agent has empty policy". A future task replaces this with
-// the real hash.
-const policyHashPlaceholder = "unhashed-policy-v0"
-
 // agentService is the T5 production implementation of
 // agentv1.AgentServiceServer. All five RPCs are real handlers
 // (each in its own file); the embed keeps us forward-compatible

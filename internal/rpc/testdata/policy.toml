@@ -1,0 +1,4 @@
+# Test fixture for policy_hash_test.go. Content is arbitrary; the test
+# recomputes sha256 over these exact bytes and compares.
+schema = "daedalus.policy/v0"
+mode = "enforce"

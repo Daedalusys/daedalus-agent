@@ -11,7 +11,7 @@
 //     from). Wired through RsyncBackend.
 //
 // LVM-snap and snapper are out of scope for P0.5 (tracked in
-// `daedalus-agent#10`). SelectBackend only returns a backend for
+// `daedalus-agent#8`). SelectBackend only returns a backend for
 // SNAPSHOT_CAPABILITY_BTRFS_SUBVOLUME and
 // SNAPSHOT_CAPABILITY_RSYNC_TARGET; other capabilities (NONE,
 // UNSPECIFIED, the deferred LVM / snapper values) yield
