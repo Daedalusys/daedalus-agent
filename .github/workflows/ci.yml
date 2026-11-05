@@ -28,16 +28,24 @@ jobs:
       - name: Checkout agent
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # 不把 GITHUB_TOKEN 持久化进 .git/config:本仓 CI 没有任何一步靠
+          # .git/config 的 http.extraheader 取凭据,不留跨 step 存活的 token。
+          persist-credentials: false
           path: daedalus-agent
       - name: Checkout SDK (sibling; go.mod 的 replace => ../daedalus-sdk)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           repository: Daedalusys/daedalus-sdk
           path: daedalus-sdk
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.26.x'
+          # 两个 job 都由 pull_request 触发 → 显式关掉 module cache:cache 按
+          # 分支作用域共享,基础分支能读到 PR 分支写入的条目(实测本仓已存在
+          # refs/pull/4/merge 写入的 setup-go 条目),那是 cache 投毒的读侧。
+          cache: false
           cache-dependency-path: |
             daedalus-agent/go.sum
             daedalus-sdk/go.sum
@@ -55,16 +63,20 @@ jobs:
       - name: Checkout agent
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           path: daedalus-agent
       - name: Checkout SDK (sibling)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           repository: Daedalusys/daedalus-sdk
           path: daedalus-sdk
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.26.x'
+          # 同 go-test job:PR 可达 → cache: false。
+          cache: false
           cache-dependency-path: |
             daedalus-agent/go.sum
             daedalus-sdk/go.sum
