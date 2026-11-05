@@ -53,16 +53,22 @@ func LoadWithEnvOverride(path string) (*Config, error) {
 	return cfg, nil
 }
 
-// applyEnvOverrides walks the Config's fields and applies any matching
-// DAEDALUS_AGENT_<UPPER_FIELD> env var. Reflection keeps the mapping
-// in one place: add a field to Config and it picks up an env override
-// for free (EnvKeyFor documents the contract for ops).
+// applyEnvOverrides applies any matching DAEDALUS_AGENT_<UPPER_FIELD>
+// env var to cfg.
+//
+// The mapping is hand-maintained in three places that must stay in sync:
+// the overrides map below, applyOverride's switch, and EnvKeyFor's
+// switch. There is no reflection here — an earlier comment in this
+// function claimed there was, and that false claim is how CAKeyPath came
+// to be missing from all three tables (the env var set, the field never
+// changed, and main() then silently disabled the mTLS server).
+// TestLoader_EnvKeysCoverAllConfigFields is the guard that keeps the
+// three tables complete.
 func applyEnvOverrides(cfg *Config) {
 	if cfg == nil {
 		return
 	}
-	// Use field-name-driven mapping so a new field on Config is
-	// automatically env-overridable, no manual case-list maintenance.
+	// Hand-maintained map — keep in sync with applyOverride and EnvKeyFor.
 	overrides := map[string]string{
 		EnvKeyFor("AgentID"):          cfg.AgentID,
 		EnvKeyFor("ControlPlaneAddr"): cfg.ControlPlaneAddr,

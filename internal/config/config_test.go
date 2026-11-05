@@ -146,27 +146,30 @@ func TestValidate_NilConfig_Fails(t *testing.T) {
 
 func TestResolveDirs_RelativePaths_BecomeAbsolute(t *testing.T) {
 	cfg := &config.Config{
-		DataDir:  "data",
-		AuditDir: "audit",
-		CertPath: "tls/cert.pem",
-		KeyPath:  "tls/agent.key",
-		CAPath:   "tls/ca.pem",
+		DataDir:    "data",
+		AuditDir:   "audit",
+		CertPath:   "tls/cert.pem",
+		KeyPath:    "tls/agent.key",
+		CAPath:     "tls/ca.pem",
+		PolicyPath: "policy.toml",
 	}
 	cfg.ResolveDirs("/etc/daedalus-agent")
 
 	want := map[string]string{
-		"DataDir":  "/etc/daedalus-agent/data",
-		"AuditDir": "/etc/daedalus-agent/audit",
-		"CertPath": "/etc/daedalus-agent/tls/cert.pem",
-		"KeyPath":  "/etc/daedalus-agent/tls/agent.key",
-		"CAPath":   "/etc/daedalus-agent/tls/ca.pem",
+		"DataDir":    "/etc/daedalus-agent/data",
+		"AuditDir":   "/etc/daedalus-agent/audit",
+		"CertPath":   "/etc/daedalus-agent/tls/cert.pem",
+		"KeyPath":    "/etc/daedalus-agent/tls/agent.key",
+		"CAPath":     "/etc/daedalus-agent/tls/ca.pem",
+		"PolicyPath": "/etc/daedalus-agent/policy.toml",
 	}
 	got := map[string]string{
-		"DataDir":  cfg.DataDir,
-		"AuditDir": cfg.AuditDir,
-		"CertPath": cfg.CertPath,
-		"KeyPath":  cfg.KeyPath,
-		"CAPath":   cfg.CAPath,
+		"DataDir":    cfg.DataDir,
+		"AuditDir":   cfg.AuditDir,
+		"CertPath":   cfg.CertPath,
+		"KeyPath":    cfg.KeyPath,
+		"CAPath":     cfg.CAPath,
+		"PolicyPath": cfg.PolicyPath,
 	}
 	for k, w := range want {
 		if got[k] != w {
