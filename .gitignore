@@ -19,3 +19,6 @@ coverage.html
 
 # Local scratch (SDD review packages, test scaffolding)
 /.superpowers/
+
+# superpowers 计划/规格件:与 core/sdk/plugins 三仓同形,本机工作产物不入库
+docs/superpowers/
