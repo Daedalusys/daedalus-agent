@@ -3,6 +3,7 @@ package config_test
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -278,11 +279,64 @@ func TestEnvKeyFor_FieldName(t *testing.T) {
 		{"CAPath", envPrefix + "CA_PATH"},
 		{"DataDir", envPrefix + "DATA_DIR"},
 		{"AuditDir", envPrefix + "AUDIT_DIR"},
+		{"CAKeyPath", envPrefix + "CA_KEY_PATH"},
+		{"PolicyPath", envPrefix + "POLICY_PATH"},
 	}
 	for _, c := range cases {
 		got := config.EnvKeyFor(c.field)
 		if !strings.EqualFold(got, c.want) {
 			t.Errorf("EnvKeyFor(%q) = %q, want %q", c.field, got, c.want)
 		}
+	}
+}
+
+// TestLoader_EnvOverride_CAKeyPath pins the exact env key for CAKeyPath:
+// DAEDALUS_AGENT_CA_KEY_PATH (the same underscore rule as CA_PATH →
+// CAPath), NOT DAEDALUS_AGENT_CAKEYPATH. main() disables the mTLS gRPC
+// server whenever CAKeyPath is empty, so an unhonored override means a
+// pure-env deployment comes up looking healthy while listening on
+// nothing.
+func TestLoader_EnvOverride_CAKeyPath(t *testing.T) {
+	t.Setenv("DAEDALUS_AGENT_CA_KEY_PATH", "/tmp/ca-key.pem")
+
+	cfg, err := config.LoadWithEnvOverride("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.CAKeyPath != "/tmp/ca-key.pem" {
+		t.Errorf("CAKeyPath = %q, want /tmp/ca-key.pem", cfg.CAKeyPath)
+	}
+}
+
+// TestLoader_EnvKeysCoverAllConfigFields reflects over every field on
+// Config, maps it to its env key via EnvKeyFor, and asserts
+// LoadWithEnvOverride honors it. A field missing from any of the three
+// tables (overrides / applyOverride / EnvKeyFor) fails here. CAKeyPath
+// is exactly that historical gap.
+func TestLoader_EnvKeysCoverAllConfigFields(t *testing.T) {
+	typ := reflect.TypeOf(config.Config{})
+	for i := 0; i < typ.NumField(); i++ {
+		field := typ.Field(i)
+		if field.Type.Kind() != reflect.String {
+			t.Fatalf("Config.%s is not a string; extend this test for kind %s", field.Name, field.Type.Kind())
+		}
+		t.Run(field.Name, func(t *testing.T) {
+			key := config.EnvKeyFor(field.Name)
+			if key == "" {
+				t.Fatalf("EnvKeyFor(%q) returned empty", field.Name)
+			}
+			want := "from-env-" + field.Name
+			t.Setenv(key, want)
+
+			cfg, err := config.LoadWithEnvOverride("")
+			if err != nil {
+				t.Fatalf("LoadWithEnvOverride: %v", err)
+			}
+			got := reflect.ValueOf(cfg).Elem().FieldByName(field.Name).String()
+			if got != want {
+				t.Errorf("field %s not env-overridable: set %s=%q, got %q",
+					field.Name, key, want, got)
+			}
+		})
 	}
 }

@@ -69,6 +69,7 @@ func applyEnvOverrides(cfg *Config) {
 		EnvKeyFor("CertPath"):         cfg.CertPath,
 		EnvKeyFor("KeyPath"):          cfg.KeyPath,
 		EnvKeyFor("CAPath"):           cfg.CAPath,
+		EnvKeyFor("CAKeyPath"):        cfg.CAKeyPath,
 		EnvKeyFor("DataDir"):          cfg.DataDir,
 		EnvKeyFor("AuditDir"):         cfg.AuditDir,
 		EnvKeyFor("PolicyPath"):       cfg.PolicyPath,
@@ -108,6 +109,8 @@ func applyOverride(cfg *Config, key, value, _ string) {
 		cfg.KeyPath = value
 	case EnvKeyFor("CAPath"):
 		cfg.CAPath = value
+	case EnvKeyFor("CAKeyPath"):
+		cfg.CAKeyPath = value
 	case EnvKeyFor("DataDir"):
 		cfg.DataDir = value
 	case EnvKeyFor("AuditDir"):
@@ -144,6 +147,8 @@ func EnvKeyFor(field string) string {
 		return EnvPrefix + "KEY_PATH"
 	case "CAPath":
 		return EnvPrefix + "CA_PATH"
+	case "CAKeyPath":
+		return EnvPrefix + "CA_KEY_PATH"
 	case "DataDir":
 		return EnvPrefix + "DATA_DIR"
 	case "AuditDir":
