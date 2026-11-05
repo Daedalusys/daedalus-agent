@@ -54,10 +54,11 @@ const DefaultListenAddr = ":9443"
 // the caller must not mutate them after passing them in.
 type ServiceDeps struct {
 	// Cfg is the daemon's runtime config. The Register handler
-	// reads agent_id from here; ApplyIntent reads DataDir for
-	// snapshot paths. nil is permitted only in tests that
-	// don't reach those handlers; production always supplies a
-	// non-nil cfg.
+	// reads agent_id and PolicyPath from here (PolicyPath is read
+	// from disk to compute the response's policy_hash); ApplyIntent
+	// reads DataDir for snapshot paths. Register therefore requires a
+	// non-nil cfg: production always supplies one, and tests that
+	// reach Register must too.
 	Cfg *config.Config
 
 	// CertInfo carries the cert's NotAfter + SHA-256

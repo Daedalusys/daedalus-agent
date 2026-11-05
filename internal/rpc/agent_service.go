@@ -44,19 +44,6 @@ import (
 // if the control plane flags false-positive dead nodes.
 const heartbeatIntervalSeconds = 30
 
-// policyHashPlaceholder is the placeholder policy_hash the
-// agent returns in Register. The real policy hash comes from
-// hashing the active /etc/daedalus-agent/policy.toml file; T5
-// stubs the placeholder because the policy loader itself is
-// out of scope for P0.5 (issue #8 in the followup queue).
-//
-// We deliberately return a recognisable, non-empty string
-// rather than an empty field so the control plane can tell
-// "agent does not yet compute the real hash" apart from
-// "agent has empty policy". A future task replaces this with
-// the real hash.
-const policyHashPlaceholder = "unhashed-policy-v0"
-
 // agentService is the T5 production implementation of
 // agentv1.AgentServiceServer. All five RPCs are real handlers
 // (each in its own file); the embed keeps us forward-compatible
@@ -77,10 +64,10 @@ type agentService struct {
 	mu sync.Mutex // protects nodeID (assigned once at first Register)
 
 	// cfg is the daemon's runtime config (agent_id, cert
-	// paths, etc.). The Register handler reads agent_id from
-	// here. The cert paths in cfg are consumed by main() to
-	// construct the TLS config; the handlers themselves do not
-	// touch the filesystem.
+	// paths, etc.). The Register handler reads agent_id and
+	// PolicyPath from here: PolicyPath is read from disk to
+	// compute the response's policy_hash. The cert paths in cfg
+	// are consumed by main() to construct the TLS config.
 	cfg *config.Config
 
 	// certInfo carries the cert's NotAfter + SHA-256

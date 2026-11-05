@@ -35,10 +35,10 @@
 // Audit logging:
 //
 // Every state-machine outcome emits a log line tagged with the
-// intent_id (the apply stub also emits its own log line). T7
-// will move this into the JSONL audit chain (issue #8 in
-// followup); T6 uses the standard log package to keep the
-// surface minimal.
+// intent_id (the apply stub also emits its own log line). Moving
+// this into the JSONL audit chain is tracked in daedalus-agent#7;
+// until then we use the standard log package to keep the surface
+// minimal.
 package rpc
 
 import (

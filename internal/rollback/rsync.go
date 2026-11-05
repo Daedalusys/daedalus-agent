@@ -28,7 +28,7 @@
 //   - File-copy snapshots are a well-understood operational
 //     pattern — the warn surface makes the trade-off visible
 //     to reviewers; a stricter atomic alternative (lvm-snap /
-//     snapper) is tracked in daedalus-agent#10.
+//     snapper) is tracked in daedalus-agent#8.
 //
 // Trailing-slash invariant:
 //

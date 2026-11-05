@@ -28,6 +28,14 @@ type Config struct {
 	CAKeyPath        string `yaml:"ca_key_path"`
 	DataDir          string `yaml:"data_dir"`
 	AuditDir         string `yaml:"audit_dir"`
+
+	// PolicyPath is the path to the agent's active policy file. It is
+	// optional: an empty value means "no policy configured" — a
+	// supported development shape that hashes to "". It is deliberately
+	// NOT part of Validate()'s required set. Like the other path
+	// fields, a relative value is resolved against the config file's
+	// directory by ResolveDirs.
+	PolicyPath string `yaml:"policy_path"`
 }
 
 // Default returns a Config populated with sane defaults for local
@@ -100,6 +108,7 @@ func (c *Config) ResolveDirs(baseDir string) {
 	c.KeyPath = resolvePath(c.KeyPath, baseDir)
 	c.CAPath = resolvePath(c.CAPath, baseDir)
 	c.CAKeyPath = resolvePath(c.CAKeyPath, baseDir)
+	c.PolicyPath = resolvePath(c.PolicyPath, baseDir)
 }
 
 func resolvePath(p, base string) string {

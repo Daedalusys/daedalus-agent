@@ -3,6 +3,7 @@ package config_test
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -278,6 +279,8 @@ func TestEnvKeyFor_FieldName(t *testing.T) {
 		{"CAPath", envPrefix + "CA_PATH"},
 		{"DataDir", envPrefix + "DATA_DIR"},
 		{"AuditDir", envPrefix + "AUDIT_DIR"},
+		{"CAKeyPath", envPrefix + "CA_KEY_PATH"},
+		{"PolicyPath", envPrefix + "POLICY_PATH"},
 	}
 	for _, c := range cases {
 		got := config.EnvKeyFor(c.field)
@@ -285,4 +288,82 @@ func TestEnvKeyFor_FieldName(t *testing.T) {
 			t.Errorf("EnvKeyFor(%q) = %q, want %q", c.field, got, c.want)
 		}
 	}
+}
+
+// TestLoader_EnvOverride_CAKeyPath pins the exact env key for CAKeyPath:
+// DAEDALUS_AGENT_CA_KEY_PATH (the same underscore rule as CA_PATH →
+// CAPath), NOT DAEDALUS_AGENT_CAKEYPATH. main() disables the mTLS gRPC
+// server whenever CAKeyPath is empty, so an unhonored override means a
+// pure-env deployment comes up looking healthy while listening on
+// nothing.
+func TestLoader_EnvOverride_CAKeyPath(t *testing.T) {
+	t.Setenv("DAEDALUS_AGENT_CA_KEY_PATH", "/tmp/ca-key.pem")
+
+	cfg, err := config.LoadWithEnvOverride("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.CAKeyPath != "/tmp/ca-key.pem" {
+		t.Errorf("CAKeyPath = %q, want /tmp/ca-key.pem", cfg.CAKeyPath)
+	}
+}
+
+// TestLoader_EnvKeysCoverAllConfigFields reflects over every field on
+// Config, derives the env key each field must have, and asserts
+// LoadWithEnvOverride honors it. A field missing from any of the three
+// tables (overrides / applyOverride / EnvKeyFor) fails here: the name is
+// derived from the field name rather than read back from EnvKeyFor, so
+// a field that falls through EnvKeyFor's switch to its non-conventional
+// fallback is caught too. CAKeyPath is exactly that historical gap.
+func TestLoader_EnvKeysCoverAllConfigFields(t *testing.T) {
+	typ := reflect.TypeOf(config.Config{})
+	for i := 0; i < typ.NumField(); i++ {
+		field := typ.Field(i)
+		if field.Type.Kind() != reflect.String {
+			t.Fatalf("Config.%s is not a string; extend this test for kind %s", field.Name, field.Type.Kind())
+		}
+		t.Run(field.Name, func(t *testing.T) {
+			wantKey := envKeyForConvention(field.Name)
+			if got := config.EnvKeyFor(field.Name); got != wantKey {
+				t.Errorf("EnvKeyFor(%q) = %q, want %q — field may be missing from EnvKeyFor's switch",
+					field.Name, got, wantKey)
+			}
+			want := "from-env-" + field.Name
+			t.Setenv(wantKey, want)
+
+			cfg, err := config.LoadWithEnvOverride("")
+			if err != nil {
+				t.Fatalf("LoadWithEnvOverride: %v", err)
+			}
+			got := reflect.ValueOf(cfg).Elem().FieldByName(field.Name).String()
+			if got != want {
+				t.Errorf("field %s not env-overridable: set %s=%q, got %q",
+					field.Name, wantKey, want, got)
+			}
+		})
+	}
+}
+
+// envKeyForConvention derives the env-var name EnvKeyFor must return for
+// a Config field, from the field name alone: camelCase → DAEDALUS_AGENT_
+// SCREAMING_SNAKE (AgentID → AGENT_ID, CAKeyPath → CA_KEY_PATH). Deriving
+// it here rather than asking EnvKeyFor is what lets the reflective test
+// catch a field missing from EnvKeyFor's switch — such a field falls
+// through to the non-conventional fallback name (e.g. CAKEYPATH) and
+// fails the comparison.
+func envKeyForConvention(field string) string {
+	var b strings.Builder
+	for i := 0; i < len(field); i++ {
+		c := field[i]
+		if i > 0 && c >= 'A' && c <= 'Z' {
+			prev := field[i-1]
+			nextLower := i+1 < len(field) && field[i+1] >= 'a' && field[i+1] <= 'z'
+			if (prev >= 'a' && prev <= 'z') || (prev >= '0' && prev <= '9') ||
+				(prev >= 'A' && prev <= 'Z' && nextLower) {
+				b.WriteByte('_')
+			}
+		}
+		b.WriteByte(c)
+	}
+	return envPrefix + strings.ToUpper(b.String())
 }
