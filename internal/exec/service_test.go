@@ -33,16 +33,12 @@ func (h *fakeSystemd) run(_ context.Context, name string, args ...string) (strin
 			return h.showOut, h.showErr
 		}
 		if !h.exists[unit] {
-			return "Unit " + unit + " could not be found.", errors.New("exit status 4")
+			// 真机语义:单元不存在时 systemctl show **仍返回 rc=0**,
+			// 只有 LoadState=not-found / ActiveState=inactive。
+			// 观测端必须靠 LoadState 判不存在,不能靠退出码。
+			return "LoadState=not-found\nActiveState=inactive\nUnitFileState=\n", nil
 		}
-		prop := strings.TrimPrefix(args[1], "--property=")
-		switch prop {
-		case "ActiveState":
-			return "ActiveState=" + h.active[unit] + "\n", nil
-		case "UnitFileState":
-			return "UnitFileState=" + h.fileState[unit] + "\n", nil
-		}
-		return "", nil
+		return "LoadState=loaded\nActiveState=" + h.active[unit] + "\nUnitFileState=" + h.fileState[unit] + "\n", nil
 	}
 
 	verb, unit := args[0], args[1]
@@ -175,5 +171,74 @@ func TestService_IsIdempotent(t *testing.T) {
 		if c[0] == "systemctl" && c[1] != "show" {
 			t.Errorf("unexpected mutating call %v; already-satisfied state must be a no-op", c)
 		}
+	}
+}
+
+// 单元不存在时,**所有四值**都必须拒绝(真机上 systemctl show 对不存在的
+// 单元仍 rc=0,只有 LoadState=not-found 能揭露它 —— 靠退出码观测会把
+// "单元不存在"误读成"已停/已禁用"而回 SUCCESS)。
+func TestService_MissingUnitRejectedForEveryState(t *testing.T) {
+	const unit = "nope.service"
+	for _, state := range []string{"started", "stopped", "enabled", "disabled"} {
+		t.Run(state, func(t *testing.T) {
+			h := newFakeSystemd(unit)
+			h.exists[unit] = false
+			withFakeSystemd(t, h)
+
+			err := Apply(context.Background(), svcIntent(state, unit))
+			if !errors.Is(err, ErrPersistent) {
+				t.Fatalf("got %v, want ErrPersistent", err)
+			}
+			for _, c := range h.calls {
+				if c[1] != "show" {
+					t.Errorf("mutating call %v must not happen for a missing unit", c)
+				}
+			}
+		})
+	}
+}
+
+// 已取消的 ctx:必须在发变更命令前中止,且不改动宿主。
+func TestService_CancelledContextAborts(t *testing.T) {
+	const unit = "nginx.service"
+	h := newFakeSystemd(unit)
+	h.active[unit] = "inactive"
+	withFakeSystemd(t, h)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := Apply(ctx, svcIntent("started", unit))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v, want context.Canceled", err)
+	}
+	for _, c := range h.calls {
+		if c[1] != "show" {
+			t.Errorf("mutating call %v must not happen after cancellation", c)
+		}
+	}
+}
+
+// 幂等:变更动词跑完再连投同一 intent,不得再发一次变更命令。
+func TestService_IdempotentAfterMutation(t *testing.T) {
+	const unit = "nginx.service"
+	h := newFakeSystemd(unit)
+	withFakeSystemd(t, h)
+
+	intent := svcIntent("started", unit)
+	if err := Apply(context.Background(), intent); err != nil {
+		t.Fatalf("first Apply: %v", err)
+	}
+	if err := Apply(context.Background(), intent); err != nil {
+		t.Fatalf("second Apply: unexpected err: %v", err)
+	}
+
+	var starts int
+	for _, c := range h.calls {
+		if len(c) > 1 && c[1] == "start" {
+			starts++
+		}
+	}
+	if starts != 1 {
+		t.Errorf("systemctl start invocations = %d, got %d, want 1", starts, starts)
 	}
 }

@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"strings"
 
-	agentv1 "github.com/Daedalusys/daedalus-sdk/proto/agent/v1"
 	"github.com/Daedalusys/daedalus-sdk/pkgquery"
+	agentv1 "github.com/Daedalusys/daedalus-sdk/proto/agent/v1"
 )
 
 // package.set 的 kind 字符串。上线的是**资源 kind**(objectmodel.Kind
@@ -42,24 +42,32 @@ func detectHostManager() (hostManager, error) {
 	return hostManager{}, fmt.Errorf("%w: no host package manager found (need /usr/bin/apt-get or /usr/bin/dnf)", ErrPersistent)
 }
 
-// packageSpec 是 package.set 的 SpecJson schema。
+// packageSpec 是 package.set 的 SpecJson schema。Version 是控制面 spec 里
+// 已有的键(常带版本诉求),显式声明以免被 DisallowUnknownFields 连坐拒掉。
 type packageSpec struct {
 	DesiredState string `json:"desired_state"`
+	Version      string `json:"version"`
 }
 
 // packageDesiredState 解析并校验 desired_state。
 //
 // 未声明时按 present 处理:v1 的冻结三值里 present 是 package 意图的自然
 // 默认("把这个包装上"),而控制面 Plan 层的 Intent.Target 已带包名、
-// Spec 可缺省。显式写了表外值则拒绝 —— 那才是"无法判定"。
+// Spec 可只给 version。显式写了表外值则拒绝 —— 那才是"无法判定"。
+//
+// 未知键一律拒:拼错的 desired_stat 若被忽略,会静默落进上面的 present
+// 默认 —— 一个本意"卸载"的意图被翻成"安装",且没有任何报错。这是全部分支
+// 里唯一朝更危险方向默认的一条,必须堵死。
 func packageDesiredState(specJSON string) (string, error) {
 	raw := strings.TrimSpace(specJSON)
 	if raw == "" || raw == "null" {
 		return statePresent, nil
 	}
 	var spec packageSpec
-	if err := json.Unmarshal([]byte(raw), &spec); err != nil {
-		return "", fmt.Errorf("%w: package.set spec_json is not a JSON object: %v", ErrPersistent, err)
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&spec); err != nil {
+		return "", fmt.Errorf("%w: invalid package.set spec_json: %v", ErrPersistent, err)
 	}
 	switch spec.DesiredState {
 	case "":
@@ -145,6 +153,10 @@ func (packageExecutor) Apply(ctx context.Context, intent *agentv1.ApplyIntentReq
 
 // pkgInstalled 观测包是否已装。apt 用 dpkg-query(退出码 1 表示未装),
 // dnf 用 rpm -q。观测失败(非"未装")如实上抛,绝不谎报现状。
+//
+// 已知取舍:dpkg 下"已卸载但留有配置文件"(deinstall ok config-files)不算
+// 已装 —— desired_state=absent 因此不会去清理残留配置。这是有意的:clean
+// 会删掉运维可能仍要保留的配置,超出"卸载"的语义。
 func pkgInstalled(ctx context.Context, mgr hostManager, name string) (bool, error) {
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return false, fmt.Errorf("exec: package.set %q cancelled: %w", name, ctxErr)

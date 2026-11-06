@@ -11,9 +11,8 @@
 //     they disagree the client is either stale (server rotated
 //     and re-issued a new node_id) or hostile (replaying an
 //     old Heartbeat). Either way we reject with FailedPrecondition.
-//  2. Return ack=true with the configured heartbeat interval and
-//     the real pending_intents count — the number of intents
-//     ApplyIntent has accepted but not yet finished.
+//  2. 回报 ack=true、配置的心跳间隔,以及**真实**的 pending_intents ——
+//     已受理但尚未完成的 ApplyIntent 数。
 //
 // We intentionally do NOT log every Heartbeat: at 30s cadence a
 // noisy log fills quickly. Diagnostics live in the agent's
@@ -40,8 +39,7 @@ import (
 // Response:
 //   - ack: true.
 //   - next_heartbeat_seconds: heartbeatIntervalSeconds.
-//   - pending_intents: the number of intents accepted by
-//     ApplyIntent and not yet finished.
+//   - pending_intents:已受理但尚未完成的 ApplyIntent 数。
 func (s *agentService) Heartbeat(ctx context.Context, req *agentv1.HeartbeatRequest) (*agentv1.HeartbeatResponse, error) {
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "Heartbeat: nil request")

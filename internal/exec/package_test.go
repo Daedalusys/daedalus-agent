@@ -227,3 +227,71 @@ func TestPackage_MissingDesiredStateDefaultsToPresent(t *testing.T) {
 		t.Errorf("argv = %v, got %v, want %v", got, got, want)
 	}
 }
+
+// key 拼错(例如 desired_stat)不得静默 fail-open 成 install:未知键即拒。
+func TestPackage_TypoKeyIsPersistent(t *testing.T) {
+	h := &fakeHost{manager: "apt", installed: map[string]bool{}}
+	withFakeHost(t, h)
+
+	err := Apply(context.Background(), pkgIntent(`{"desired_stat":"absent"}`, "nginx"))
+	if !errors.Is(err, ErrPersistent) {
+		t.Fatalf("got %v, want ErrPersistent", err)
+	}
+	for _, c := range h.calls {
+		if c[0] == "/usr/bin/apt-get" {
+			t.Errorf("mutating call %v must not happen for an unparseable spec", c)
+		}
+	}
+}
+
+// absent 也要幂等:已卸载时再投一次不得再调卸载。
+func TestPackage_AbsentIsIdempotent(t *testing.T) {
+	h := &fakeHost{manager: "dnf", installed: map[string]bool{}}
+	withFakeHost(t, h)
+
+	intent := pkgIntent(`{"desired_state":"absent"}`, "nginx")
+	for i := 0; i < 2; i++ {
+		if err := Apply(context.Background(), intent); err != nil {
+			t.Fatalf("Apply #%d: unexpected err: %v", i+1, err)
+		}
+	}
+	for _, c := range h.calls {
+		if c[0] == "/usr/bin/dnf" {
+			t.Errorf("mutating call %v must not happen: already absent", c)
+		}
+	}
+}
+
+// 网络类失败可重试(DNS / 连接层)。
+func TestPackage_NetworkFailureIsTransient(t *testing.T) {
+	h := &fakeHost{
+		manager:   "apt",
+		installed: map[string]bool{},
+		verbOut:   "Err:1 http://archive.example.test/... Temporary failure resolving 'archive.example.test'\n",
+		verbErr:   errors.New("exit status 100"),
+	}
+	withFakeHost(t, h)
+
+	err := Apply(context.Background(), pkgIntent(`{"desired_state":"present"}`, "nginx"))
+	if !errors.Is(err, ErrTransient) {
+		t.Fatalf("got %v, want ErrTransient", err)
+	}
+}
+
+// 已取消的 ctx:必须在发变更命令前中止。
+func TestPackage_CancelledContextAborts(t *testing.T) {
+	h := &fakeHost{manager: "apt", installed: map[string]bool{}}
+	withFakeHost(t, h)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := Apply(ctx, pkgIntent(`{"desired_state":"present"}`, "nginx"))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v, want context.Canceled", err)
+	}
+	for _, c := range h.calls {
+		if c[0] == "/usr/bin/apt-get" {
+			t.Errorf("mutating call %v must not happen after cancellation", c)
+		}
+	}
+}

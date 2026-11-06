@@ -48,16 +48,14 @@ const heartbeatIntervalSeconds = 30
 // (each in its own file); the embed keeps us forward-compatible
 // if the proto grows new RPCs.
 //
-// Concurrency: agentService's mutable state (nodeID, pending) is
-// guarded by mu. nodeID is written exactly once during Register and
-// only read after; pending is mutated around every ApplyIntent.
-// All dependencies (cfg, certInfo, snapshot) are set at
-// construction time and not mutated thereafter; the
-// snapshot.Detector's own internal cache is itself mutex-guarded.
+// 并发:agentService 的可变状态(nodeID、pending)由 mu 保护。nodeID 在
+// Register 时写一次、之后只读;pending 在每次 ApplyIntent 前后成对变更。
+// 其余依赖(cfg / certInfo / snapshot)都在构造期设定、之后不再改;
+// snapshot.Detector 自己的缓存另有互斥保护。
 type agentService struct {
 	agentv1.UnimplementedAgentServiceServer
 
-	mu sync.Mutex // protects nodeID (assigned once at first Register) and pending
+	mu sync.Mutex // 保护 nodeID(首次 Register 时写入一次)与 pending
 
 	// cfg is the daemon's runtime config (agent_id, cert
 	// paths, etc.). The Register handler reads agent_id and
@@ -104,10 +102,8 @@ type agentService struct {
 	// requiring real btrfs/rsync on the test runner.
 	backend rollback.Backend
 
-	// txFactory, if non-nil, is used instead of tx.New to
-	// construct the per-RPC ApplyIntent transaction. nil
-	// means use the production default (tx.New with the
-	// real executor from internal/exec).
+	// txFactory 非 nil 时用来替代 tx.New 构造每次 ApplyIntent 的事务;
+	// nil 表示走生产默认(tx.New + internal/exec 的真实执行器)。
 	txFactory TxFactory
 
 	// nodeID is the control-plane-assigned identifier for
@@ -118,11 +114,13 @@ type agentService struct {
 	// old agent registration.
 	nodeID string
 
-	// pending is the set of intent_ids accepted by ApplyIntent but
-	// not yet finished. Heartbeat reports its size as
-	// pending_intents, so the control plane sees the real in-flight
-	// work instead of a hardcoded 0. Guarded by mu.
-	pending map[string]struct{}
+	// pending 按 intent_id 记"已受理但未完成"的 ApplyIntent 次数。
+	// Heartbeat 把它的总和回报成 pending_intents,让控制面看到真实的
+	// 在途工作量,而不是硬编码的 0。由 mu 保护。
+	//
+	// 用引用计数而不是集合:控制面把同一 intent_id 并发投递两次时,先结束
+	// 的那次不能把仍在跑的那次一起抹掉(否则计数会少报)。
+	pending map[string]int
 
 	// startedAt is the wall-clock the service was constructed.
 	// It is informational only in T5 (a future health-check
@@ -148,10 +146,8 @@ var _ agentv1.AgentServiceServer = (*agentService)(nil)
 //     SnapshotRequest. Production passes nil and the handler
 //     selects via rollback.SelectBackend per RPC. Tests pass a
 //     fake that records invocations without touching the host.
-//   - txFactory is the injection point for ApplyIntent's tx
-//     construction. Production passes nil and the handler uses
-//     the default tx.New with the internal/exec dispatcher. Tests
-//     can substitute a fake.
+//   - txFactory 是 ApplyIntent 事务构造的注入点。生产传 nil,handler 走
+//     默认的 tx.New + internal/exec 分派器;测试可换成 fake。
 //
 // T7 adds audit:
 //   - audit is the per-process hash-chained audit log. nil
@@ -175,34 +171,45 @@ func newAgentService(cfg *config.Config, certInfo *cert.Info, det *snapshot.Dete
 		backend:   backend,
 		txFactory: txFactory,
 		audit:     auditLog,
-		pending:   map[string]struct{}{},
+		pending:   map[string]int{},
 		startedAt: time.Now().UTC(),
 	}
 }
 
-// beginIntent / endIntent / pendingIntentCount maintain the set of
-// intents that ApplyIntent has accepted but not yet finished.
-// ApplyIntent calls them in pairs around the transaction, so the
-// count reflects in-flight work rather than a lifecycle total.
+// beginIntent / endIntent / pendingIntentCount 维护"已受理但未完成"的
+// intent 计数。ApplyIntent 在事务前后成对调用,因此这个数反映的是**在途**
+// 工作量,不是历史累计。
 func (s *agentService) beginIntent(intentID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.pending == nil {
-		s.pending = map[string]struct{}{}
+		s.pending = map[string]int{}
 	}
-	s.pending[intentID] = struct{}{}
+	s.pending[intentID]++
 }
 
 func (s *agentService) endIntent(intentID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.pending, intentID)
+	n, ok := s.pending[intentID]
+	if !ok {
+		return
+	}
+	if n <= 1 {
+		delete(s.pending, intentID)
+		return
+	}
+	s.pending[intentID] = n - 1
 }
 
 func (s *agentService) pendingIntentCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return len(s.pending)
+	total := 0
+	for _, n := range s.pending {
+		total += n
+	}
+	return total
 }
 
 // selectedBackend returns the rollback backend for the
@@ -221,14 +228,12 @@ func (s *agentService) selectedBackend() (rollback.Backend, error) {
 	return rollback.SelectBackend(s.snapshot.Capability())
 }
 
-// buildTx constructs the per-RPC ApplyIntent transaction. If a
-// test-injected txFactory is set, it is used; otherwise the
-// production default (tx.New with the internal/exec dispatcher) is
-// used. The passed backend and auditSeq are forwarded to the tx.
+// buildTx 构造每次 ApplyIntent 的事务:测试注入的 txFactory 优先,否则走
+// 生产默认(tx.New + internal/exec 分派器)。传入的 backend 与 auditSeq
+// 原样转发给事务。
 //
-// T7: also forwards the per-process hash-chained audit log
-// (shared with report_status.go). tx.Local writes success /
-// failure events to it on every ApplyIntent outcome.
+// 同时转发进程级哈希链审计日志(与 report_status.go 共用):
+// tx.Local 在每次 ApplyIntent 结局往链上写 success / failure 事件。
 func (s *agentService) buildTx(backend rollback.Backend) tx.Tx {
 	if s.txFactory != nil {
 		return s.txFactory(backend, s.cfg.DataDir, s.auditSeq, s.audit)

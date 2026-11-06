@@ -1,8 +1,7 @@
-// Package tx owns the daedalus-agent local transaction state
-// machine that gives ApplyIntent its pre-snapshot → apply →
-// post-snapshot / rollback semantics.
+// Package tx 拥有 daedalus-agent 的本地事务状态机,给 ApplyIntent 提供
+// pre-snapshot → apply → post-snapshot / rollback 语义。
 //
-// State machine (in pseudo-code):
+// 状态机(伪码):
 //
 //	pre-snapshot:   backend.CreateSnapshot(target → snap)
 //	apply:          applyFn(ctx, intent)              [internal/exec]
@@ -11,54 +10,40 @@
 //	else:
 //	    rollback:   backend.Restore(snap → target)
 //	    if rollback.ok:
-//	        result = PERSISTENT_FAILURE if the executor
-//	                 classified the failure as non-retryable
-//	                 (exec.ErrPersistent / ErrUnsupportedKind),
-//	                 else TRANSIENT_FAILURE (apply failed but
-//	                 state was unwound; safe to retry)
+//	        result = PERSISTENT_FAILURE,若执行器把该失败判为不可重试
+//	                 (exec.ErrPersistent / ErrUnsupportedKind);
+//	                 否则 TRANSIENT_FAILURE(已回滚,重试安全)
 //	    else:
-//	        result = PERSISTENT_FAILURE (give up; needs
-//	                 human — rollback machinery itself
-//	                 broke)
+//	        result = PERSISTENT_FAILURE(回滚机制本身也坏了,需人工介入)
 //
-// We deliberately separate the three failure modes
-// (pre-snapshot fail, apply fail with rollback, apply fail
-// without rollback) so the control plane can render a useful
-// failure bucket to the human reviewer. A naive
-// "ApplyIntent failed" message would lose the distinction
-// between "rollback machinery is OK; retry" and "rollback
-// machinery is broken; the host is in an undefined state".
+// 三种失败模式(快照失败、apply 失败但回滚成功、apply 失败且回滚失败)刻意
+// 分开上报,控制面才能给出有用的失败分桶。一句笼统的 "ApplyIntent failed"
+// 会丢掉「回滚机制还好,可以重试」与「回滚机制坏了,宿主状态未定义」的区别。
 //
-// The retryable / non-retryable split comes from the executor's
-// error sentinels (internal/exec): a missing package or an
-// unknown intent kind must not be auto-retried, a held package
-// lock or a flaky network may be. When the executor cannot
-// classify, it reports persistent — auto-retrying an operation
-// that will never succeed is the more expensive mistake.
+// 可重试与否来自执行器的错误哨兵(internal/exec):包不存在、kind 不认识
+// 不该自动重试;包管理器锁被占、网络抖动可以。执行器判不出来时按不可重试
+// 上报 —— 自动重试一个永远不会成功的操作,代价更大。
 //
-// RF3 surface (plan §RF3 + spec §5.2):
+// RF3 面(plan §RF3 + spec §5.2):
 //
-//	The handler-level "snap_capability == NONE → refuse"
-//	check lives in internal/rpc/apply_intent.go, not here.
-//	Tx assumes the caller has already admitted the intent
-//	(i.e. selected a non-nil backend). Defence in depth: even
-//	if a future caller forgets the admission check, the tx's
-//	pre-snapshot step on a nil backend will panic with a
-//	clear nil-deref — surfaced loudly, not silently swallowed
-//	as "best-effort".
+//	handler 层的「snap_capability == NONE → 拒绝」在
+//	internal/rpc/apply_intent.go,不在这里。tx 假定调用方已受理该 intent
+//	(即已选中非 nil backend)。纵深防御:即便未来有调用方漏了受理检查,
+//	这里对 nil backend 做 pre-snapshot 也会以一个清楚的 nil 解引用炸出来,
+//	而不是被 "best-effort" 悄悄吞掉。
 //
-// Audit / audit_seq:
+// 审计 / audit_seq:
 //
-//	T6 uses a process-local atomic.Uint64 counter as the
-//	audit_seq source. T7 (issue in followup queue) replaces
-//	this with the JSONL audit chain — see internal/rpc/
-//	handlers_test.go for the placeholder stub.
+//	审计序号取自进程内的 atomic.Uint64 计数器;事件落盘走 internal/audit
+//	(单一入口,由 sdkAudit.LogAudit 写哈希链)。
 //
-// Apply stub:
+// 回滚能力边界:
 //
-//	T6 wires applyFn as a no-op (log + nil). T7+ replaces it
-//	with the real package manager / filesystem executor. The
-//	tx interface itself does not change between T6 and T7+.
+//	文件级快照只捕获 <dataDir>/intent-target/<target> 这个暂存路径。当前
+//	wire 上只有资源 kind(package/service),它们改的是宿主状态(包库 /
+//	单元文件),文件级快照对它们没有还原能力 —— agent 的回滚本就是
+//	best-effort(产品叙事 "best-effort rollback, not bootc");"精确到
+//	kind 的快照源选择"是另一个待决的设计缺口。
 package tx
 
 import (
@@ -66,6 +51,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"path/filepath"
 	"sync/atomic"
 
@@ -76,16 +62,11 @@ import (
 	"github.com/Daedalusys/daedalus-agent/internal/rollback"
 )
 
-// ApplyFunc is the apply step the tx state machine invokes
-// between pre-snapshot and post-snapshot. T6 stubs it as a
-// no-op (logs the intent, returns nil). T7+ replaces it with
-// the real package manager / filesystem executor (apt-get,
-// yum, transactional update, etc.).
+// ApplyFunc 是事务状态机在 pre-snapshot 与 post-snapshot 之间调用的 apply
+// 步骤。生产实现是 internal/exec 的 Apply:按 intent.Kind 分派到各执行器。
 //
-// The function MUST honour ctx.Done(). A long apply step
-// without ctx observation can stall the gRPC server's
-// graceful shutdown — see internal/daemon (30s
-// ShutdownTimeout).
+// 实现**必须**尊重 ctx.Done():不观察 ctx 的长 apply 会卡住 gRPC 服务的
+// 优雅退出 —— 见 internal/daemon 的 30s ShutdownTimeout。
 type ApplyFunc func(ctx context.Context, intent *agentv1.ApplyIntentRequest) error
 
 // Tx is the per-intent transaction. Construct via New() with
@@ -165,13 +146,37 @@ func (t *Local) Run(ctx context.Context, intent *agentv1.ApplyIntentRequest) (*a
 	// separator regardless of host OS. filepath.Join also
 	// cleans redundant separators that an intent_id might
 	// carry.
-	sourcePath := filepath.Join(t.dataDir, "intent-target", intent.Target)
+	//
+	// 暂存目标名走 filepath.Base:intent.Target 由控制面提供,含 ".." 时
+	// 会让 Join 的结果爬出 dataDir —— 而那一步之后是 MkdirAll,等于路径穿越。
+	sourcePath := filepath.Join(t.dataDir, "intent-target", filepath.Base(intent.Target))
 	snapshotPath := filepath.Join(t.dataDir, "snapshots", intent.IntentId+".snap")
 
-	// 2. Pre-snapshot. A failure here means we never
-	// modified the host — return TRANSIENT_FAILURE so the
-	// control plane retries (e.g. transient ENOSPC on the
-	// snapshot volume).
+	// 2. Pre-snapshot.
+	//
+	// 先把暂存目标建出来:文件级快照后端(btrfs / rsync)对不存在的源路径
+	// 直接失败,而资源 kind(package/service)的 intent 动的是宿主状态,
+	// 没有谁会预先 materialize 这个目录。不建出来,事务会在 pre-snapshot
+	// 就 dead-end,真正的执行器根本没机会跑。
+	//
+	// 注意这**不**等于"回滚万事大吉":文件级快照只捕获这个暂存路径,对
+	// package 安装 / service 启停这类宿主状态变更并无还原能力 —— agent 的
+	// 回滚本就是 best-effort(产品叙事 "best-effort rollback, not bootc"),
+	// 精确到 kind 的快照源选择是另一个待决的设计缺口。
+	if mkErr := os.MkdirAll(sourcePath, 0o755); mkErr != nil {
+		seq := t.auditSeq.Add(1)
+		log.Printf("agent: tx staged-target mkdir failed: intent_id=%q target=%q err=%v audit_seq=%d",
+			intent.IntentId, intent.Target, mkErr, seq)
+		return &agentv1.ApplyIntentResponse{
+			Result:       agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_TRANSIENT_FAILURE,
+			ErrorMessage: fmt.Sprintf("staged target unavailable: %v", mkErr),
+			AuditSeq:     seq,
+		}, nil
+	}
+
+	// A failure here means we never modified the host — return
+	// TRANSIENT_FAILURE so the control plane retries (e.g.
+	// transient ENOSPC on the snapshot volume).
 	seq := t.auditSeq.Add(1)
 	if err := t.backend.CreateSnapshot(sourcePath, snapshotPath); err != nil {
 		log.Printf("agent: tx pre-snapshot failed: intent_id=%q target=%q err=%v audit_seq=%d",
@@ -236,8 +241,9 @@ func (t *Local) Run(ctx context.Context, intent *agentv1.ApplyIntentRequest) (*a
 				AuditSeq:     rbSeq,
 			}, nil
 		}
-		// Apply failed but rollback succeeded. The result
-		// depends on whether the failure is worth retrying.
+		// apply 失败但回滚成功。上报结果取决于这次失败值不值得重试:
+		// 不可重试的失败即便回滚成功也必须报 PERSISTENT,否则控制面会
+		// 自动重试一个永远不会成功的操作。
 		rbSeq := t.auditSeq.Add(1)
 		log.Printf("agent: tx apply failed, rolled back: intent_id=%q apply_err=%v audit_seq=%d",
 			intent.IntentId, err, rbSeq)

@@ -273,3 +273,20 @@ func containsToken(tokens []string, want string) bool {
 	}
 	return false
 }
+
+// lvm-snap 后端的参数形状守卫:它按**逻辑卷**寻址,传进来的却是目录时
+// 必须当场报错,而不是把目录当 LV 名发给 lvcreate 后失败在半路。
+func TestLVMSnapBackend_RejectsNonDeviceSource(t *testing.T) {
+	resetRunCommand(t)
+	called := 0
+	runCommand = func(string, ...string) error { called++; return nil }
+
+	b := &lvmSnapBackend{}
+	err := b.CreateSnapshot("/var/lib/daedalus-agent/intent-target/nginx", "/var/lib/daedalus-agent/snapshots/i-1.snap")
+	if err == nil {
+		t.Fatal("CreateSnapshot: nil err; want a shape-guard rejection")
+	}
+	if called != 0 {
+		t.Errorf("lvcreate invoked %d times, want 0 (guard must reject before running anything)", called)
+	}
+}

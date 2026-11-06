@@ -3,6 +3,7 @@ package exec_test
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
 	agentv1 "github.com/Daedalusys/daedalus-sdk/proto/agent/v1"
@@ -17,6 +18,10 @@ type fakeExecutor struct {
 	lastIntent *agentv1.ApplyIntentRequest
 	err        error
 }
+
+var (
+	registerFakeOnce sync.Once
+)
 
 func (f *fakeExecutor) Apply(_ context.Context, intent *agentv1.ApplyIntentRequest) error {
 	f.calls++
@@ -35,7 +40,7 @@ func TestApply_UnknownKindIsUnsupported(t *testing.T) {
 // 命中的 kind 必须原样转发给注册的执行器,且请求对象不被复制/篡改。
 func TestApply_DispatchesToRegisteredKind(t *testing.T) {
 	fake := &fakeExecutor{}
-	exec.Register("fake.set", fake)
+	registerFakeOnce.Do(func() { exec.Register("fake.set", fake) })
 	intent := &agentv1.ApplyIntentRequest{IntentId: "i-1", Kind: "fake.set", Target: "x"}
 
 	if err := exec.Apply(context.Background(), intent); err != nil {
@@ -54,5 +59,25 @@ func TestApply_EmptyKindIsUnsupported(t *testing.T) {
 	err := exec.Apply(context.Background(), &agentv1.ApplyIntentRequest{Kind: ""})
 	if !errors.Is(err, exec.ErrUnsupportedKind) {
 		t.Fatalf("got %v, want %v", err, exec.ErrUnsupportedKind)
+	}
+}
+
+// fakeExecutor 之外的第二个 fake:返回**没有哨兵**的裸错误,用来验证
+// 分派边界会把不可分类的执行器错误兜底成不可重试(否则上层的默认分流
+// 会把它当可重试)。
+type unclassifiedExecutor struct{}
+
+func (unclassifiedExecutor) Apply(_ context.Context, _ *agentv1.ApplyIntentRequest) error {
+	return errors.New("executor forgot to classify this failure")
+}
+
+var unclassifiedOnce sync.Once
+
+func TestApply_UnclassifiedExecutorErrorIsPersistent(t *testing.T) {
+	unclassifiedOnce.Do(func() { exec.Register("unclassified.set", unclassifiedExecutor{}) })
+
+	err := exec.Apply(context.Background(), &agentv1.ApplyIntentRequest{Kind: "unclassified.set", Target: "x"})
+	if !errors.Is(err, exec.ErrPersistent) {
+		t.Fatalf("got %v, want ErrPersistent", err)
 	}
 }

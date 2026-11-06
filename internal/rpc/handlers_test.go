@@ -69,6 +69,9 @@ var (
 // 故用 Once 保护多次调用)。
 func registerTestNoopExecutor() {
 	testNoopOnce.Do(func() { exec.Register(testNoopKind, testNoopExec) })
+	// 计数是跨用例的包级状态:每个用例开始前清零,免得上一个用例的调用
+	// 数污染本用例的断言(go test -count=2 也会踩到)。
+	testNoopExec.calls.Store(0)
 }
 
 // testRig bundles a live *rpc.Server with a *grpc.ClientConn
@@ -464,14 +467,11 @@ func TestApplyIntent_OnNoneCapability_Refused(t *testing.T) {
 	}
 }
 
-// TestApplyIntent_OnBtrfsCapability_DispatchesToExecutor verifies the
-// non-NONE happy path still returns APPLY_INTENT_RESULT_SUCCESS with a
-// non-empty tx_id now that the handler routes apply through the real
-// internal/exec dispatcher (the log-only applyStub is gone).
+// 非 NONE 的 happy path 仍必须回 SUCCESS 且 tx_id 非空 —— 现在 apply 走的是
+// internal/exec 的真实分派器(只打日志的 applyStub 已删除)。
 //
-// A test-local executor is registered for a test-only kind so the assertion
-// covers the handler → exec.Apply wiring without invoking a real package
-// manager on the test runner.
+// 这里为一个仅测试用的 kind 注册无副作用执行器,这样断言覆盖的是
+// handler → exec.Apply 的接线,而不会在测试机上跑真实包管理器。
 func TestApplyIntent_OnBtrfsCapability_DispatchesToExecutor(t *testing.T) {
 	registerTestNoopExecutor()
 	rig := startTestServerWithSnapshot(t, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_BTRFS_SUBVOLUME)

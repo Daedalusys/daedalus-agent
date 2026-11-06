@@ -84,11 +84,15 @@ func Register(kind string, e Executor) {
 	registry[kind] = e
 }
 
-// registerAll 登记所有生产执行器。计划要求在 init() 与显式 registerAll
-// 之间二选一,这里选**显式**函数:注册顺序确定、可测、无 init 顺序陷阱。
+// registerAll 登记所有生产执行器。在 init() 与显式函数之间选了**显式**:
+// 注册顺序确定、可测、无 init 顺序陷阱。
 //
-// 各执行器文件(Task 2–4)各自往这里追加一行注册;骨架阶段先留空,
-// 这样本 task 可以独立编译与测试。
+// 键是**资源 kind**(objectmodel.Kind):控制面把 Intent.Kind 原样发上
+// wire,`package.set` / `service.set` 只是 core 风险判定表内部的适配器名,
+// 不会出现在这里。`package` 与 `service` 各对应一个执行器;未登记的 kind
+// 由 Apply 统一按 ErrUnsupportedKind 拒绝(fail-closed)。
+//
+// 各执行器文件各自往这里追加一行注册。
 func registerAll() {
 	Register(kindPackage, packageExecutor{})
 	Register(kindService, serviceExecutor{})
@@ -114,7 +118,27 @@ func Apply(ctx context.Context, intent *agentv1.ApplyIntentRequest) error {
 		// 不猜:控制面发了本 agent 不认识的 kind,重试也不会变好。
 		return fmt.Errorf("%w: %q", ErrUnsupportedKind, intent.Kind)
 	}
-	return e.Apply(ctx, intent)
+	err := e.Apply(ctx, intent)
+	if err == nil {
+		return nil
+	}
+	if classifyable(err) {
+		return err
+	}
+	// 执行器契约:失败必须可分类,否则控制面不知道要不要重试。这里在
+	// **分派边界**兜底 —— 漏裹哨兵的实现一律按不可重试处理,免得依赖
+	// 上层(如 tx)的默认分流恰好选对方向。
+	return fmt.Errorf("%w: executor returned an unclassified error: %v", ErrPersistent, err)
+}
+
+// classifyable 报告 err 是否已经带上可重试性(或本身就是 ctx 取消,由上层
+// 按取消语义处理)。
+func classifyable(err error) bool {
+	return errors.Is(err, ErrTransient) ||
+		errors.Is(err, ErrPersistent) ||
+		errors.Is(err, ErrUnsupportedKind) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded)
 }
 
 // cmdRunner 是所有执行器调用外部命令的唯一注入缝。返回合并后的

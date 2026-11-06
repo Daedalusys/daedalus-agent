@@ -3,6 +3,7 @@ package rollback
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -31,6 +32,13 @@ func (s *snapperBackend) CreateSnapshot(sourcePath, snapshotPath string) error {
 	if num == "" {
 		// 拿不到编号就绝不猜:sidecar 写进错误的号等于回滚时打错目标。
 		return fmt.Errorf("rollback: snapper create returned no snapshot number (output %q)", strings.TrimSpace(string(out)))
+	}
+	if dir := filepath.Dir(snapshotPath); dir != "" {
+		// sidecar 的目标目录(tx 传的是 <dataDir>/snapshots/)未必存在,
+		// 先建出来,否则写 sidecar 会失败在半路。
+		if mkErr := os.MkdirAll(dir, 0o755); mkErr != nil {
+			return fmt.Errorf("rollback: mkdir snapper sidecar dir %q: %w", dir, mkErr)
+		}
 	}
 	if werr := os.WriteFile(snapshotPath, []byte(num+"\n"), 0o600); werr != nil {
 		return fmt.Errorf("rollback: write snapper sidecar %q: %w", snapshotPath, werr)

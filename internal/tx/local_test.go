@@ -29,6 +29,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -679,5 +680,42 @@ func TestLocal_CancelledApplyWritesCancelledEntry(t *testing.T) {
 	}
 	if !strings.Contains(events[0].Outcome, "cancelled") {
 		t.Errorf("outcome = %q must mark the cancellation", events[0].Outcome)
+	}
+}
+
+// 事务必须在 pre-snapshot 之前把暂存目标建出来:文件级快照后端(btrfs /
+// rsync)对不存在的源路径直接失败,而资源 kind(package/service)的 intent
+// 动的是宿主状态,没有谁会预先 materialize 这个目录 —— 不建出来,事务在
+// pre-snapshot 就 dead-end,真正的执行器根本没机会跑。
+func TestLocal_Run_CreatesStagedTargetBeforeSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	tx := New(&txMockBackend{}, (&txSpyApply{}).Fn, dir, nil, nil)
+
+	if _, err := tx.Run(context.Background(), sampleIntent()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	wantSrc := filepath.Join(dir, "intent-target", "nginx")
+	fi, err := os.Stat(wantSrc)
+	if err != nil {
+		t.Fatalf("staged target %q not created before snapshot: %v", wantSrc, err)
+	}
+	if !fi.IsDir() {
+		t.Errorf("%q is not a directory", wantSrc)
+	}
+}
+
+// 暂存路径不得被 intent.Target 里的 ".." 带出 dataDir(它会走 MkdirAll,
+// 建到外面就是路径穿越)。
+func TestLocal_Run_StagedTargetCannotEscapeDataDir(t *testing.T) {
+	dir := t.TempDir()
+	tx := New(&txMockBackend{}, (&txSpyApply{}).Fn, dir, nil, nil)
+
+	intent := &agentv1.ApplyIntentRequest{IntentId: "i-esc", Kind: "package", Target: "../../escaped"}
+	if _, err := tx.Run(context.Background(), intent); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	outside := filepath.Join(filepath.Dir(dir), "escaped")
+	if _, err := os.Stat(outside); err == nil {
+		t.Errorf("staged target escaped dataDir and created %q", outside)
 	}
 }

@@ -46,7 +46,7 @@ func TestHeartbeat_PendingReflectsQueued(t *testing.T) {
 
 	resp := heartbeatFrom(t, svc)
 	if resp.PendingIntents != 2 {
-		t.Errorf("PendingIntents = %d, got %d, want 2", resp.PendingIntents, resp.PendingIntents)
+		t.Errorf("PendingIntents = %d, want 2", resp.PendingIntents)
 	}
 	if !resp.Ack {
 		t.Errorf("Ack = false, got %v, want true", resp.Ack)
@@ -57,7 +57,7 @@ func TestHeartbeat_PendingReflectsQueued(t *testing.T) {
 func TestHeartbeat_PendingZeroWhenIdle(t *testing.T) {
 	svc := heartbeatTestService(t)
 	if resp := heartbeatFrom(t, svc); resp.PendingIntents != 0 {
-		t.Errorf("PendingIntents = %d, got %d, want 0", resp.PendingIntents, resp.PendingIntents)
+		t.Errorf("PendingIntents = %d, want 0", resp.PendingIntents)
 	}
 }
 
@@ -68,7 +68,7 @@ func TestHeartbeat_PendingDropsWhenIntentFinishes(t *testing.T) {
 	svc.endIntent("intent-a")
 
 	if resp := heartbeatFrom(t, svc); resp.PendingIntents != 0 {
-		t.Errorf("PendingIntents = %d, got %d, want 0 after the intent finished", resp.PendingIntents, resp.PendingIntents)
+		t.Errorf("PendingIntents = %d, want 0 after the intent finished", resp.PendingIntents)
 	}
 }
 
@@ -111,9 +111,29 @@ func TestApplyIntent_MarksPendingDuringRun(t *testing.T) {
 		t.Fatal("tx.Run was never called")
 	}
 	if rt.seen != 1 {
-		t.Errorf("pending during tx.Run = %d, got %d, want 1", rt.seen, rt.seen)
+		t.Errorf("pending during tx.Run = %d, want 1", rt.seen)
 	}
 	if got := svc.pendingIntentCount(); got != 0 {
-		t.Errorf("pending after ApplyIntent returned = %d, got %d, want 0", got, got)
+		t.Errorf("pending after ApplyIntent returned = %d, want 0", got)
+	}
+}
+
+// 同一 intent_id 并发投递两次:两次都要计入。先结束的那次不能把仍在跑的
+// 那次一起抹掉(否则 pending_intents 会少报,控制面以为节点空闲)。
+func TestHeartbeat_PendingCountsConcurrentDuplicateIntent(t *testing.T) {
+	svc := heartbeatTestService(t)
+	svc.beginIntent("intent-a")
+	svc.beginIntent("intent-a")
+
+	if got := svc.pendingIntentCount(); got != 2 {
+		t.Errorf("pending count = %d, want 2", got)
+	}
+	svc.endIntent("intent-a")
+	if got := svc.pendingIntentCount(); got != 1 {
+		t.Errorf("pending count after one finished = %d, want 1", got)
+	}
+	svc.endIntent("intent-a")
+	if got := svc.pendingIntentCount(); got != 0 {
+		t.Errorf("pending count after both finished = %d, want 0", got)
 	}
 }
