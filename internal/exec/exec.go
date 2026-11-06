@@ -90,6 +90,7 @@ func Register(kind string, e Executor) {
 // 各执行器文件(Task 2–4)各自往这里追加一行注册;骨架阶段先留空,
 // 这样本 task 可以独立编译与测试。
 func registerAll() {
+	Register(kindPackage, packageExecutor{})
 }
 
 // lookup 返回 kind 对应的执行器。第二个返回值为 false 表示未注册。
