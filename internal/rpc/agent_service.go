@@ -14,8 +14,6 @@
 package rpc
 
 import (
-	"context"
-	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,6 +23,7 @@ import (
 	"github.com/Daedalusys/daedalus-agent/internal/audit"
 	"github.com/Daedalusys/daedalus-agent/internal/cert"
 	"github.com/Daedalusys/daedalus-agent/internal/config"
+	"github.com/Daedalusys/daedalus-agent/internal/exec"
 	"github.com/Daedalusys/daedalus-agent/internal/rollback"
 	"github.com/Daedalusys/daedalus-agent/internal/snapshot"
 	"github.com/Daedalusys/daedalus-agent/internal/tx"
@@ -110,8 +109,8 @@ type agentService struct {
 
 	// txFactory, if non-nil, is used instead of tx.New to
 	// construct the per-RPC ApplyIntent transaction. nil
-	// means use the production default (tx.New with the T6
-	// apply stub).
+	// means use the production default (tx.New with the
+	// real executor from internal/exec).
 	txFactory TxFactory
 
 	// nodeID is the control-plane-assigned identifier for
@@ -148,8 +147,8 @@ var _ agentv1.AgentServiceServer = (*agentService)(nil)
 //     fake that records invocations without touching the host.
 //   - txFactory is the injection point for ApplyIntent's tx
 //     construction. Production passes nil and the handler uses
-//     the default tx.New with the T6 apply stub. Tests can
-//     substitute a fake.
+//     the default tx.New with the internal/exec dispatcher. Tests
+//     can substitute a fake.
 //
 // T7 adds audit:
 //   - audit is the per-process hash-chained audit log. nil
@@ -195,8 +194,8 @@ func (s *agentService) selectedBackend() (rollback.Backend, error) {
 
 // buildTx constructs the per-RPC ApplyIntent transaction. If a
 // test-injected txFactory is set, it is used; otherwise the
-// production default (tx.New with the T6 apply stub) is used.
-// The passed backend and auditSeq are forwarded to the tx.
+// production default (tx.New with the internal/exec dispatcher) is
+// used. The passed backend and auditSeq are forwarded to the tx.
 //
 // T7: also forwards the per-process hash-chained audit log
 // (shared with report_status.go). tx.Local writes success /
@@ -205,17 +204,5 @@ func (s *agentService) buildTx(backend rollback.Backend) tx.Tx {
 	if s.txFactory != nil {
 		return s.txFactory(backend, s.cfg.DataDir, s.auditSeq, s.audit)
 	}
-	return tx.New(backend, applyStub, s.cfg.DataDir, s.auditSeq, s.audit)
-}
-
-// applyStub is the T6 apply step. It only logs the intent and
-// returns nil; T7+ replaces it with a real package manager /
-// filesystem executor that respects ctx.Done().
-//
-// Exported at package scope (not method) so tx.New can capture
-// it as an ApplyFunc without instantiating agentService.
-func applyStub(_ context.Context, intent *agentv1.ApplyIntentRequest) error {
-	log.Printf("agent: apply stub (T6): intent_id=%q kind=%q target=%q (T7+ replaces with real ops)",
-		intent.IntentId, intent.Kind, intent.Target)
-	return nil
+	return tx.New(backend, exec.Apply, s.cfg.DataDir, s.auditSeq, s.audit)
 }

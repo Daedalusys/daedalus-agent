@@ -107,7 +107,7 @@ func (R *RsyncBackend) CreateSnapshot(sourcePath, snapshotPath string) error {
 //
 // We do NOT mkdir -p <targetPath> here: Restore assumes the
 // target directory already exists (it always does in the tx
-// state machine — applyStub ran in <targetPath> before the
+// state machine — the apply step wrote into <targetPath> before the
 // rollback fires). If a future caller passes a missing target,
 // rsync will fail with a clear error and we wrap it.
 //

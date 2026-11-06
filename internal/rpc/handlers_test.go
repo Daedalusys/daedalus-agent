@@ -29,6 +29,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -41,9 +42,34 @@ import (
 
 	"github.com/Daedalusys/daedalus-agent/internal/cert"
 	"github.com/Daedalusys/daedalus-agent/internal/config"
+	"github.com/Daedalusys/daedalus-agent/internal/exec"
 	"github.com/Daedalusys/daedalus-agent/internal/rpc"
 	"github.com/Daedalusys/daedalus-agent/internal/snapshot"
 )
+
+// testNoopKind 是仅测试用的 intent kind;注册一个无副作用执行器后,
+// rpc 层测试既能验证"handler 确实把 intent 交给 internal/exec",又不会
+// 在测试机上跑真实包管理器/文件系统操作。
+const testNoopKind = "test.noop"
+
+// testNoopExecutor 只数调用次数。
+type testNoopExecutor struct{ calls atomic.Int32 }
+
+func (e *testNoopExecutor) Apply(_ context.Context, _ *agentv1.ApplyIntentRequest) error {
+	e.calls.Add(1)
+	return nil
+}
+
+var (
+	testNoopOnce sync.Once
+	testNoopExec = &testNoopExecutor{}
+)
+
+// registerTestNoopExecutor 幂等注册(exec.Register 对重复注册会 panic,
+// 故用 Once 保护多次调用)。
+func registerTestNoopExecutor() {
+	testNoopOnce.Do(func() { exec.Register(testNoopKind, testNoopExec) })
+}
 
 // testRig bundles a live *rpc.Server with a *grpc.ClientConn
 // already wired up to it. Tests defer rig.Cleanup() and use
@@ -438,12 +464,16 @@ func TestApplyIntent_OnNoneCapability_Refused(t *testing.T) {
 	}
 }
 
-// TestApplyIntent_OnBtrfsCapability_StubSucceeds verifies that the
-// non-NONE happy path returns APPLY_INTENT_RESULT_SUCCESS with a
-// non-empty tx_id. The real pre-snapshot → apply → post-snapshot
-// → rollback state machine is T6; T5 stubs success and writes a
-// clear comment marking the boundary.
-func TestApplyIntent_OnBtrfsCapability_StubSucceeds(t *testing.T) {
+// TestApplyIntent_OnBtrfsCapability_DispatchesToExecutor verifies the
+// non-NONE happy path still returns APPLY_INTENT_RESULT_SUCCESS with a
+// non-empty tx_id now that the handler routes apply through the real
+// internal/exec dispatcher (the log-only applyStub is gone).
+//
+// A test-local executor is registered for a test-only kind so the assertion
+// covers the handler → exec.Apply wiring without invoking a real package
+// manager on the test runner.
+func TestApplyIntent_OnBtrfsCapability_DispatchesToExecutor(t *testing.T) {
+	registerTestNoopExecutor()
 	rig := startTestServerWithSnapshot(t, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_BTRFS_SUBVOLUME)
 	defer rig.Cleanup()
 
@@ -454,7 +484,7 @@ func TestApplyIntent_OnBtrfsCapability_StubSucceeds(t *testing.T) {
 	}
 	resp, err := rig.Client.ApplyIntent(ctx, &agentv1.ApplyIntentRequest{
 		IntentId:  "intent-001",
-		Kind:      "package.set",
+		Kind:      testNoopKind,
 		Target:    "nginx",
 		SpecJson:  `{"name":"nginx"}`,
 		RiskClass: agentv1.RiskClass_RISK_CLASS_LOW,
@@ -466,7 +496,10 @@ func TestApplyIntent_OnBtrfsCapability_StubSucceeds(t *testing.T) {
 		t.Errorf("Result = %v, want SUCCESS", resp.Result)
 	}
 	if resp.TxId == "" {
-		t.Errorf("TxId empty; want non-empty (stub)")
+		t.Errorf("TxId empty; want non-empty (tx success derives one from intent_id)")
+	}
+	if got := testNoopExec.calls.Load(); got != 1 {
+		t.Errorf("executor calls = %d, want 1 (apply must reach internal/exec)", got)
 	}
 }
 
