@@ -105,11 +105,9 @@ func (R *RsyncBackend) CreateSnapshot(sourcePath, snapshotPath string) error {
 // the snapshot are removed (i.e. partial state changes that
 // the apply step introduced are unwound).
 //
-// We do NOT mkdir -p <targetPath> here: Restore assumes the
-// target directory already exists (it always does in the tx
-// state machine — applyStub ran in <targetPath> before the
-// rollback fires). If a future caller passes a missing target,
-// rsync will fail with a clear error and we wrap it.
+// 这里不 mkdir -p <targetPath>:Restore 假定目标目录已存在(在事务状态机里
+// 总是如此 —— 回滚触发之前 apply 已经写过 <targetPath>)。若未来有调用方传
+// 了不存在的目标,rsync 会以清楚的错误失败,我们再把它包起来。
 //
 // Returns an error wrapping the rsync exit status with both
 // paths included for triage.

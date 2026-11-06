@@ -28,15 +28,19 @@ package tx
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 
+	sdkAudit "github.com/Daedalusys/daedalus-sdk/audit"
 	agentv1 "github.com/Daedalusys/daedalus-sdk/proto/agent/v1"
 
 	"github.com/Daedalusys/daedalus-agent/internal/audit"
+	"github.com/Daedalusys/daedalus-agent/internal/exec"
 )
 
 // txMockBackend is a minimal Backend for tx-level tests. Each
@@ -484,5 +488,234 @@ func TestLocal_NilAuditSkipsEmission(t *testing.T) {
 	}
 	if resp.Result != agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_SUCCESS {
 		t.Errorf("Result = %v, want SUCCESS", resp.Result)
+	}
+}
+
+// --- apply 结果进本地哈希链(Task 5) ----------------------------------------
+
+// txTestKind 是 tx 测试自用的 intent kind。注册一个可配置错误的执行器后,
+// 这些测试经**真实的 exec.Apply 分派**驱动 tx,而不是绕过分派层用 spy ——
+// 这样"执行器返回 error ⇒ 非 SUCCESS 且进审计链"这条链路是被端到端覆盖的。
+const txTestKind = "tx.test.kind"
+
+// txTestApplyErr 控制 txTestExecutor 的返回值。测试内设置,t.Cleanup 还原;
+// 本包测试不并行,故包级变量够用。
+var txTestApplyErr error
+
+type txTestExecutor struct{}
+
+func (txTestExecutor) Apply(_ context.Context, _ *agentv1.ApplyIntentRequest) error {
+	return txTestApplyErr
+}
+
+var txTestRegOnce sync.Once
+
+// execApplyForTest 返回真实的 exec.Apply 分派函数(首次调用时注册测试执行器)。
+func execApplyForTest() ApplyFunc {
+	txTestRegOnce.Do(func() { exec.Register(txTestKind, txTestExecutor{}) })
+	return exec.Apply
+}
+
+func execIntent() *agentv1.ApplyIntentRequest {
+	return &agentv1.ApplyIntentRequest{IntentId: "intent-exec-1", Kind: txTestKind, Target: "nginx"}
+}
+
+func setApplyErr(t *testing.T, err error) {
+	t.Helper()
+	prev := txTestApplyErr
+	txTestApplyErr = err
+	t.Cleanup(func() { txTestApplyErr = prev })
+}
+
+// apply 成功后链上恰好多一条成功条目。
+func TestLocal_ApplyWritesAuditEntry(t *testing.T) {
+	dir := t.TempDir()
+	auditLog, err := audit.New(dir)
+	if err != nil {
+		t.Fatalf("audit.New: %v", err)
+	}
+	setApplyErr(t, nil)
+
+	tx := New(&txMockBackend{}, execApplyForTest(), dir, new(atomic.Uint64), auditLog)
+	resp, err := tx.Run(context.Background(), execIntent())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if resp.Result != agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_SUCCESS {
+		t.Fatalf("Result = %v, want SUCCESS", resp.Result)
+	}
+
+	events, final, err := auditLog.Since(0)
+	if err != nil {
+		t.Fatalf("audit.Since: %v", err)
+	}
+	if final != 1 || len(events) != 1 {
+		t.Fatalf("chain entries = %d (final=%d), got %d, want 1", len(events), final, len(events))
+	}
+	if events[0].Tool != "apply_intent.success" {
+		t.Errorf("tool = %q, got %q, want apply_intent.success", events[0].Tool, events[0].Tool)
+	}
+	if events[0].Outcome != "ok" {
+		t.Errorf("outcome = %q, got %q, want ok", events[0].Outcome, events[0].Outcome)
+	}
+}
+
+// 执行器报错时链上落一条 failure 条目(而不是静默丢弃)。
+func TestLocal_ApplyFailureWritesFailureEntry(t *testing.T) {
+	dir := t.TempDir()
+	auditLog, err := audit.New(dir)
+	if err != nil {
+		t.Fatalf("audit.New: %v", err)
+	}
+	setApplyErr(t, errors.New("executor exploded"))
+
+	tx := New(&txMockBackend{}, execApplyForTest(), dir, new(atomic.Uint64), auditLog)
+	resp, err := tx.Run(context.Background(), execIntent())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if resp.Result == agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_SUCCESS {
+		t.Fatalf("Result = SUCCESS despite executor error (Review Focus #1)")
+	}
+
+	events, _, err := auditLog.Since(0)
+	if err != nil {
+		t.Fatalf("audit.Since: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("chain entries = %d, got %d, want 1", len(events), len(events))
+	}
+	if events[0].Tool != "apply_intent.failure" {
+		t.Errorf("tool = %q, got %q, want apply_intent.failure", events[0].Tool, events[0].Tool)
+	}
+	if !strings.Contains(events[0].Outcome, "executor exploded") {
+		t.Errorf("outcome = %q must carry the executor error", events[0].Outcome)
+	}
+}
+
+// apply 之后链仍然是完整可验的哈希链(SDK 是权威校验器)。
+func TestLocal_ChainStaysIntactAfterApply(t *testing.T) {
+	dir := t.TempDir()
+	auditLog, err := audit.New(dir)
+	if err != nil {
+		t.Fatalf("audit.New: %v", err)
+	}
+	setApplyErr(t, nil)
+
+	tx := New(&txMockBackend{}, execApplyForTest(), dir, new(atomic.Uint64), auditLog)
+	if _, err := tx.Run(context.Background(), execIntent()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	n, err := sdkAudit.Verify(auditLog.ChainPath())
+	if err != nil {
+		t.Fatalf("hash chain is not intact: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("verified entries = %d, got %d, want 1", n, n)
+	}
+}
+
+// 不可重试的执行器失败必须映射成 PERSISTENT_FAILURE,否则控制面会自动重试
+// 一个永远不会成功的操作(Review Focus #2)。回滚照旧要发生。
+func TestLocal_PersistentApplyErrorYieldsPersistentFailure(t *testing.T) {
+	backend := &txMockBackend{}
+	setApplyErr(t, fmt.Errorf("%w: package nope does not exist", exec.ErrPersistent))
+
+	tx := New(backend, execApplyForTest(), t.TempDir(), new(atomic.Uint64), nil)
+	resp, err := tx.Run(context.Background(), execIntent())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if resp.Result != agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_PERSISTENT_FAILURE {
+		t.Fatalf("Result = %v, got %v, want PERSISTENT_FAILURE", resp.Result, resp.Result)
+	}
+	if backend.restoreCalls != 1 {
+		t.Errorf("Restore calls = %d, got %d, want 1 (rollback still runs)", backend.restoreCalls, backend.restoreCalls)
+	}
+}
+
+// 可重试的执行器失败仍是 TRANSIENT_FAILURE(回滚成功、重试安全)。
+func TestLocal_TransientApplyErrorYieldsTransientFailure(t *testing.T) {
+	backend := &txMockBackend{}
+	setApplyErr(t, fmt.Errorf("%w: dpkg lock held", exec.ErrTransient))
+
+	tx := New(backend, execApplyForTest(), t.TempDir(), new(atomic.Uint64), nil)
+	resp, err := tx.Run(context.Background(), execIntent())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if resp.Result != agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_TRANSIENT_FAILURE {
+		t.Fatalf("Result = %v, got %v, want TRANSIENT_FAILURE", resp.Result, resp.Result)
+	}
+}
+
+// ctx 取消不得被静默丢弃:链上要留一条明确记录(Review Focus #4)。
+func TestLocal_CancelledApplyWritesCancelledEntry(t *testing.T) {
+	dir := t.TempDir()
+	auditLog, err := audit.New(dir)
+	if err != nil {
+		t.Fatalf("audit.New: %v", err)
+	}
+	setApplyErr(t, fmt.Errorf("exec: package.set cancelled: %w", context.Canceled))
+
+	tx := New(&txMockBackend{}, execApplyForTest(), dir, new(atomic.Uint64), auditLog)
+	resp, err := tx.Run(context.Background(), execIntent())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if resp.Result == agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_SUCCESS {
+		t.Fatalf("Result = SUCCESS despite cancellation")
+	}
+
+	events, _, err := auditLog.Since(0)
+	if err != nil {
+		t.Fatalf("audit.Since: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("chain entries = %d, got %d, want 1", len(events), len(events))
+	}
+	if events[0].Tool != "apply_intent.cancelled" {
+		t.Errorf("tool = %q, got %q, want apply_intent.cancelled", events[0].Tool, events[0].Tool)
+	}
+	if !strings.Contains(events[0].Outcome, "cancelled") {
+		t.Errorf("outcome = %q must mark the cancellation", events[0].Outcome)
+	}
+}
+
+// 事务必须在 pre-snapshot 之前把暂存目标建出来:文件级快照后端(btrfs /
+// rsync)对不存在的源路径直接失败,而资源 kind(package/service)的 intent
+// 动的是宿主状态,没有谁会预先 materialize 这个目录 —— 不建出来,事务在
+// pre-snapshot 就 dead-end,真正的执行器根本没机会跑。
+func TestLocal_Run_CreatesStagedTargetBeforeSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	tx := New(&txMockBackend{}, (&txSpyApply{}).Fn, dir, nil, nil)
+
+	if _, err := tx.Run(context.Background(), sampleIntent()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	wantSrc := filepath.Join(dir, "intent-target", "nginx")
+	fi, err := os.Stat(wantSrc)
+	if err != nil {
+		t.Fatalf("staged target %q not created before snapshot: %v", wantSrc, err)
+	}
+	if !fi.IsDir() {
+		t.Errorf("%q is not a directory", wantSrc)
+	}
+}
+
+// 暂存路径不得被 intent.Target 里的 ".." 带出 dataDir(它会走 MkdirAll,
+// 建到外面就是路径穿越)。
+func TestLocal_Run_StagedTargetCannotEscapeDataDir(t *testing.T) {
+	dir := t.TempDir()
+	tx := New(&txMockBackend{}, (&txSpyApply{}).Fn, dir, nil, nil)
+
+	intent := &agentv1.ApplyIntentRequest{IntentId: "i-esc", Kind: "package", Target: "../../escaped"}
+	if _, err := tx.Run(context.Background(), intent); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	outside := filepath.Join(filepath.Dir(dir), "escaped")
+	if _, err := os.Stat(outside); err == nil {
+		t.Errorf("staged target escaped dataDir and created %q", outside)
 	}
 }

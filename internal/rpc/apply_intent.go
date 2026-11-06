@@ -143,6 +143,11 @@ func (s *agentService) ApplyIntent(ctx context.Context, req *agentv1.ApplyIntent
 		}, nil
 	}
 
+	// pending 只覆盖真正进入事务的 intent:RF3 拒绝与后端选择失败都已终结,
+	// 不该把"未完成工作量"数大。
+	s.beginIntent(req.IntentId)
+	defer s.endIntent(req.IntentId)
+
 	tx := s.buildTx(backend)
 	return tx.Run(ctx, req)
 }
