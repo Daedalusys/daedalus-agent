@@ -5,13 +5,16 @@
 // State machine (in pseudo-code):
 //
 //	pre-snapshot:   backend.CreateSnapshot(target → snap)
-//	apply:          applyFn(ctx, intent)              [stub in T6]
+//	apply:          applyFn(ctx, intent)              [internal/exec]
 //	if apply.ok:
 //	    success:    result = SUCCESS, audit_seq++, log
 //	else:
 //	    rollback:   backend.Restore(snap → target)
 //	    if rollback.ok:
-//	        result = TRANSIENT_FAILURE (apply failed but
+//	        result = PERSISTENT_FAILURE if the executor
+//	                 classified the failure as non-retryable
+//	                 (exec.ErrPersistent / ErrUnsupportedKind),
+//	                 else TRANSIENT_FAILURE (apply failed but
 //	                 state was unwound; safe to retry)
 //	    else:
 //	        result = PERSISTENT_FAILURE (give up; needs
@@ -25,6 +28,13 @@
 // "ApplyIntent failed" message would lose the distinction
 // between "rollback machinery is OK; retry" and "rollback
 // machinery is broken; the host is in an undefined state".
+//
+// The retryable / non-retryable split comes from the executor's
+// error sentinels (internal/exec): a missing package or an
+// unknown intent kind must not be auto-retried, a held package
+// lock or a flaky network may be. When the executor cannot
+// classify, it reports persistent — auto-retrying an operation
+// that will never succeed is the more expensive mistake.
 //
 // RF3 surface (plan §RF3 + spec §5.2):
 //
@@ -53,6 +63,7 @@ package tx
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"path/filepath"
@@ -61,6 +72,7 @@ import (
 	agentv1 "github.com/Daedalusys/daedalus-sdk/proto/agent/v1"
 
 	"github.com/Daedalusys/daedalus-agent/internal/audit"
+	"github.com/Daedalusys/daedalus-agent/internal/exec"
 	"github.com/Daedalusys/daedalus-agent/internal/rollback"
 )
 
@@ -188,9 +200,13 @@ func (t *Local) Run(ctx context.Context, intent *agentv1.ApplyIntentRequest) (*a
 		}, nil
 	}
 
-	// 3. Apply. T6 stub always returns nil (success); T7+
-	// replaces with real package / fs operations.
+	// 3. Apply. 真实执行器(internal/exec)在这里改机器。失败时先看
+	// 错误是可重试还是不可重试,再决定回滚后的上报结果 —— 控制面据此
+	// 决定要不要自动重试(TRANSIENT 最多 3 次;PERSISTENT 不重试)。
 	if err := t.apply(ctx, intent); err != nil {
+		cancelled := errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+		persistent := errors.Is(err, exec.ErrPersistent) || errors.Is(err, exec.ErrUnsupportedKind)
+
 		// Apply failed. Attempt rollback.
 		rbErr := t.backend.Restore(snapshotPath, sourcePath)
 		if rbErr != nil {
@@ -220,23 +236,38 @@ func (t *Local) Run(ctx context.Context, intent *agentv1.ApplyIntentRequest) (*a
 				AuditSeq:     rbSeq,
 			}, nil
 		}
-		// Apply failed but rollback succeeded —
-		// TRANSIENT_FAILURE (safe to retry).
+		// Apply failed but rollback succeeded. The result
+		// depends on whether the failure is worth retrying.
 		rbSeq := t.auditSeq.Add(1)
 		log.Printf("agent: tx apply failed, rolled back: intent_id=%q apply_err=%v audit_seq=%d",
 			intent.IntentId, err, rbSeq)
 		if t.audit != nil {
+			tool := "apply_intent.failure"
+			outcome := fmt.Sprintf("apply_failed: %v (rolled back)", err)
+			if cancelled {
+				// 控制面超时取消必须留下可区分的记录,不能与普通
+				// 失败混为一谈。
+				tool = "apply_intent.cancelled"
+				outcome = fmt.Sprintf("cancelled: %v (rolled back)", err)
+			}
 			if _, aerr := t.audit.Log(audit.Event{
 				Identity: intent.IntentId,
-				Tool:     "apply_intent.failure",
+				Tool:     tool,
 				Args: map[string]string{
 					"target": intent.Target,
 					"kind":   intent.Kind,
 				},
-				Outcome: fmt.Sprintf("apply_failed: %v (rolled back)", err),
+				Outcome: outcome,
 			}); aerr != nil {
 				log.Printf("agent: audit log (failure) failed: %v", aerr)
 			}
+		}
+		if persistent {
+			return &agentv1.ApplyIntentResponse{
+				Result:       agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_PERSISTENT_FAILURE,
+				ErrorMessage: fmt.Sprintf("apply failed with a non-retryable error, rolled back successfully: %v", err),
+				AuditSeq:     rbSeq,
+			}, nil
 		}
 		return &agentv1.ApplyIntentResponse{
 			Result:       agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_TRANSIENT_FAILURE,
