@@ -48,19 +48,16 @@ const heartbeatIntervalSeconds = 30
 // (each in its own file); the embed keeps us forward-compatible
 // if the proto grows new RPCs.
 //
-// Concurrency: agentService's mutable state (nodeID) is written
-// exactly once during Register and only read after. We use a
-// mutex so future extensions (e.g. an in-memory pending-intent
-// queue in T6) do not have to think about whether the field is
-// race-free.
-//
+// Concurrency: agentService's mutable state (nodeID, pending) is
+// guarded by mu. nodeID is written exactly once during Register and
+// only read after; pending is mutated around every ApplyIntent.
 // All dependencies (cfg, certInfo, snapshot) are set at
 // construction time and not mutated thereafter; the
 // snapshot.Detector's own internal cache is itself mutex-guarded.
 type agentService struct {
 	agentv1.UnimplementedAgentServiceServer
 
-	mu sync.Mutex // protects nodeID (assigned once at first Register)
+	mu sync.Mutex // protects nodeID (assigned once at first Register) and pending
 
 	// cfg is the daemon's runtime config (agent_id, cert
 	// paths, etc.). The Register handler reads agent_id and
@@ -121,6 +118,12 @@ type agentService struct {
 	// old agent registration.
 	nodeID string
 
+	// pending is the set of intent_ids accepted by ApplyIntent but
+	// not yet finished. Heartbeat reports its size as
+	// pending_intents, so the control plane sees the real in-flight
+	// work instead of a hardcoded 0. Guarded by mu.
+	pending map[string]struct{}
+
 	// startedAt is the wall-clock the service was constructed.
 	// It is informational only in T5 (a future health-check
 	// RPC could surface uptime); not yet surfaced.
@@ -172,8 +175,34 @@ func newAgentService(cfg *config.Config, certInfo *cert.Info, det *snapshot.Dete
 		backend:   backend,
 		txFactory: txFactory,
 		audit:     auditLog,
+		pending:   map[string]struct{}{},
 		startedAt: time.Now().UTC(),
 	}
+}
+
+// beginIntent / endIntent / pendingIntentCount maintain the set of
+// intents that ApplyIntent has accepted but not yet finished.
+// ApplyIntent calls them in pairs around the transaction, so the
+// count reflects in-flight work rather than a lifecycle total.
+func (s *agentService) beginIntent(intentID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pending == nil {
+		s.pending = map[string]struct{}{}
+	}
+	s.pending[intentID] = struct{}{}
+}
+
+func (s *agentService) endIntent(intentID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.pending, intentID)
+}
+
+func (s *agentService) pendingIntentCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.pending)
 }
 
 // selectedBackend returns the rollback backend for the

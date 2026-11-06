@@ -12,8 +12,8 @@
 //     and re-issued a new node_id) or hostile (replaying an
 //     old Heartbeat). Either way we reject with FailedPrecondition.
 //  2. Return ack=true with the configured heartbeat interval and
-//     pending_intents=0 (T6 will track the real pending-intents
-//     count from the local transaction queue).
+//     the real pending_intents count — the number of intents
+//     ApplyIntent has accepted but not yet finished.
 //
 // We intentionally do NOT log every Heartbeat: at 30s cadence a
 // noisy log fills quickly. Diagnostics live in the agent's
@@ -40,7 +40,8 @@ import (
 // Response:
 //   - ack: true.
 //   - next_heartbeat_seconds: heartbeatIntervalSeconds.
-//   - pending_intents: 0 (T6 will fill from the local queue).
+//   - pending_intents: the number of intents accepted by
+//     ApplyIntent and not yet finished.
 func (s *agentService) Heartbeat(ctx context.Context, req *agentv1.HeartbeatRequest) (*agentv1.HeartbeatResponse, error) {
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "Heartbeat: nil request")
@@ -67,6 +68,6 @@ func (s *agentService) Heartbeat(ctx context.Context, req *agentv1.HeartbeatRequ
 	return &agentv1.HeartbeatResponse{
 		Ack:                  true,
 		NextHeartbeatSeconds: heartbeatIntervalSeconds,
-		PendingIntents:       0,
+		PendingIntents:       uint32(s.pendingIntentCount()),
 	}, nil
 }

@@ -143,6 +143,12 @@ func (s *agentService) ApplyIntent(ctx context.Context, req *agentv1.ApplyIntent
 		}, nil
 	}
 
+	// pending covers only intents that actually enter the transaction:
+	// an RF3 refusal or a backend-selection failure is already terminal
+	// and must not inflate the "unfinished work" count.
+	s.beginIntent(req.IntentId)
+	defer s.endIntent(req.IntentId)
+
 	tx := s.buildTx(backend)
 	return tx.Run(ctx, req)
 }
