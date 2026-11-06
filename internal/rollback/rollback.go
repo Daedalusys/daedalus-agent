@@ -10,17 +10,19 @@
 //     still gives the rollback machinery something to restore
 //     from). Wired through RsyncBackend.
 //
-// LVM-snap and snapper are out of scope for P0.5 (tracked in
-// `daedalus-agent#8`). SelectBackend only returns a backend for
-// SNAPSHOT_CAPABILITY_BTRFS_SUBVOLUME and
-// SNAPSHOT_CAPABILITY_RSYNC_TARGET; other capabilities (NONE,
-// UNSPECIFIED, the deferred LVM / snapper values) yield
-// ErrNoBackend so callers can refuse early with a clear error.
+// LVM-snap and snapper (daedalus-agent#8) are wired through
+// lvmSnapBackend / snapperBackend: SelectBackend returns them for
+// SNAPSHOT_CAPABILITY_LVM_SNAP and SNAPSHOT_CAPABILITY_SNAPSHOT_SNAPPER.
+// The capability probe that reports those values lives in
+// internal/snapshot. NONE, UNSPECIFIED and any unknown enum still
+// yield ErrNoBackend so callers can refuse early with a clear error.
 //
 // The package follows T4's hook-substitution convention: a
-// package-level `runCommand` variable is the only seam tests
-// need. Production code calls exec.Command directly through
-// this variable; tests override it with a recording fake.
+// package-level `runCommand` variable is the only seam most tests
+// need; a second `runCommandOutput` seam covers the commands whose
+// stdout carries the answer (snapper prints the new snapshot
+// number). Production code calls exec.Command directly through
+// these variables; tests override them with a recording fake.
 //
 // RF3 surface (see plan §RF3 + spec §5.2):
 //
@@ -65,6 +67,15 @@ var runCommand = func(name string, args ...string) error {
 	return c.Run()
 }
 
+// runCommandOutput is the seam for commands whose stdout carries the
+// answer (snapper prints the number of the snapshot it just created).
+// Same shape as internal/snapshot/capability.go's runCommandOutput so
+// the convention stays consistent across packages.
+var runCommandOutput = func(name string, args ...string) ([]byte, error) {
+	c := newCmd(name, args...)
+	return c.Output()
+}
+
 // Backend is the on-host snapshot / restore primitive the tx
 // state machine consumes. The two P0.5 implementations are
 // BtrfsBackend (subvolume-level, copy-on-write) and RsyncBackend
@@ -97,10 +108,10 @@ type Backend interface {
 
 // SelectBackend returns the rollback Backend corresponding to a
 // snapshot capability, or (nil, ErrNoBackend) if the capability
-// is NONE / UNSPECIFIED / one of the deferred P0.6+ capabilities
-// (LVM, SNAPPER).
+// is NONE / UNSPECIFIED. Unknown enum values (a future proto
+// addition the agent doesn't know) also refuse rather than guess.
 //
-// Callers MUST treat ErrNoBackend as an early-exit refusal —
+// Callers MUST treat any non-nil error as an early-exit refusal —
 // never fall through to a no-op apply, never substitute a
 // "best-effort" wrapper (RF3).
 func SelectBackend(capability agentv1.SnapshotCapability) (Backend, error) {
@@ -109,14 +120,17 @@ func SelectBackend(capability agentv1.SnapshotCapability) (Backend, error) {
 		return &BtrfsBackend{}, nil
 	case agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_RSYNC_TARGET:
 		return &RsyncBackend{}, nil
+	case agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_LVM_SNAP:
+		return &lvmSnapBackend{}, nil
+	case agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_SNAPSHOT_SNAPPER:
+		return &snapperBackend{}, nil
 	case agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE,
 		agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_UNSPECIFIED:
 		return nil, ErrNoBackend
 	default:
-		// Deferred P0.6+ capabilities (lvm-snap, snapper) and
-		// any future proto enum value fall into here. We refuse
+		// Any future proto enum value falls into here. We refuse
 		// rather than guess — an unknown backend should look
 		// identical to NONE from the agent's perspective.
-		return nil, fmt.Errorf("rollback: unsupported snapshot capability %v (deferred to P0.6+); refuse", capability)
+		return nil, fmt.Errorf("rollback: unsupported snapshot capability %v; refuse", capability)
 	}
 }
