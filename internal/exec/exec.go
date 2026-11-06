@@ -91,6 +91,7 @@ func Register(kind string, e Executor) {
 // 这样本 task 可以独立编译与测试。
 func registerAll() {
 	Register(kindPackage, packageExecutor{})
+	Register(kindService, serviceExecutor{})
 }
 
 // lookup 返回 kind 对应的执行器。第二个返回值为 false 表示未注册。
