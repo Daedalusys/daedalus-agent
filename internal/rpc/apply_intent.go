@@ -48,6 +48,7 @@ package rpc
 
 import (
 	"context"
+	"fmt"
 	"log"
 
 	"google.golang.org/grpc/codes"
@@ -147,6 +148,13 @@ func (s *agentService) ApplyIntent(ctx context.Context, req *agentv1.ApplyIntent
 		auditSeq := s.auditSeq.Add(1)
 		log.Printf("agent: ApplyIntent backend selection failed after RF3 admission: intent_id=%q cap=%v err=%v audit_seq=%d",
 			req.IntentId, capability, err, auditSeq)
+		s.recordOutcome(req.IntentId, "apply_intent.backend_unavailable",
+			fmt.Sprintf("backend_unavailable: %v", err),
+			map[string]string{
+				"target": req.Target,
+				"kind":   req.Kind,
+				"error":  err.Error(),
+			})
 		return &agentv1.ApplyIntentResponse{
 			Result:       agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_REFUSED_SNAPSHOT_CAPABILITY_NONE,
 			ErrorMessage: rf3RefusalMessage,
