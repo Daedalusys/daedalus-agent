@@ -40,6 +40,7 @@ import (
 
 	agentv1 "github.com/Daedalusys/daedalus-sdk/proto/agent/v1"
 
+	"github.com/Daedalusys/daedalus-agent/internal/audit"
 	"github.com/Daedalusys/daedalus-agent/internal/cert"
 	"github.com/Daedalusys/daedalus-agent/internal/config"
 	"github.com/Daedalusys/daedalus-agent/internal/exec"
@@ -84,6 +85,8 @@ type testRig struct {
 	Conn    *grpc.ClientConn
 	Client  agentv1.AgentServiceClient
 	Backend *rigMockBackend
+	// Audit 是服务端实际写入的同一条链,测试可直接 Since / Verify。
+	Audit   *audit.Local
 	Cleanup func()
 }
 
@@ -185,6 +188,11 @@ func startTestServerConfigured(t *testing.T, cap agentv1.SnapshotCapability, mut
 		mutate(cfg)
 	}
 
+	auditLog, err := audit.New(dir)
+	if err != nil {
+		t.Fatalf("audit.New: %v", err)
+	}
+
 	detector := snapshot.NewDetector()
 	detector.SetCapability(cap)
 
@@ -199,6 +207,7 @@ func startTestServerConfigured(t *testing.T, cap agentv1.SnapshotCapability, mut
 		CertInfo: info,
 		Snapshot: detector,
 		Backend:  mockBackend,
+		Audit:    auditLog,
 	})
 	if err != nil {
 		t.Fatalf("rpc.NewServer: %v", err)
@@ -235,6 +244,7 @@ func startTestServerConfigured(t *testing.T, cap agentv1.SnapshotCapability, mut
 		Conn:    conn,
 		Client:  client,
 		Backend: mockBackend,
+		Audit:   auditLog,
 		Cleanup: func() {
 			srv.Stop()
 			_ = conn.Close()
