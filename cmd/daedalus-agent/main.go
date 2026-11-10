@@ -448,10 +448,3 @@ func newReportCmd(cfgPath *string) *cobra.Command {
 	cmd.Flags().String("addr", "", "override control_plane_addr for this call")
 	return cmd
 }
-
-// errNotImplemented returns a sentinel-shaped error that callers can
-// errors.Is against once a real implementation lands. The task name
-// tells the operator which task will close the gap.
-func errNotImplemented(cmd, task string) error {
-	return errors.New(cmd + ": not implemented (planned for " + task + ")")
-}
