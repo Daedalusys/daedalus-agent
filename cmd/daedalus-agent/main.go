@@ -412,20 +412,41 @@ func newApplyCmd(cfgPath *string) *cobra.Command {
 }
 
 func newReportCmd(cfgPath *string) *cobra.Command {
-	return &cobra.Command{
-		Use:   "report",
-		Short: "Manually invoke ReportStatus against the control plane",
-		RunE: func(_ *cobra.Command, _ []string) error {
-			cfg, err := loadConfig(*cfgPath)
+	var (
+		since uint64
+		max   uint32
+	)
+	cmd := &cobra.Command{
+		Use:          "report",
+		Short:        "Manually invoke ReportStatus against an endpoint serving AgentService",
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cfg, err := clientConfig(cmd, *cfgPath)
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(os.Stderr,
-				"report: not yet implemented (T5 will add this RPC); would dial %s as %s\n",
-				cfg.ControlPlaneAddr, cfg.AgentID)
-			return errNotImplemented("report", "T5")
+			client, closer, err := dialClient(cfg)
+			if err != nil {
+				return fmt.Errorf("report: %w", err)
+			}
+			defer func() { _ = closer() }()
+
+			ctx, cancel := clientCallContext(cmd)
+			defer cancel()
+			resp, err := client.ReportStatus(ctx, &agentv1.ReportStatusRequest{
+				SinceAuditSeq: since,
+				MaxEvents:     max,
+			})
+			if err != nil {
+				return wrapPeerError("report", cfg.ControlPlaneAddr, err)
+			}
+			return printProtoJSON(cmd.OutOrStdout(), resp)
 		},
 	}
+	cmd.Flags().Uint64Var(&since, "since", 0, "return audit events with seq > since (0 = all)")
+	cmd.Flags().Uint32Var(&max, "max", 0, "max events to return (0 = no cap)")
+	cmd.Flags().String("addr", "", "override control_plane_addr for this call")
+	return cmd
 }
 
 // errNotImplemented returns a sentinel-shaped error that callers can
