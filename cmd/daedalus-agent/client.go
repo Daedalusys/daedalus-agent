@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -47,12 +49,20 @@ func clientConfig(cmd *cobra.Command, cfgPath string) (*config.Config, error) {
 
 // printProtoJSON 用 proto 字段名输出缩进 JSON:运维读的是 wire 字段名,
 // 不是 protojson 默认的 lowerCamelCase。
+//
+// 缩进由 encoding/json 重排而不是交给 protojson 的 Multiline:protojson 会
+// 故意在冒号后随机多插一个空格,同一份响应的字节输出不稳定,运维脚本没法
+// 按固定文本断言。重排只动空白,不动字段名与值的表示。
 func printProtoJSON(w io.Writer, msg proto.Message) error {
-	b, err := protojson.MarshalOptions{Multiline: true, Indent: "  ", UseProtoNames: true}.Marshal(msg)
+	compact, err := protojson.MarshalOptions{UseProtoNames: true}.Marshal(msg)
 	if err != nil {
 		return fmt.Errorf("序列化响应失败: %w", err)
 	}
-	_, err = fmt.Fprintln(w, string(b))
+	var pretty bytes.Buffer
+	if err := json.Indent(&pretty, compact, "", "  "); err != nil {
+		return fmt.Errorf("序列化响应失败: %w", err)
+	}
+	_, err = fmt.Fprintln(w, pretty.String())
 	return err
 }
 
@@ -69,6 +79,19 @@ func wrapPeerError(cmd, addr string, err error) error {
 			"用 --addr 指向实际在服务的端点: %w", cmd, addr, err)
 	}
 	return fmt.Errorf("%s: 调用 %s 失败: %w", cmd, addr, err)
+}
+
+// riskClassFromFlag 把命令行风险等级翻成 proto 枚举。取值集合故意封闭:
+// 拼错或大小写不符一律当用法错误,因为风险等级决定审批门,不能靠猜。
+func riskClassFromFlag(s string) (agentv1.RiskClass, error) {
+	switch s {
+	case "low":
+		return agentv1.RiskClass_RISK_CLASS_LOW, nil
+	case "high":
+		return agentv1.RiskClass_RISK_CLASS_HIGH, nil
+	default:
+		return agentv1.RiskClass_RISK_CLASS_UNSPECIFIED, fmt.Errorf("--risk-class=%q: 只接受 low|high", s)
+	}
 }
 
 // collectRegisterRequest 组装 Register 请求。身份字段全部来自本机:

@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -17,6 +18,8 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+
+	agentv1 "github.com/Daedalusys/daedalus-sdk/proto/agent/v1"
 
 	"github.com/Daedalusys/daedalus-agent/internal/audit"
 	"github.com/Daedalusys/daedalus-agent/internal/cert"
@@ -340,20 +343,72 @@ func newRegisterCmd(cfgPath *string) *cobra.Command {
 }
 
 func newApplyCmd(cfgPath *string) *cobra.Command {
-	return &cobra.Command{
-		Use:   "apply",
-		Short: "Manually invoke ApplyIntent against the control plane",
-		RunE: func(_ *cobra.Command, _ []string) error {
-			cfg, err := loadConfig(*cfgPath)
+	var (
+		intentID  string
+		kind      string
+		target    string
+		specFile  string
+		riskClass string
+	)
+	cmd := &cobra.Command{
+		Use:          "apply",
+		Short:        "Manually invoke ApplyIntent against an endpoint serving AgentService",
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			// 先做纯输入校验,再加载配置/建连:用法错误不应产生任何网络行为。
+			if intentID == "" {
+				return errors.New("--intent-id 必填")
+			}
+			if kind == "" {
+				return errors.New("--kind 必填")
+			}
+			rc, err := riskClassFromFlag(riskClass)
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(os.Stderr,
-				"apply: not yet implemented (T5 will add this RPC); would dial %s as %s\n",
-				cfg.ControlPlaneAddr, cfg.AgentID)
-			return errNotImplemented("apply", "T5")
+			specJSON := ""
+			if specFile != "" {
+				raw, err := os.ReadFile(specFile)
+				if err != nil {
+					return fmt.Errorf("--spec-file=%q: %w", specFile, err)
+				}
+				if !json.Valid(raw) {
+					return fmt.Errorf("--spec-file=%q: 内容不是合法 JSON", specFile)
+				}
+				specJSON = string(raw)
+			}
+			cfg, err := clientConfig(cmd, *cfgPath)
+			if err != nil {
+				return err
+			}
+			client, closer, err := dialClient(cfg)
+			if err != nil {
+				return fmt.Errorf("apply: %w", err)
+			}
+			defer func() { _ = closer() }()
+
+			ctx, cancel := clientCallContext(cmd)
+			defer cancel()
+			resp, err := client.ApplyIntent(ctx, &agentv1.ApplyIntentRequest{
+				IntentId:  intentID,
+				Kind:      kind,
+				Target:    target,
+				SpecJson:  specJSON,
+				RiskClass: rc,
+			})
+			if err != nil {
+				return wrapPeerError("apply", cfg.ControlPlaneAddr, err)
+			}
+			return printProtoJSON(cmd.OutOrStdout(), resp)
 		},
 	}
+	cmd.Flags().StringVar(&intentID, "intent-id", "", "intent id written into the peer's audit chain")
+	cmd.Flags().StringVar(&kind, "kind", "", "resource kind (package / service / task / container / policy)")
+	cmd.Flags().StringVar(&target, "target", "", "target path or package name")
+	cmd.Flags().StringVar(&specFile, "spec-file", "", "path to the intent spec JSON (optional)")
+	cmd.Flags().StringVar(&riskClass, "risk-class", "high", "risk class: low|high (default high — CLI 调用不允许静默低估风险)")
+	cmd.Flags().String("addr", "", "override control_plane_addr for this call")
+	return cmd
 }
 
 func newReportCmd(cfgPath *string) *cobra.Command {
