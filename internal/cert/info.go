@@ -17,6 +17,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -66,6 +67,25 @@ func LoaderInfo(loader *Loader) (*Info, error) {
 		return nil, fmt.Errorf("cert: read %s: %w", loader.cfg.CertPath, err)
 	}
 	return parseInfoFromPEM(leafPEM)
+}
+
+// FingerprintFromFile 读取 certPath 处的叶子证书并返回其 SHA-256 指纹
+// (小写 hex,无分隔符 —— 与 Info.Fingerprint 的实际输出形式一致)。
+// 存在的意义是让"没有 Loader、只有证书路径"的调用方(如 CLI 的 Register)
+// 不必构造完整的 Loader/私钥即可取到指纹。
+func FingerprintFromFile(certPath string) (string, error) {
+	if certPath == "" {
+		return "", errors.New("cert: FingerprintFromFile: certPath 为空")
+	}
+	leafPEM, err := os.ReadFile(certPath)
+	if err != nil {
+		return "", fmt.Errorf("cert: read %s: %w", certPath, err)
+	}
+	info, err := parseInfoFromPEM(leafPEM)
+	if err != nil {
+		return "", err
+	}
+	return info.Fingerprint, nil
 }
 
 // parseInfoFromPEM is the helper LoaderInfo delegates to; it

@@ -37,4 +37,4 @@ Open issues in this repository, so "has this been done yet?" is answerable by nu
 | [#7](https://github.com/Daedalusys/daedalus-agent/issues/7) | `ApplyIntent` outcome events move from plain log lines into the JSONL audit hash chain |
 | [#8](https://github.com/Daedalusys/daedalus-agent/issues/8) | Rollback backend: add LVM-snap / snapper (today only btrfs subvolume + rsync target are probed and selectable) |
 | [#9](https://github.com/Daedalusys/daedalus-agent/issues/9) | `Heartbeat` returns the real `pending_intents` count (today hardcoded to `0`) |
-| [#10](https://github.com/Daedalusys/daedalus-agent/issues/10) | Agent outbound gRPC client: the `register` / `apply` / `report` subcommands are still `not implemented` |
+| [#10](https://github.com/Daedalusys/daedalus-agent/issues/10) | Agent outbound gRPC client: `register` / `apply` / `report` now dial the peer over mTLS via `internal/agentclient` (closed; `--addr` overrides `control_plane_addr`) |
