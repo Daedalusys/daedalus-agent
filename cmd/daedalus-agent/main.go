@@ -302,28 +302,41 @@ func newVersionCmd() *cobra.Command {
 	}
 }
 
-// --- RPC client stubs -------------------------------------------------------
-//
-// These three subcommands exist to exercise the gRPC client wiring in T3
-// and the RPC handler paths in T5. For T1 they print a clear
-// not-implemented message and exit non-zero, after loading the config so
-// the wiring is exercised end-to-end.
+// --- RPC client subcommands -------------------------------------------------
 
 func newRegisterCmd(cfgPath *string) *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "register",
-		Short: "Manually invoke Register against the control plane",
-		RunE: func(_ *cobra.Command, _ []string) error {
-			cfg, err := loadConfig(*cfgPath)
+		Short: "Manually invoke Register against an endpoint serving AgentService",
+		// 用法/传输错误都不打印 usage:stdout 只留给响应 JSON,
+		// 让调用方能直接解析。
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cfg, err := clientConfig(cmd, *cfgPath)
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(os.Stderr,
-				"register: not yet implemented (T5 will add this RPC); would dial %s as %s\n",
-				cfg.ControlPlaneAddr, cfg.AgentID)
-			return errNotImplemented("register", "T5")
+			req, err := collectRegisterRequest(cfg)
+			if err != nil {
+				return fmt.Errorf("register: 组装请求失败: %w", err)
+			}
+			client, closer, err := dialClient(cfg)
+			if err != nil {
+				return fmt.Errorf("register: %w", err)
+			}
+			defer func() { _ = closer() }()
+
+			ctx, cancel := clientCallContext(cmd)
+			defer cancel()
+			resp, err := client.Register(ctx, req)
+			if err != nil {
+				return wrapPeerError("register", cfg.ControlPlaneAddr, err)
+			}
+			return printProtoJSON(cmd.OutOrStdout(), resp)
 		},
 	}
+	cmd.Flags().String("addr", "", "override control_plane_addr for this call")
+	return cmd
 }
 
 func newApplyCmd(cfgPath *string) *cobra.Command {
