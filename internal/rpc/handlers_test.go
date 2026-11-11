@@ -40,38 +40,39 @@ import (
 
 	agentv1 "github.com/Daedalusys/daedalus-sdk/proto/agent/v1"
 
+	"github.com/Daedalusys/daedalus-agent/internal/audit"
 	"github.com/Daedalusys/daedalus-agent/internal/cert"
 	"github.com/Daedalusys/daedalus-agent/internal/config"
-	"github.com/Daedalusys/daedalus-agent/internal/exec"
+	"github.com/Daedalusys/daedalus-agent/internal/rollback"
 	"github.com/Daedalusys/daedalus-agent/internal/rpc"
 	"github.com/Daedalusys/daedalus-agent/internal/snapshot"
+	"github.com/Daedalusys/daedalus-agent/internal/tx"
 )
 
-// testNoopKind 是仅测试用的 intent kind;注册一个无副作用执行器后,
-// rpc 层测试既能验证"handler 确实把 intent 交给 internal/exec",又不会
-// 在测试机上跑真实包管理器/文件系统操作。
-const testNoopKind = "test.noop"
-
-// testNoopExecutor 只数调用次数。
-type testNoopExecutor struct{ calls atomic.Int32 }
-
-func (e *testNoopExecutor) Apply(_ context.Context, _ *agentv1.ApplyIntentRequest) error {
-	e.calls.Add(1)
-	return nil
+// cannedTx 是只回一条固定响应的事务 fake。准入相关的用例不关心事务内部
+// 怎么跑,只关心 handler 有没有把 intent 送进事务 —— 用真的 exec.Apply
+// 会去跑测试机上的包管理器。
+type cannedTx struct {
+	onRun func(context.Context, *agentv1.ApplyIntentRequest) (*agentv1.ApplyIntentResponse, error)
 }
 
-var (
-	testNoopOnce sync.Once
-	testNoopExec = &testNoopExecutor{}
-)
+func (c cannedTx) Run(ctx context.Context, req *agentv1.ApplyIntentRequest) (*agentv1.ApplyIntentResponse, error) {
+	return c.onRun(ctx, req)
+}
 
-// registerTestNoopExecutor 幂等注册(exec.Register 对重复注册会 panic,
-// 故用 Once 保护多次调用)。
-func registerTestNoopExecutor() {
-	testNoopOnce.Do(func() { exec.Register(testNoopKind, testNoopExec) })
-	// 计数是跨用例的包级状态:每个用例开始前清零,免得上一个用例的调用
-	// 数污染本用例的断言(go test -count=2 也会踩到)。
-	testNoopExec.calls.Store(0)
+// successTxFactory 返回一个恒 SUCCESS 的事务,并把收到的 intent 记进 got。
+func successTxFactory(got **agentv1.ApplyIntentRequest) rpc.TxFactory {
+	return func(rollback.Backend, string, *atomic.Uint64, *audit.Local) tx.Tx {
+		return cannedTx{onRun: func(_ context.Context, req *agentv1.ApplyIntentRequest) (*agentv1.ApplyIntentResponse, error) {
+			if got != nil {
+				*got = req
+			}
+			return &agentv1.ApplyIntentResponse{
+				Result: agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_SUCCESS,
+				TxId:   "tx-" + req.IntentId,
+			}, nil
+		}}
+	}
 }
 
 // testRig bundles a live *rpc.Server with a *grpc.ClientConn
@@ -138,6 +139,19 @@ func startTestServerWithSnapshot(t *testing.T, cap agentv1.SnapshotCapability) *
 // need a non-default Config field (e.g. PolicyPath) use this seam; every
 // other test keeps calling the wrapper and stays untouched.
 func startTestServerConfigured(t *testing.T, cap agentv1.SnapshotCapability, mutate func(*config.Config)) *testRig {
+	return startTestServerFull(t, cap, mutate, nil)
+}
+
+// startTestServerWithTx 在标准 rig 上换掉 ApplyIntent 的事务构造,用来
+// 只验证准入 / 分派,不落真实执行器。回滚点用例既不希望跑包管理器,也不
+// 希望依赖 file 执行器是否已注册。
+func startTestServerWithTx(t *testing.T, cap agentv1.SnapshotCapability, factory rpc.TxFactory) *testRig {
+	return startTestServerFull(t, cap, nil, func(d *rpc.ServiceDeps) { d.TxFactory = factory })
+}
+
+// startTestServerFull is the shared rig builder: mutateCfg runs before the
+// config is consumed, mutateDeps before the server is constructed.
+func startTestServerFull(t *testing.T, cap agentv1.SnapshotCapability, mutateCfg func(*config.Config), mutateDeps func(*rpc.ServiceDeps)) *testRig {
 	t.Helper()
 
 	mockBackend := &rigMockBackend{}
@@ -181,8 +195,8 @@ func startTestServerConfigured(t *testing.T, cap agentv1.SnapshotCapability, mut
 		CAPath:           mustWrite(t, dir, "noop-ca.crt", []byte("")),
 		CAKeyPath:        mustWrite(t, dir, "noop-ca.key", []byte("")),
 	}
-	if mutate != nil {
-		mutate(cfg)
+	if mutateCfg != nil {
+		mutateCfg(cfg)
 	}
 
 	detector := snapshot.NewDetector()
@@ -194,12 +208,16 @@ func startTestServerConfigured(t *testing.T, cap agentv1.SnapshotCapability, mut
 	}
 	t.Cleanup(func() { _ = listener.Close() })
 
-	srv, err := rpc.NewServer(listener.Addr().String(), tlsCfg, rpc.ServiceDeps{
+	deps := rpc.ServiceDeps{
 		Cfg:      cfg,
 		CertInfo: info,
 		Snapshot: detector,
 		Backend:  mockBackend,
-	})
+	}
+	if mutateDeps != nil {
+		mutateDeps(&deps)
+	}
+	srv, err := rpc.NewServer(listener.Addr().String(), tlsCfg, deps)
 	if err != nil {
 		t.Fatalf("rpc.NewServer: %v", err)
 	}
@@ -415,66 +433,44 @@ func TestHeartbeat_AfterRegister_Acks(t *testing.T) {
 	}
 }
 
-// TestApplyIntent_OnNoneCapability_Refused — RF3.
+// TestApplyIntent_HighRiskWithoutRollbackPoint_Refused — 准入闸门.
 //
-// This is the most important test in the file. The agent MUST
-// refuse ApplyIntent when its snapshot_capability is NONE: any
-// commit without a rollback path violates the spec's "no silent
-// partial apply" rule (spec §6 + plan §RF3). The response must:
+// 高危 intent 打到没有回滚点的 kind(package / service)上 → 拒绝。拒绝
+// 理由必须说"没有回滚点",而不是"宿主没有快照能力":后者回答的是另一个
+// 问题,照旧用它会把"这台机器没装 btrfs"错当成"这次变更没法还原"。
 //
-//   - Result == APPLY_INTENT_RESULT_REFUSED_SNAPSHOT_CAPABILITY_NONE.
-//   - ErrorMessage is non-empty.
-//   - ErrorMessage contains "no snapshot backend" or
-//     "ApplyIntent refused" so the control plane's failure bucket
-//     can surface it.
-//   - ErrorMessage does NOT contain the bare word "best-effort"
-//     without the rest of the explanation (the human-reviewer
-//     misreading concern raised in the spec).
-func TestApplyIntent_OnNoneCapability_Refused(t *testing.T) {
+// 这里刻意把宿主能力设成 NONE:准入不再看它。
+func TestApplyIntent_HighRiskWithoutRollbackPoint_Refused(t *testing.T) {
 	rig := startTestServerWithSnapshot(t, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE)
 	defer rig.Cleanup()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	// First Register so the agent has a node_id.
 	if _, err := rig.Client.Register(ctx, &agentv1.RegisterRequest{AgentId: "agent-test-1"}); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	resp, err := rig.Client.ApplyIntent(ctx, &agentv1.ApplyIntentRequest{
-		IntentId:  "intent-001",
-		Kind:      "package.set",
-		Target:    "nginx",
-		SpecJson:  `{"name":"nginx","version":"1.18"}`,
-		RiskClass: agentv1.RiskClass_RISK_CLASS_LOW,
+		IntentId:  "i1",
+		Kind:      "package",
+		Target:    "kernel-core",
+		RiskClass: agentv1.RiskClass_RISK_CLASS_HIGH,
 	})
 	if err != nil {
-		t.Fatalf("ApplyIntent: %v", err)
+		t.Fatal(err)
 	}
-	if resp.Result != agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_REFUSED_SNAPSHOT_CAPABILITY_NONE {
-		t.Errorf("Result = %v, want REFUSED_SNAPSHOT_CAPABILITY_NONE", resp.Result)
+	if resp.GetResult() != agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_REFUSED_SNAPSHOT_CAPABILITY_NONE {
+		t.Errorf("结果 = %v, want REFUSED", resp.GetResult())
 	}
-	if resp.ErrorMessage == "" {
-		t.Errorf("ErrorMessage empty; want explanation of the refusal")
-	}
-	if !strings.Contains(resp.ErrorMessage, "snapshot backend") &&
-		!strings.Contains(resp.ErrorMessage, "ApplyIntent refused") {
-		t.Errorf("ErrorMessage %q must mention 'snapshot backend' or 'ApplyIntent refused' (RF3 clarity)", resp.ErrorMessage)
-	}
-	// Bare "best-effort" alone is forbidden — the full
-	// explanation must accompany it.
-	if strings.TrimSpace(resp.ErrorMessage) == "best-effort" {
-		t.Errorf("ErrorMessage is the bare string 'best-effort'; that misreads to reviewers as 'we will handle it' (RF3)")
+	if !strings.Contains(resp.GetErrorMessage(), "without rollback point") {
+		t.Errorf("文案 = %q, want 含 without rollback point", resp.GetErrorMessage())
 	}
 }
 
-// 非 NONE 的 happy path 仍必须回 SUCCESS 且 tx_id 非空 —— 现在 apply 走的是
-// internal/exec 的真实分派器(只打日志的 applyStub 已删除)。
-//
-// 这里为一个仅测试用的 kind 注册无副作用执行器,这样断言覆盖的是
-// handler → exec.Apply 的接线,而不会在测试机上跑真实包管理器。
-func TestApplyIntent_OnBtrfsCapability_DispatchesToExecutor(t *testing.T) {
-	registerTestNoopExecutor()
-	rig := startTestServerWithSnapshot(t, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_BTRFS_SUBVOLUME)
+// 低危 + 无回滚点 → 放行。低危变更没有还原手段也未必不能做:拒绝与否是
+// 风险问题,不是能力问题。
+func TestApplyIntent_LowRiskWithoutRollbackPoint_Allowed(t *testing.T) {
+	var got *agentv1.ApplyIntentRequest
+	rig := startTestServerWithTx(t, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE, successTxFactory(&got))
 	defer rig.Cleanup()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -483,23 +479,76 @@ func TestApplyIntent_OnBtrfsCapability_DispatchesToExecutor(t *testing.T) {
 		t.Fatalf("Register: %v", err)
 	}
 	resp, err := rig.Client.ApplyIntent(ctx, &agentv1.ApplyIntentRequest{
-		IntentId:  "intent-001",
-		Kind:      testNoopKind,
+		IntentId:  "i2",
+		Kind:      "package",
 		Target:    "nginx",
-		SpecJson:  `{"name":"nginx"}`,
 		RiskClass: agentv1.RiskClass_RISK_CLASS_LOW,
 	})
 	if err != nil {
-		t.Fatalf("ApplyIntent: %v", err)
+		t.Fatal(err)
 	}
-	if resp.Result != agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_SUCCESS {
-		t.Errorf("Result = %v, want SUCCESS", resp.Result)
+	if resp.GetResult() == agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_REFUSED_SNAPSHOT_CAPABILITY_NONE {
+		t.Fatalf("低危 package 应放行, got REFUSED: %q", resp.GetErrorMessage())
 	}
-	if resp.TxId == "" {
-		t.Errorf("TxId empty; want non-empty (tx success derives one from intent_id)")
+	if got == nil {
+		t.Fatal("intent 没有进入事务")
 	}
-	if got := testNoopExec.calls.Load(); got != 1 {
-		t.Errorf("executor calls = %d, want 1 (apply must reach internal/exec)", got)
+}
+
+// 高危 + 有回滚点(file)→ 放行。file 是唯一有回滚点的 kind。
+func TestApplyIntent_HighRiskWithRollbackPoint_Allowed(t *testing.T) {
+	var got *agentv1.ApplyIntentRequest
+	rig := startTestServerWithTx(t, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE, successTxFactory(&got))
+	defer rig.Cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := rig.Client.Register(ctx, &agentv1.RegisterRequest{AgentId: "agent-test-1"}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	resp, err := rig.Client.ApplyIntent(ctx, &agentv1.ApplyIntentRequest{
+		IntentId:  "i3",
+		Kind:      "file",
+		Target:    "/etc/app.conf",
+		SpecJson:  `{"content":"hello"}`,
+		RiskClass: agentv1.RiskClass_RISK_CLASS_HIGH,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.GetResult() == agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_REFUSED_SNAPSHOT_CAPABILITY_NONE {
+		t.Fatalf("高危 file 应放行, got REFUSED: %q", resp.GetErrorMessage())
+	}
+	if got == nil {
+		t.Fatal("intent 没有进入事务")
+	}
+}
+
+// 表外 kind → 拒绝(fail-closed)。不认识的 kind 既没有回滚点,也没有执行器,
+// 放行等于让控制面以为 agent 会做点什么。
+func TestApplyIntent_UnknownKind_Refused(t *testing.T) {
+	rig := startTestServerWithSnapshot(t, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE)
+	defer rig.Cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := rig.Client.Register(ctx, &agentv1.RegisterRequest{AgentId: "agent-test-1"}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	resp, err := rig.Client.ApplyIntent(ctx, &agentv1.ApplyIntentRequest{
+		IntentId:  "i4",
+		Kind:      "totally-unknown",
+		Target:    "whatever",
+		RiskClass: agentv1.RiskClass_RISK_CLASS_LOW,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.GetResult() != agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_REFUSED_SNAPSHOT_CAPABILITY_NONE {
+		t.Errorf("结果 = %v, want REFUSED", resp.GetResult())
+	}
+	if !strings.Contains(resp.GetErrorMessage(), "unknown intent kind") {
+		t.Errorf("文案 = %q, want 含 unknown intent kind", resp.GetErrorMessage())
 	}
 }
 
