@@ -658,6 +658,13 @@ func TestLocal_ApplyFailureWritesFailureEntry(t *testing.T) {
 	if !strings.Contains(events[0].Outcome, "executor exploded") {
 		t.Errorf("outcome = %q must carry the executor error", events[0].Outcome)
 	}
+	// 没有回滚点就别在审计里写 "rolled back":那是留给真的拷回过的路径的。
+	if !strings.Contains(events[0].Outcome, "no rollback point") {
+		t.Errorf("outcome = %q must say there was no rollback point", events[0].Outcome)
+	}
+	if strings.Contains(events[0].Outcome, "rolled back") {
+		t.Errorf("outcome = %q must not claim a rollback", events[0].Outcome)
+	}
 }
 
 // apply 之后链仍然是完整可验的哈希链(SDK 是权威校验器)。

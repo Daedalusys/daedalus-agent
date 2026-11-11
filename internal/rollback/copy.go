@@ -118,6 +118,9 @@ func markAbsent(sourcePath, snapshotPath string) error {
 // copyFile 用一次 open + io.Copy 复制内容,不 shell out 到 cp / rsync。
 // 目标先以 0600 建出来,再由 applyMeta 把真实 mode 还回去 —— 中间不存在
 // 一个"宽权限裸奔"的窗口。
+//
+// O_NOFOLLOW:目标路径若在检查之后被换成符号链接,O_TRUNC 会顺着链接写
+// 到别处。把"不是链接"这个判断交给 open 本身,不留时间窗。
 func copyFile(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
@@ -125,7 +128,7 @@ func copyFile(src, dst string) error {
 	}
 	defer in.Close()
 
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return err
 	}
