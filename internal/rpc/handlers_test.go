@@ -12,9 +12,13 @@
 //     *agentService struct each time; gRPC gives us one point of
 //     wiring (NewServer) and covers the registration path too.
 //
-// RF3 (ApplyIntent refuses on snapshot_capability == NONE) and
-// RF4 (cert expiry surfaces a clear error to the gRPC client) are
-// covered as dedicated tests below.
+// ApplyIntent's admission gate (type-based: unknown kind refused, high-risk
+// without a rollback point refused) and RF4 (cert expiry surfaces a clear
+// error to the gRPC client) are covered as dedicated tests below.
+//
+// The gate no longer keys off snapshot_capability: that field only reports
+// which host-provided mechanism is present, not whether this change has a
+// rollback point.
 package rpc_test
 
 import (
@@ -85,6 +89,8 @@ type testRig struct {
 	Conn    *grpc.ClientConn
 	Client  agentv1.AgentServiceClient
 	Backend *rigMockBackend
+	// Audit 是服务端实际写入的同一条链,测试可直接 Since / Verify。
+	Audit   *audit.Local
 	Cleanup func()
 }
 
@@ -199,6 +205,11 @@ func startTestServerFull(t *testing.T, cap agentv1.SnapshotCapability, mutateCfg
 		mutateCfg(cfg)
 	}
 
+	auditLog, err := audit.New(dir)
+	if err != nil {
+		t.Fatalf("audit.New: %v", err)
+	}
+
 	detector := snapshot.NewDetector()
 	detector.SetCapability(cap)
 
@@ -213,6 +224,7 @@ func startTestServerFull(t *testing.T, cap agentv1.SnapshotCapability, mutateCfg
 		CertInfo: info,
 		Snapshot: detector,
 		Backend:  mockBackend,
+		Audit:    auditLog,
 	}
 	if mutateDeps != nil {
 		mutateDeps(&deps)
@@ -253,6 +265,7 @@ func startTestServerFull(t *testing.T, cap agentv1.SnapshotCapability, mutateCfg
 		Conn:    conn,
 		Client:  client,
 		Backend: mockBackend,
+		Audit:   auditLog,
 		Cleanup: func() {
 			srv.Stop()
 			_ = conn.Close()
