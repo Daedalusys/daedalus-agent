@@ -2,48 +2,26 @@
 // uses to take a pre-ApplyIntent snapshot and to restore from it
 // on failure.
 //
-// Two backends are implemented for P0.5:
+// 后端分两层语义:
 //
-//   - btrfs subvolume snapshot (priority 1 — copy-on-write,
-//     cheapest). Wired through BtrfsBackend.
-//   - rsync file-copy snapshot (priority 2 — slower, no CoW, but
-//     still gives the rollback machinery something to restore
-//     from). Wired through RsyncBackend.
-//
-// LVM-snap 与 snapper(daedalus-agent#8)分别由 lvmSnapBackend /
-// snapperBackend 承担:SelectBackend 对 SNAPSHOT_CAPABILITY_LVM_SNAP 与
-// SNAPSHOT_CAPABILITY_SNAPSHOT_SNAPPER 返回它们。把这两个能力探出来的
-// 探测器在 internal/snapshot(NONE / UNSPECIFIED / 未知枚举仍返回
-// ErrNoBackend,调用方据此尽早拒绝)。
+//   - copy 后端(CopyBackend)是生产路径。纯 Go 单文件副本,不依赖宿主
+//     上的任何二进制;回滚点由 kind 决定(目前只有 file)。
+//   - btrfs / rsync / lvm / snapper 是宿主自带机制,对应 BtrfsBackend /
+//     RsyncBackend / lvmSnapBackend / snapperBackend。它们的代码保留,
+//     但 MVP 不再探测、不再选中(见 daedalus-agent#8):通用云镜像的根
+//     文件系统是 ext4 / xfs,btrfs subvolume snapshot 又要求源本身是子卷。
+//     把它们留在 SelectBackend 里是为了扩展时能接回来。
 //
 // 包内沿用 hook 替换惯例:多数测试只需替换包级 `runCommand`;另有
 // `runCommandOutput` 覆盖"答案在 stdout 里"的命令(snapper 会打印刚建的
 // 快照号)。生产代码一律经这两个变量调 exec.Command,测试替换成录制 fake。
-//
-// RF3 surface (see plan §RF3 + spec §5.2):
-//
-//	SelectBackend(capability=NONE) returns (nil, ErrNoBackend).
-//	The local tx state machine (internal/tx) treats ErrNoBackend
-//	as an immediate refusal — no apply step, no fallback to
-//	"best-effort", no silent success. The wording in the refusal
-//	message is in internal/rpc/apply_intent.go (kept there so
-//	the agent and control plane agree on the exact phrasing).
 package rollback
 
 import (
-	"errors"
 	"fmt"
 
 	agentv1 "github.com/Daedalusys/daedalus-sdk/proto/agent/v1"
 )
-
-// ErrNoBackend is returned by SelectBackend when the agent has no
-// usable snapshot backend. Callers should refuse ApplyIntent /
-// SnapshotRequest with the RF3 wording when they see this error.
-// ErrNoBackend is matched with errors.Is — it is exported so
-// internal/tx and the gRPC handlers can both check for it without
-// sharing an import.
-var ErrNoBackend = errors.New("rollback: no snapshot backend available (btrfs/rsync/lvm/snapper all absent)")
 
 // runCommand is the package-level command-execution seam.
 //
@@ -84,8 +62,9 @@ var runCommandOutput = func(name string, args ...string) ([]byte, error) {
 //   - snapperBackend 按**配置 + 快照号**寻址:<snapshotPath> 是承载快照号
 //     的 sidecar 文件,<sourcePath> 只进描述文本。
 //
-// 换言之 tx 目前算出的 <dataDir>/intent-target/<target> 只对 btrfs/rsync
-// 有路径含义;把 lvm/snapper 接进来之前必须先解决快照源的选择问题(见
+// 换言之 copy 后端的 sourcePath / targetPath 都是**文件路径**(被改文件
+// 本体与还原目标),btrfs / rsync 的也是路径,lvm/snapper 的不是;把
+// lvm/snapper 接进生产路径之前必须先解决快照源的选择问题(见
 // SelectBackend 的调用方)。
 type Backend interface {
 	// CreateSnapshot captures <sourcePath> into <snapshotPath>.
@@ -112,12 +91,15 @@ type Backend interface {
 	Restore(snapshotPath, targetPath string) error
 }
 
-// SelectBackend 把快照能力映射到具体的回滚后端;能力是 NONE / UNSPECIFIED
-// 时返回 (nil, ErrNoBackend)。未知枚举值(未来 proto 新增而本 agent 不认识
-// 的)同样拒绝,不猜。
+// SelectBackend 把快照能力映射到具体的回滚后端。
 //
-// 调用方**必须**把任何非 nil error 当尽早拒绝处理 —— 绝不落到 no-op
-// apply,也绝不用一个 "best-effort" 包装蒙混过去(RF3)。
+// NONE / UNSPECIFIED 落到内建的 copy 后端:能力字段只描述"宿主自带什么
+// 机制",而回滚点是按 kind 判的 —— 宿主没装 btrfs 不等于这次变更没有
+// 还原手段。宿主自带机制(BTRFS / RSYNC / LVM / SNAPPER)的分支保持原样,
+// 但生产路径不再走到它们(探测已停用),留作扩展。
+//
+// 未知枚举值(未来 proto 新增而本 agent 不认识的)仍然拒绝,不猜:猜错会
+// 拿错的后端去动宿主。
 func SelectBackend(capability agentv1.SnapshotCapability) (Backend, error) {
 	switch capability {
 	case agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_BTRFS_SUBVOLUME:
@@ -130,10 +112,8 @@ func SelectBackend(capability agentv1.SnapshotCapability) (Backend, error) {
 		return &snapperBackend{}, nil
 	case agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE,
 		agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_UNSPECIFIED:
-		return nil, ErrNoBackend
+		return &CopyBackend{}, nil
 	default:
-		// 未来 proto 新增的枚举值落到这里。拒绝而不是猜:从 agent 的
-		// 视角,一个不认识的后端应当和 NONE 长得一样。
 		return nil, fmt.Errorf("rollback: unsupported snapshot capability %v; refuse", capability)
 	}
 }

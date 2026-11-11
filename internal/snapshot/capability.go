@@ -1,24 +1,16 @@
 // Package snapshot owns the daedalus-agent snapshot backend
 // capability probe.
 //
-// Detect() inspects the host at agent start-up (and on demand)
-// to determine which snapshot backend the agent can use for
-// pre-ApplyIntent rollback: a btrfs subvolume snapshot if the
-// root filesystem is btrfs and the `btrfs` CLI is on PATH, an
-// rsync target if rsync is available but btrfs is not, or NONE
-// if neither is present. LVM-snap and snapper backends are out
-// of scope for P0.5 (deferred to daedalus-agent#8) and are not probed
-// here — they are tracked separately.
+// Detect() 恒报 SNAPSHOT_CAPABILITY_NONE:这个字段只描述宿主自带的快照
+// 机制(btrfs subvolume / rsync / LVM / snapper),而 agent 的回滚点按
+// kind 定义、由内建的纯 Go copy 后端落地,与宿主能力无关。btrfs /
+// rsync 的探测函数保留(probeBtrfs / probeRsync),但生产路径不再调用。
 //
 // The result of Detect() flows into the gRPC Register response
 // (`snapshot_capability` field on the Register RPC, see SDK
 // proto `agent/v1/agent.proto`). The control plane reads the
-// field and decides whether to enable ApplyIntent on the host:
-// when the agent reports NONE, ApplyIntent MUST be refused
-// (spec §5.2 / RF3). Detect() also emits a clear WARN to stderr
-// in the NONE case so an operator reading the agent's log sees
-// the same notice the control plane surfaces to the human
-// reviewer.
+// field as "what host mechanism does this agent have"; it must
+// not read it as "can this agent roll anything back".
 package snapshot
 
 import (
@@ -110,30 +102,17 @@ func probeRsync() (bool, error) {
 	return true, nil
 }
 
-// Detect returns the snapshot backend the agent will use. The
-// priority is btrfs > rsync > none. When the agent has no usable
-// backend it returns SNAPSHOT_CAPABILITY_NONE AND emits a single
-// WARN to stderr so an operator reading the agent log sees the
-// same notice the control plane surfaces to the human reviewer
-// (RF3 — see plan §RF3 and spec §5.2).
+// Detect 恒报 NONE:宿主自带的快照机制不再参与回滚点判定。
 //
-// The WARN deliberately does NOT use the phrase "best-effort"
-// alone. "Best-effort rollback" reads to a hurried reviewer as
-// "we will handle it"; the actual contract is "ApplyIntent will
-// be refused; the host has no snapshot recovery path".
+// 能力字段回答的是"宿主自带什么手段",不是"这次变更有没有还原点" —— 后者
+// 按 kind 判,由内建的 copy 后端落地(见 internal/rollback 与 internal/tx)。
+// 在 ext4 / xfs 的通用镜像上探测 btrfs / rsync 只会得到一个与回滚能力无关
+// 的答案,却容易被读成"这台机器能回滚一切"。
+//
+// probeBtrfs / probeRsync 保留给扩展(btrfs / rsync 后端接回来时复用),
+// 生产路径不再调用它们;这里仍打一行日志,免得操作员把 NONE 读成"什么都
+// 不能回滚"。
 func Detect() agentv1.SnapshotCapability {
-	// Priority 1: btrfs subvolume (copy-on-write, cheapest).
-	if ok, _ := probeBtrfs(); ok {
-		return agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_BTRFS_SUBVOLUME
-	}
-	// Priority 2: rsync target (file-copy fallback, no CoW).
-	if ok, _ := probeRsync(); ok {
-		return agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_RSYNC_TARGET
-	}
-	// No backend. Per RF3, surface this loudly. Do NOT call
-	// log.Warn — that does not exist in the stdlib log package;
-	// the agent uses the prefix convention used by T1-T3
-	// (`agent:` prefix, single line, no structured fields yet).
-	log.Print("agent: no snapshot backend detected (btrfs/rsync/lvm/snapper all absent); ApplyIntent will refuse per RF3; only local audit + state report available")
+	log.Print("agent: snapshot capability reported as NONE by design (host snapshot mechanisms are not probed); rollback points are per-kind and use the built-in copy backend")
 	return agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE
 }

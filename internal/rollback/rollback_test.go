@@ -2,17 +2,14 @@
 //
 // SelectBackend is the boundary that maps an agent's detected
 // snapshot_capability (from internal/snapshot.Detector) onto a
-// concrete on-host Backend. The RF3 invariant — "ApplyIntent
-// refuses on NONE capability" — is enforced at this boundary:
-// the handler calls SelectBackend; on NONE/UNSPECIFIED/
-// deferred-capabilities, SelectBackend returns ErrNoBackend
-// and the handler translates that to
-// APPLY_INTENT_RESULT_REFUSED_SNAPSHOT_CAPABILITY_NONE without
-// ever constructing a tx / invoking a backend / calling apply.
+// concrete on-host Backend.
+//
+// 能力与回滚点是两件事:能力回答"宿主自带什么手段",回滚点回答"这次
+// 变更有没有还原手段"。MVP 里回滚点按 kind 判(file 才有),宿主能力
+// 一律 NONE —— copy 后端是 agent 内建的,所以 NONE 也选得出后端。
 package rollback
 
 import (
-	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -46,44 +43,27 @@ func TestSelectBackend_Rsync_ReturnsRsyncBackend(t *testing.T) {
 	}
 }
 
-// TestSelectBackend_None_ReturnsErrNoBackend — the RF3 surface.
-// NONE must return ErrNoBackend so the handler's
-// errors.Is(err, ErrNoBackend) check fires and translates
-// the failure into
-// APPLY_INTENT_RESULT_REFUSED_SNAPSHOT_CAPABILITY_NONE with
-// the RF3 wording (in internal/rpc/apply_intent.go).
-//
-// The error message must mention the missing backends so a
-// reviewer reading the failure can immediately tell why no
-// snapshot was taken.
-func TestSelectBackend_None_ReturnsErrNoBackend(t *testing.T) {
+// NONE 是"宿主没有自带快照机制",不是"这次变更没有还原手段":copy
+// 后端是 agent 内建的,应当兜底选出来,而不是把 ApplyIntent 一并拒掉。
+func TestSelectBackend_NoneYieldsCopyBackend(t *testing.T) {
 	b, err := SelectBackend(agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE)
-	if !errors.Is(err, ErrNoBackend) {
-		t.Errorf("err = %v, want ErrNoBackend", err)
+	if err != nil {
+		t.Fatalf("NONE 应给出 copy 后端: %v", err)
 	}
-	if b != nil {
-		t.Errorf("backend = %v, want nil (no backend on NONE)", b)
-	}
-	if !strings.Contains(err.Error(), "btrfs") {
-		t.Errorf("err message must reference btrfs for triage; got %q", err.Error())
-	}
-	if !strings.Contains(err.Error(), "rsync") {
-		t.Errorf("err message must reference rsync for triage; got %q", err.Error())
+	if _, ok := b.(*CopyBackend); !ok {
+		t.Errorf("后端类型 = %T, want *CopyBackend", b)
 	}
 }
 
-// TestSelectBackend_Unspecified_ReturnsErrNoBackend — UNSPECIFIED
-// is the zero value of the capability enum (an init-time /
-// never-detected state). Treating it as NONE is fail-safe:
-// refusing an intent whose own snapshot_capability is unset is
-// safer than guessing a backend.
-func TestSelectBackend_Unspecified_ReturnsErrNoBackend(t *testing.T) {
+// UNSPECIFIED 是能力枚举的零值(从未探测过)。既然宿主能力不再决定
+// 回滚点,零值同样落到内建的 copy 后端。
+func TestSelectBackend_UnspecifiedYieldsCopyBackend(t *testing.T) {
 	b, err := SelectBackend(agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_UNSPECIFIED)
-	if !errors.Is(err, ErrNoBackend) {
-		t.Errorf("err = %v, want ErrNoBackend (UNSPECIFIED must look like NONE)", err)
+	if err != nil {
+		t.Fatalf("UNSPECIFIED 应给出 copy 后端: %v", err)
 	}
-	if b != nil {
-		t.Errorf("backend = %v, want nil (UNSPECIFIED must not select a backend)", b)
+	if _, ok := b.(*CopyBackend); !ok {
+		t.Errorf("后端类型 = %T, want *CopyBackend", b)
 	}
 }
 
@@ -106,12 +86,6 @@ func TestSelectBackend_DeferredCapabilities_ReturnsError(t *testing.T) {
 	}
 	if b != nil {
 		t.Errorf("backend = %v, want nil", b)
-	}
-	if errors.Is(err, ErrNoBackend) {
-		// Defensive — unknown capabilities should fall
-		// through to a generic refusal (not ErrNoBackend,
-		// so handlers can distinguish via errors.Is).
-		t.Logf("unknown capability returned ErrNoBackend; acceptable as a refusal but loses the deferred/upgraded signal")
 	}
 }
 
@@ -155,27 +129,15 @@ func TestSelectBackend_LVMSnapWhenThinPoolPresent(t *testing.T) {
 	}
 }
 
-// 没有可用后端时保持既有的 refuse 语义:NONE / UNSPECIFIED / 未知枚举
-// 都返回非 nil error 且不选后端。
-func TestSelectBackend_RefusesWhenNone(t *testing.T) {
-	cases := []struct {
-		name string
-		cap  agentv1.SnapshotCapability
-	}{
-		{"none", agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE},
-		{"unspecified", agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_UNSPECIFIED},
-		{"unknown", agentv1.SnapshotCapability(99)},
+// 未知枚举仍拒绝:NONE / UNSPECIFIED 有内建后端兜底,但"未来 proto 新增
+// 而本 agent 不认识的能力"不能猜 —— 猜错会拿错的后端去动宿主。
+func TestSelectBackend_RefusesUnknownCapability(t *testing.T) {
+	b, err := SelectBackend(agentv1.SnapshotCapability(99))
+	if err == nil {
+		t.Fatalf("SelectBackend(unknown): nil err; want refusal")
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			b, err := SelectBackend(tc.cap)
-			if err == nil {
-				t.Fatalf("SelectBackend(%v): nil err, got nil; want refusal", tc.cap)
-			}
-			if b != nil {
-				t.Errorf("backend = %v, got %v, want nil", b, b)
-			}
-		})
+	if b != nil {
+		t.Errorf("backend = %v, got %v, want nil", b, b)
 	}
 }
 

@@ -218,9 +218,8 @@ func (s *agentService) pendingIntentCount() int {
 // the agent selects via rollback.SelectBackend based on the
 // live detector capability.
 //
-// Returns ErrNoBackend when the capability is NONE / UNSPECIFIED
-// / an unknown enum value. Callers are responsible for checking
-// the snapshot capability separately (RF3 admission check).
+// NONE / UNSPECIFIED 落到内建的 copy 后端,未知枚举值返回错误。
+// 这次变更有没有回滚点不在这一层判定(见 internal/rollback.PointFor)。
 func (s *agentService) selectedBackend() (rollback.Backend, error) {
 	if s.backend != nil {
 		return s.backend, nil
