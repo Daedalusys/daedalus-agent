@@ -28,7 +28,7 @@
 // 不该自动重试;包管理器锁被占、网络抖动可以。执行器判不出来时按不可重试
 // 上报 —— 自动重试一个永远不会成功的操作,代价更大。
 //
-// RF3 面(plan §RF3 + spec §5.2):
+// 准入面:
 //
 //	handler 层的准入(高危且无回滚点 → 拒绝)在 internal/rpc/apply_intent.go,
 //	不在这里。tx 假定调用方已受理该 intent。纵深防御:即便未来有调用方漏了
@@ -70,7 +70,7 @@ import (
 type ApplyFunc func(ctx context.Context, intent *agentv1.ApplyIntentRequest) error
 
 // Tx is the per-intent transaction. Construct via New() with
-// a non-nil rollback.Backend (the handler enforces the RF3
+// a non-nil rollback.Backend (the handler enforces the
 // admission check separately).
 type Tx interface {
 	// Run executes the pre-snapshot → apply → post-snapshot
@@ -103,7 +103,7 @@ type Local struct {
 }
 
 // New constructs a Local transaction. The backend MUST be
-// non-nil (callers enforce RF3 admission upstream).
+// non-nil (callers enforce admission upstream).
 //
 // auditSeq may be nil — in that case the tx uses a private
 // counter. Production wires a shared *atomic.Uint64 so audit

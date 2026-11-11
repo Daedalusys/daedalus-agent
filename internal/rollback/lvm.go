@@ -23,8 +23,8 @@ type lvmSnapBackend struct{}
 // CreateSnapshot 对源 LV 建一个 LVM 快照。
 //
 // 形状守卫:<sourcePath> 必须是 LV 设备路径(如 /dev/vg0/root)。这条后端
-// 与 btrfs/rsync 的路径语义不同,若被误接成目录路径(例如未来有人把它接进
-// detector 却仍传 tx 算出的 intent-target 目录),这里当场拒绝,而不是把
+// 与 btrfs/rsync 的路径语义不同,若被误接成普通文件路径(例如未来有人把它
+// 接进 detector 却仍传 tx 算出的被改文件路径),这里当场拒绝,而不是把
 // 一个普通目录当 LV 名发给 lvcreate 后失败在半路。
 func (l *lvmSnapBackend) CreateSnapshot(sourcePath, snapshotPath string) error {
 	if !strings.HasPrefix(sourcePath, "/dev/") {

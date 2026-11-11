@@ -1,18 +1,13 @@
 // Package snapshot — Detector wrapper.
 //
-// The package-level Detect() function probes the host exactly
-// once per call. For the gRPC server we need a stable answer
-// across many RPC invocations — the agent's "what snapshot
-// backend can I use?" does not change between two Heartbeats
-// arriving 50ms apart — so we wrap Detect() in a small Detector
-// that caches the result.
+// Detect() 恒报 NONE(宿主自带机制不再探测),但 RPC 层仍需要"多次调用
+// 看到同一个答案",所以用 Detector 把结果缓存起来。
 //
 // Detector is concurrency-safe: the cache is guarded by a mutex
 // so two simultaneous Register / ApplyIntent calls cannot race
 // to disk-and-back and disagree. The cache is invalidated only
 // by SetCapability(), which tests use to force a specific
-// answer (NONE for the RF3 refusal branch, BTRFS for the
-// happy path).
+// answer (NONE / BTRFS) without touching the host.
 package snapshot
 
 import (
@@ -23,8 +18,7 @@ import (
 
 // Detector is the agent's snapshot-capability cache. Construct
 // with NewDetector(); the first Capability() call invokes
-// Detect() (probing the host); subsequent calls return the
-// cached answer.
+// Detect() (恒 NONE); subsequent calls return the cached answer.
 //
 // Tests can override the cached answer with SetCapability()
 // to simulate any backend state without touching the host
@@ -38,22 +32,17 @@ type Detector struct {
 }
 
 // NewDetector returns a Detector with an empty cache. The first
-// Capability() call will probe the host (running Detect()).
+// Capability() call will run Detect().
 func NewDetector() *Detector {
 	return &Detector{}
 }
 
 // Capability returns the cached snapshot capability. If no
 // detection has been performed yet, it invokes Detect() and
-// caches the result. Subsequent calls return the cached answer
-// without re-probing.
+// caches the result. Subsequent calls return the cached answer.
 //
-// The implementation prefers lazy detection over eager: the
-// daemon can boot before the snapshot subsystem is ready (e.g.
-// in tests where the cert paths are missing); calling Detect()
-// at boot would force tests to build a fake btrfs/rsync
-// environment. Lazy means tests that don't call Capability()
-// don't pay for it.
+// 懒检测的理由是启动顺序与测试成本:daemon 可以在快照子系统就绪前
+// 起来,而且不调用 Capability() 的测试不必为此准备宿主环境。
 func (d *Detector) Capability() agentv1.SnapshotCapability {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -64,9 +53,8 @@ func (d *Detector) Capability() agentv1.SnapshotCapability {
 }
 
 // SetCapability overrides the cached capability. Production code
-// does not call this — it exists so tests can force NONE (for
-// the RF3 refusal branch) or any other backend (for the
-// happy-path tests) without faking btrfs/rsync on the host.
+// does not call this — it exists so tests can force NONE or any
+// other backend without faking btrfs/rsync on the host.
 //
 // SetCapability is concurrency-safe but tests typically call it
 // before the detector is shared across goroutines.

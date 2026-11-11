@@ -1,9 +1,10 @@
 //go:build detecttest
 
-// Command detect-test is a T4-only debugging helper that calls
-// snapshot.Detect() in a clean environment and prints the result
-// to stdout. It exists to support the T4 真机 validation runs
-// (Ubuntu 22.04 容器, scenarios: rsync-only, no-rsync).
+// Command detect-test is a debugging helper that calls
+// snapshot.Detect() and prints the result to stdout.
+//
+// Detect() 恒报 NONE(宿主自带机制不再探测),所以这个工具现在只能证明
+// "没有探测发生";等宿主机制接回来时它才重新有用。
 //
 // The `//go:build detecttest` build tag keeps this tool out of
 // the production daedalus-agent binary — `go build ./...` does
@@ -29,8 +30,8 @@ func main() {
 	case agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_RSYNC_TARGET:
 		fmt.Println("backend: rsync-target")
 	case agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE:
-		fmt.Println("backend: NONE — ApplyIntent will be refused per RF3")
-		os.Exit(2)
+		// NONE 是设计态,不是故障:回滚点按 kind 判,copy 后端兜底。
+		fmt.Println("backend: NONE — 宿主快照机制不再探测;回滚点按 kind 判,copy 后端兜底")
 	default:
 		fmt.Println("backend: UNSPECIFIED or unexpected")
 		os.Exit(1)

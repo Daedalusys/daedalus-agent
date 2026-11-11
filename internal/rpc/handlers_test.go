@@ -552,9 +552,9 @@ func TestApplyIntent_UnknownKind_Refused(t *testing.T) {
 	}
 }
 
-// SnapshotRequest 不再拍 intent-target 目录(该概念已删),而请求本身
-// 只有 reason、没有目标路径 —— 无从决定拍谁,所以恒拒绝。结果不随宿主
-// 能力变化:装了 btrfs 也一样 FailedPrecondition。
+// SnapshotRequest 不再替调用方挑一个目录拍快照(请求不带目标路径),
+// 而请求本身只有 reason、没有目标路径 —— 无从决定拍谁,所以恒拒绝。
+// 结果不随宿主能力变化:装了 btrfs 也一样 FailedPrecondition。
 func TestSnapshotRequest_RefusedRegardlessOfCapability(t *testing.T) {
 	for _, cap := range []agentv1.SnapshotCapability{
 		agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE,

@@ -244,7 +244,7 @@ func TestLVMSnapBackend_RejectsNonDeviceSource(t *testing.T) {
 	runCommand = func(string, ...string) error { called++; return nil }
 
 	b := &lvmSnapBackend{}
-	err := b.CreateSnapshot("/var/lib/daedalus-agent/intent-target/nginx", "/var/lib/daedalus-agent/snapshots/i-1.snap")
+	err := b.CreateSnapshot("/var/lib/daedalus-agent/data/app.conf", "/var/lib/daedalus-agent/snapshots/i-1.snap")
 	if err == nil {
 		t.Fatal("CreateSnapshot: nil err; want a shape-guard rejection")
 	}

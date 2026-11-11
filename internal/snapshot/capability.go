@@ -34,8 +34,8 @@ var errNotFound = exec.ErrNotFound
 // In production these resolve to os/exec.LookPath, exec.Command
 // and Command.Output respectively.
 var (
-	execLookPath    = exec.LookPath
-	execCommand     = exec.Command
+	execLookPath     = exec.LookPath
+	execCommand      = exec.Command
 	runCommandOutput = func(name string, args ...string) ([]byte, error) {
 		return execCommand(name, args...).Output()
 	}

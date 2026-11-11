@@ -41,14 +41,13 @@ const DefaultListenAddr = ":9443"
 // Required for production: Cfg, CertInfo, Snapshot, AuditSeq.
 // Optional (zero-value defaults apply):
 //   - Backend:  if non-nil, used as the rollback backend
-//     instead of SelectBackend(capability) for both ApplyIntent
-//     and SnapshotRequest. Tests use this to inject a mock
-//     backend that does not require a real btrfs / rsync on
-//     the host.
+//     instead of SelectBackend(capability) in ApplyIntent.
+//     Tests use this to inject a mock backend that does not
+//     require a real btrfs / rsync on the host.
 //   - TxFactory: if non-nil, used instead of tx.New to
 //     construct the per-RPC transaction in ApplyIntent.
 //     Production leaves this nil (handler falls through to
-//     tx.New with a stub apply step).
+//     tx.New with internal/exec's dispatcher).
 //
 // Cfg, CertInfo, Snapshot and Backend are retained by reference —
 // the caller must not mutate them after passing them in.
@@ -80,16 +79,16 @@ type ServiceDeps struct {
 	AuditSeq *atomic.Uint64
 
 	// Backend, if non-nil, overrides the per-RPC backend
-	// selection in ApplyIntent and SnapshotRequest. Tests use
-	// this to inject a recording fake (avoids requiring real
-	// btrfs / rsync on the test runner). Production leaves
-	// this nil — handlers call SelectBackend per RPC.
+	// selection in ApplyIntent. Tests use this to inject a
+	// recording fake (avoids requiring real btrfs / rsync on
+	// the test runner). Production leaves this nil — handlers
+	// call SelectBackend per RPC.
 	Backend rollback.Backend
 
 	// TxFactory, if non-nil, overrides tx.New in ApplyIntent.
 	// Production leaves this nil and accepts the default
-	// (tx.New with the T6 apply stub). Tests can substitute a
-	// canned-response Tx.
+	// (tx.New with internal/exec's dispatcher). Tests can
+	// substitute a canned-response Tx.
 	TxFactory TxFactory
 
 	// Audit is the per-process hash-chained audit log. nil is

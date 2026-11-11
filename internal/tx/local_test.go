@@ -773,16 +773,24 @@ func TestLocal_CancelledApplyWritesCancelledEntry(t *testing.T) {
 	}
 }
 
-// 事务必须按 kind 取回滚点:package 没有回滚点,不得再往 dataDir 下建
-// intent-target 暂存目录(那个目录概念已删除)。
-func TestLocal_Run_NonFileKindDoesNotCreateStagingDir(t *testing.T) {
+// 没有回滚点的 kind 不该在 dataDir 下留下任何东西:不快照,也就没有快照
+// 目录要建。
+func TestLocal_Run_NonFileKindLeavesNoArtifacts(t *testing.T) {
 	dir := t.TempDir()
 	tx := New(&txMockBackend{}, (&txSpyApply{}).Fn, dir, nil, nil)
 
 	if _, err := tx.Run(context.Background(), sampleIntent()); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "intent-target")); !os.IsNotExist(err) {
-		t.Errorf("intent-target 目录不应再被创建, stat err = %v", err)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != 0 {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("package kind 不该留下产物, got %v", names)
 	}
 }
