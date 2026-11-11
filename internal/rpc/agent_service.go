@@ -72,9 +72,9 @@ type agentService struct {
 	certInfo *cert.Info
 
 	// snapshot is the agent's snapshot-capability probe.
-	// Register reads it; ApplyIntent / SnapshotRequest consult
-	// it to enforce RF3 (refuse on NONE) and to refuse
-	// SnapshotRequest with FailedPrecondition.
+	// Register reads it; ApplyIntent consults it to pick the
+	// rollback backend. SnapshotRequest no longer uses it (it
+	// carries no target path, so it refuses unconditionally).
 	snapshot *snapshot.Detector
 
 	// auditSeq is the per-process monotonic audit sequence
@@ -96,10 +96,9 @@ type agentService struct {
 
 	// backend is an optional override for the per-RPC backend
 	// selection. If non-nil, it is used as-is by ApplyIntent
-	// and SnapshotRequest (skipping SelectBackend). Production
-	// leaves this nil; tests inject a mock backend so the
-	// handler exercises the wired-up state machine without
-	// requiring real btrfs/rsync on the test runner.
+	// (skipping SelectBackend). Production leaves this nil;
+	// tests inject a mock backend so the handler exercises the
+	// wired-up state machine without touching the host.
 	backend rollback.Backend
 
 	// txFactory 非 nil 时用来替代 tx.New 构造每次 ApplyIntent 的事务;
@@ -142,10 +141,10 @@ var _ agentv1.AgentServiceServer = (*agentService)(nil)
 //   - auditSeq is bumped by tx.Local on every ApplyIntent outcome
 //     (success / transient / persistent). Tests may pass nil —
 //     the agentService seeds a private counter in that case.
-//   - backend is an optional override for ApplyIntent /
-//     SnapshotRequest. Production passes nil and the handler
-//     selects via rollback.SelectBackend per RPC. Tests pass a
-//     fake that records invocations without touching the host.
+//   - backend is an optional override for ApplyIntent. Production
+//     passes nil and the handler selects via rollback.SelectBackend
+//     per RPC. Tests pass a fake that records invocations without
+//     touching the host.
 //   - txFactory 是 ApplyIntent 事务构造的注入点。生产传 nil,handler 走
 //     默认的 tx.New + internal/exec 分派器;测试可换成 fake。
 //
@@ -218,9 +217,8 @@ func (s *agentService) pendingIntentCount() int {
 // the agent selects via rollback.SelectBackend based on the
 // live detector capability.
 //
-// Returns ErrNoBackend when the capability is NONE / UNSPECIFIED
-// / an unknown enum value. Callers are responsible for checking
-// the snapshot capability separately (RF3 admission check).
+// NONE / UNSPECIFIED 落到内建的 copy 后端,未知枚举值返回错误。
+// 这次变更有没有回滚点不在这一层判定(见 internal/rollback.PointFor)。
 func (s *agentService) selectedBackend() (rollback.Backend, error) {
 	if s.backend != nil {
 		return s.backend, nil

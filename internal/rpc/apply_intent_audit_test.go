@@ -12,6 +12,10 @@ import (
 	"github.com/Daedalusys/daedalus-agent/internal/snapshot"
 )
 
+// highRiskRefusalOutcome 是"高危 + 无回滚点"拒绝在链上留下的 outcome。
+// package 是认识的 kind,但没有回滚点,所以高危时走准入拒绝而不是执行器。
+const highRiskRefusalOutcome = "refused: high-risk intent on a kind without rollback point: kind=package"
+
 // 拒绝结局必须落链:tool / outcome / identity / args 四元组是控制面的
 // 分桶依据,少一个都读不出"是谁、想改什么、为什么被拒"。
 func TestApplyIntent_RefusalWritesAuditEvent(t *testing.T) {
@@ -25,7 +29,8 @@ func TestApplyIntent_RefusalWritesAuditEvent(t *testing.T) {
 	svc := newAgentService(&config.Config{DataDir: dir}, nil, det, nil, nil, nil, auditLog)
 
 	resp, err := svc.ApplyIntent(context.Background(), &agentv1.ApplyIntentRequest{
-		IntentId: "intent-rf3", Kind: "package", Target: "nginx",
+		IntentId: "intent-high-risk", Kind: "package", Target: "nginx",
+		RiskClass: agentv1.RiskClass_RISK_CLASS_HIGH,
 	})
 	if err != nil {
 		t.Fatalf("ApplyIntent: %v", err)
@@ -51,17 +56,44 @@ func TestApplyIntent_RefusalWritesAuditEvent(t *testing.T) {
 	if ev.Tool != "apply_intent.refused" {
 		t.Errorf("tool = %q, want apply_intent.refused", ev.Tool)
 	}
-	if ev.Identity != "intent-rf3" {
-		t.Errorf("identity = %q, want intent-rf3", ev.Identity)
+	if ev.Identity != "intent-high-risk" {
+		t.Errorf("identity = %q, want intent-high-risk", ev.Identity)
 	}
-	if ev.Outcome != "refused: snapshot_capability_none" {
-		t.Errorf("outcome = %q, want refused: snapshot_capability_none", ev.Outcome)
+	if ev.Outcome != highRiskRefusalOutcome {
+		t.Errorf("outcome = %q, want %q", ev.Outcome, highRiskRefusalOutcome)
 	}
 	if ev.Args["target"] != "nginx" {
 		t.Errorf("args[target] = %q, want nginx", ev.Args["target"])
 	}
 	if ev.Args["kind"] != "package" {
 		t.Errorf("args[kind] = %q, want package", ev.Args["kind"])
+	}
+}
+
+// 表外 kind 也是准入拒绝,且必须落链 —— 控制面不能把"不认识的 kind"
+// 误当成"agent 会做点什么"。
+func TestApplyIntent_UnknownKindRefusalWritesAuditEvent(t *testing.T) {
+	dir := t.TempDir()
+	auditLog, err := audit.New(dir)
+	if err != nil {
+		t.Fatalf("audit.New: %v", err)
+	}
+	svc := newAgentService(&config.Config{DataDir: dir}, nil, snapshot.NewDetector(), nil, nil, nil, auditLog)
+
+	if _, err := svc.ApplyIntent(context.Background(), &agentv1.ApplyIntentRequest{
+		IntentId: "intent-unknown-kind", Kind: "widget", Target: "w-1",
+	}); err != nil {
+		t.Fatalf("ApplyIntent: %v", err)
+	}
+	events, _, err := auditLog.Since(0)
+	if err != nil {
+		t.Fatalf("audit.Since: %v", err)
+	}
+	if len(events) != 1 || events[0].Tool != "apply_intent.refused" {
+		t.Fatalf("events = %+v, want one apply_intent.refused", events)
+	}
+	if want := `refused: unknown intent kind "widget"`; events[0].Outcome != want {
+		t.Errorf("outcome = %q, want %q", events[0].Outcome, want)
 	}
 }
 
@@ -73,6 +105,7 @@ func TestApplyIntent_RefusalNilAuditDoesNotPanic(t *testing.T) {
 
 	resp, err := svc.ApplyIntent(context.Background(), &agentv1.ApplyIntentRequest{
 		IntentId: "intent-nil-audit", Kind: "package", Target: "nginx",
+		RiskClass: agentv1.RiskClass_RISK_CLASS_HIGH,
 	})
 	if err != nil {
 		t.Fatalf("ApplyIntent: %v", err)
@@ -98,6 +131,7 @@ func TestApplyIntent_RefusalIsNotPending(t *testing.T) {
 
 	if _, err := svc.ApplyIntent(context.Background(), &agentv1.ApplyIntentRequest{
 		IntentId: "intent-pending", Kind: "package", Target: "nginx",
+		RiskClass: agentv1.RiskClass_RISK_CLASS_HIGH,
 	}); err != nil {
 		t.Fatalf("ApplyIntent: %v", err)
 	}
@@ -126,6 +160,7 @@ func TestApplyIntent_AuditSeqIsNotChainSeq(t *testing.T) {
 
 	resp, err := svc.ApplyIntent(context.Background(), &agentv1.ApplyIntentRequest{
 		IntentId: "intent-after-restart", Kind: "package", Target: "nginx",
+		RiskClass: agentv1.RiskClass_RISK_CLASS_HIGH,
 	})
 	if err != nil {
 		t.Fatalf("ApplyIntent: %v", err)

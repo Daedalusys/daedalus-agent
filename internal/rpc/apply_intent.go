@@ -1,43 +1,16 @@
-// ApplyIntent handler — RF3 critical.
+// ApplyIntent handler:准入 + 本地事务 + 审计回报。
 //
-// Wire-protocol role:
-//
-//   - 包/文件意图落地
-//   - agent 跑本地事务 + 落审计 + 一次性回报
-//
-// Behaviour:
-//
-//  1. **RF3钉** (plan §RF3 + spec §5.2): if the agent's snapshot
-//     capability is NONE, refuse immediately. Return
-//     APPLY_INTENT_RESULT_REFUSED_SNAPSHOT_CAPABILITY_NONE with
-//     a clear error_message explaining *why* — the operator /
-//     control plane reviewer reading the failure must understand
-//     "this machine has no rollback path" and not "best-effort
-//     will handle it". The error message is structured:
-//
-//     "this machine has no snapshot backend
-//     (btrfs/rsync/lvm/snapper all absent);
-//     ApplyIntent refused per fail-closed policy;
-//     only local audit + state report available"
-//
-//     Note we say "fail-closed policy", not "best-effort policy" —
-//     the spec's "best-effort rollback" phrasing reads to a hurried
-//     reviewer as "we will handle it" (false); the actual contract
-//     is "ApplyIntent refuses; the host has no recovery path".
-//
-//  2. For non-NONE capabilities, T6 wires the real pre-snapshot
-//     → apply → post-snapshot / rollback state machine via
-//     internal/tx.Local. The state machine handles pre-snapshot
-//     failure, apply failure with rollback success (TRANSIENT_FAILURE,
-//     safe to retry), and apply failure with rollback failure
-//     (PERSISTENT_FAILURE, host may be in undefined state).
+// 准入门按"这次变更有没有回滚点"判,而不是"宿主有没有快照机制":后者
+// 回答的是用什么手段还原,与有没有还原点无关。高危且无回滚点才拒绝;
+// 表外 kind 一律拒绝(fail-closed)。宿主快照机制(btrfs/lvm/snapper)不进
+// MVP 判定,`snapshot_capability` 字段只回报宿主自带了什么。
 //
 // 审计:
 //
 // ApplyIntent 的每个终局都进进程级 JSONL 哈希链(internal/audit,单一写入口
 // sdkAudit.LogAudit):进入事务的结局由 internal/tx 写 success / failure /
 // rollback_failed / cancelled / presnapshot_failed;在 tx.Run 之前就终结的
-// 两类结局(RF3 拒绝、后端选择失败)由本文件写 refused / backend_unavailable。
+// 两类结局(准入拒绝、后端选择失败)由本文件写 refused / backend_unavailable。
 // 标准库日志行保留 —— journald 的即时排障视图与链上的取证视图是两种用途。
 //
 // audit_seq 与链 seq 是两条不同的序列:前者是进程内单调计数器(每次结局 +1,
@@ -57,113 +30,74 @@ import (
 	agentv1 "github.com/Daedalusys/daedalus-sdk/proto/agent/v1"
 
 	"github.com/Daedalusys/daedalus-agent/internal/audit"
+	"github.com/Daedalusys/daedalus-agent/internal/rollback"
 )
 
-// rf3RefusalMessage is the human-readable explanation surfaced
-// when ApplyIntent is invoked on a host with no snapshot backend.
-// The wording is intentionally structured so the control plane's
-// failure-bucket rendering picks up both the "no snapshot
-// backend" phrase (used by alerting rules) and the
-// "ApplyIntent refused" phrase (used by reviewer guidance).
+// knownIntentKinds 是 agent 认识的资源 kind 白名单。用显式列表而不是
+// "PointFor 不返回 None 就算认识":package / service 明明认识却没有回滚点,
+// 两者混在一起会让"不支持这个 kind"与"支持但不承诺回滚"共用一条理由。
+var knownIntentKinds = map[string]struct{}{
+	"file":    {},
+	"package": {},
+	"service": {},
+}
+
+func isKnownIntentKind(kind string) bool {
+	_, ok := knownIntentKinds[kind]
+	return ok
+}
+
+// refuseIntent 记录一次准入拒绝并返回 in-body 的拒绝响应。
 //
-// We DO NOT use the word "best-effort" alone — see the package
-// comment for the human-reviewer misreading concern.
-const rf3RefusalMessage = "this machine has no snapshot backend (btrfs/rsync/lvm/snapper all absent); ApplyIntent refused per fail-closed policy; only local audit + state report available"
+// 拒绝码只有 REFUSED_SNAPSHOT_CAPABILITY_NONE 可用(proto 没有更贴切的
+// 枚举),真实原因写在 error_message 里 —— 这是已知的命名瑕疵,别让读表
+// 的人把结果码当成唯一理由。拒绝是一次**成功**的 RPC:控制面需要这条
+// 记录,而且 transport 错误分不清"逻辑拒绝"与"链路断了"。
+func (s *agentService) refuseIntent(req *agentv1.ApplyIntentRequest, tool, outcome string, extra map[string]string) *agentv1.ApplyIntentResponse {
+	auditSeq := s.auditSeq.Add(1)
+	log.Printf("agent: ApplyIntent refused: intent_id=%q kind=%q target=%q audit_seq=%d — %s",
+		req.IntentId, req.Kind, req.Target, auditSeq, outcome)
+	args := map[string]string{"target": req.Target, "kind": req.Kind}
+	for k, v := range extra {
+		args[k] = v
+	}
+	s.recordOutcome(req.IntentId, tool, outcome, args)
+	return &agentv1.ApplyIntentResponse{
+		Result:       agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_REFUSED_SNAPSHOT_CAPABILITY_NONE,
+		ErrorMessage: outcome,
+		AuditSeq:     auditSeq,
+	}
+}
 
 // ApplyIntent implements agentv1.AgentServiceServer.ApplyIntent.
-//
-// Validation:
-//   - req must be non-nil (InvalidArgument otherwise).
-//   - RF3: snapshot_capability must not be NONE
-//     (REFUSED_SNAPSHOT_CAPABILITY_NONE otherwise; see constant
-//     rf3RefusalMessage for the explanation).
-//
-// Response (success path):
-//   - result: APPLY_INTENT_RESULT_SUCCESS.
-//   - tx_id: deterministic from intent_id, "tx-<intent_id>".
-//   - audit_seq: monotonic counter (per-process).
-//   - error_message: empty on success.
-//
-// Response (refusal path, RF3):
-//   - result: APPLY_INTENT_RESULT_REFUSED_SNAPSHOT_CAPABILITY_NONE.
-//   - tx_id: "" (no transaction was started).
-//   - audit_seq: monotonic counter at the refusal point.
-//   - error_message: rf3RefusalMessage.
-//
-// Response (failure paths via tx state machine):
-//   - pre-snapshot fail: TRANSIENT_FAILURE with explanation.
-//   - apply fail + rollback ok: TRANSIENT_FAILURE
-//     ("rolled back successfully").
-//   - apply fail + rollback fail: PERSISTENT_FAILURE
-//     (host may be in undefined state).
-//
-// Error semantics:
-//
-// We do NOT return a gRPC status error on the RF3 refusal — the
-// refusal is a *successful* RPC whose body carries a refusal
-// code. This matches the proto's design (refused_* are values of
-// ApplyIntentResult, not separate status codes). Returning
-// codes.FailedPrecondition here would force the control plane
-// to distinguish "RPC transport failure" from "logical refusal",
-// and the proto is explicit that the latter lives in the body.
-//
-// True transport failures (e.g. the tx state machine panicking)
-// DO return a non-nil error — they map to codes.Internal via
-// the gRPC default handler.
 func (s *agentService) ApplyIntent(ctx context.Context, req *agentv1.ApplyIntentRequest) (*agentv1.ApplyIntentResponse, error) {
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "ApplyIntent: nil request")
 	}
 
-	capability := s.snapshot.Capability()
+	point := rollback.PointFor(req.Kind)
 
-	// RF3: refuse on NONE with a clear explanation.
-	if capability == agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE {
-		// audit_seq is bumped even on refusal so the
-		// control plane's audit log shows every
-		// admission-control event.
-		auditSeq := s.auditSeq.Add(1)
-		log.Printf("agent: ApplyIntent refused (RF3): intent_id=%q kind=%q target=%q audit_seq=%d — %s",
-			req.IntentId, req.Kind, req.Target, auditSeq, rf3RefusalMessage)
-		s.recordOutcome(req.IntentId, "apply_intent.refused", "refused: snapshot_capability_none", map[string]string{
-			"target": req.Target,
-			"kind":   req.Kind,
-		})
-		return &agentv1.ApplyIntentResponse{
-			Result:       agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_REFUSED_SNAPSHOT_CAPABILITY_NONE,
-			ErrorMessage: rf3RefusalMessage,
-			AuditSeq:     auditSeq,
-		}, nil
+	// 1. 表外 kind:既没有回滚点,也没有执行器。放行等于让控制面以为
+	// agent 会做点什么,而它什么都不会做。
+	if !isKnownIntentKind(req.Kind) {
+		return s.refuseIntent(req, "apply_intent.refused", fmt.Sprintf("refused: unknown intent kind %q", req.Kind), nil), nil
 	}
 
-	// Non-NONE path: build a per-RPC tx and run it. The
-	// tx-local state machine handles snapshot / apply /
-	// rollback semantically — we just forward the outcome.
+	// 2. 高危且无回滚点:拒绝。低危不因缺回滚点被拒 —— 该不该做是风险
+	// 问题,不是能力问题。
+	if point == rollback.PointNone && req.RiskClass == agentv1.RiskClass_RISK_CLASS_HIGH {
+		return s.refuseIntent(req, "apply_intent.refused", fmt.Sprintf("refused: high-risk intent on a kind without rollback point: kind=%s", req.Kind), nil), nil
+	}
+
+	// 3. 其余放行。copy 后端是纯 Go 内建的,选不出来只可能是配置错误;
+	// 带病往下跑会把一次确定的失败拖成宿主状态未知。
 	backend, err := s.selectedBackend()
 	if err != nil {
-		// Should not happen given the RF3 admission check
-		// above, but the tx-local surface MUST be defended
-		// against a malformed detector state (e.g. an
-		// unexpected enum from a future proto change).
-		auditSeq := s.auditSeq.Add(1)
-		log.Printf("agent: ApplyIntent backend selection failed after RF3 admission: intent_id=%q cap=%v err=%v audit_seq=%d",
-			req.IntentId, capability, err, auditSeq)
-		s.recordOutcome(req.IntentId, "apply_intent.backend_unavailable",
-			fmt.Sprintf("backend_unavailable: %v", err),
-			map[string]string{
-				"target": req.Target,
-				"kind":   req.Kind,
-				"error":  err.Error(),
-			})
-		return &agentv1.ApplyIntentResponse{
-			Result:       agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_REFUSED_SNAPSHOT_CAPABILITY_NONE,
-			ErrorMessage: rf3RefusalMessage,
-			AuditSeq:     auditSeq,
-		}, nil
+		return s.refuseIntent(req, "apply_intent.backend_unavailable", fmt.Sprintf("backend_unavailable: %v", err), map[string]string{"error": err.Error()}), nil
 	}
 
-	// pending 只覆盖真正进入事务的 intent:RF3 拒绝与后端选择失败都已终结,
-	// 不该把"未完成工作量"数大。
+	// pending 只覆盖真正进入事务的 intent:准入拒绝已终结,不该把
+	// "未完成工作量"数大。
 	s.beginIntent(req.IntentId)
 	defer s.endIntent(req.IntentId)
 
@@ -174,9 +108,9 @@ func (s *agentService) ApplyIntent(ctx context.Context, req *agentv1.ApplyIntent
 // recordOutcome 把一个"在进入事务之前就已终结"的 ApplyIntent 结局写进进程级
 // 哈希链(与 internal/tx 共用同一条链、同一个写入口)。
 //
-// 为什么在 handler 而不是 tx 里:RF3 拒绝与后端选择失败都在 tx.Run 之前返回,
+// 为什么在 handler 而不是 tx 里:准入拒绝与后端选择失败都在 tx.Run 之前返回,
 // 根本到不了状态机;不在这里补一笔,链上就分不清"从未收到该 intent"与
-// "收到但按 fail-closed 拒绝"—— 而这正是控制面要展示给审查者的区别。
+// "收到但按 fail-closed 拒绝" —— 而这正是控制面要展示给审查者的区别。
 //
 // audit 为 nil(测试或未配置链)时直接跳过;写链失败只记日志,绝不改变
 // RPC 的对外结局 —— 与 internal/tx 的处理保持一致。

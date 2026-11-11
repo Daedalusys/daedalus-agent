@@ -99,12 +99,31 @@ func (s *txSpyApply) Fn(ctx context.Context, intent *agentv1.ApplyIntentRequest)
 // success / apply-error tests. The choice of Target="nginx"
 // and IntentId="intent-001" is arbitrary but stable so log
 // assertions can match on string literals.
+//
+// package 没有回滚点:这些用例走的是"不快照、不还原"的分支。
 func sampleIntent() *agentv1.ApplyIntentRequest {
 	return &agentv1.ApplyIntentRequest{
 		IntentId:  "intent-001",
 		Kind:      "package.set",
 		Target:    "nginx",
 		SpecJson:  `{"name":"nginx","version":"1.18"}`,
+		RiskClass: agentv1.RiskClass_RISK_CLASS_LOW,
+	}
+}
+
+// fileIntent 是"有回滚点"的 intent:目标是一个真实存在的普通文件,
+// 这样快照源就是被改路径本体,而不是 dataDir 下的暂存目录。
+func fileIntent(t *testing.T, id string) *agentv1.ApplyIntentRequest {
+	t.Helper()
+	target := filepath.Join(t.TempDir(), "app.conf")
+	if err := os.WriteFile(target, []byte("v1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return &agentv1.ApplyIntentRequest{
+		IntentId:  id,
+		Kind:      "file",
+		Target:    target,
+		SpecJson:  `{"content":"v2"}`,
 		RiskClass: agentv1.RiskClass_RISK_CLASS_LOW,
 	}
 }
@@ -119,7 +138,7 @@ func TestLocal_Run_Success(t *testing.T) {
 	audit := new(atomic.Uint64)
 	tx := New(backend, apply.Fn, t.TempDir(), audit, nil)
 
-	resp, err := tx.Run(context.Background(), sampleIntent())
+	resp, err := tx.Run(context.Background(), fileIntent(t, "intent-001"))
 	if err != nil {
 		t.Fatalf("Run: unexpected err: %v", err)
 	}
@@ -156,7 +175,7 @@ func TestLocal_Run_PreSnapshotError_AppliesNotCalled(t *testing.T) {
 	audit := new(atomic.Uint64)
 	tx := New(backend, apply.Fn, t.TempDir(), audit, nil)
 
-	resp, err := tx.Run(context.Background(), sampleIntent())
+	resp, err := tx.Run(context.Background(), fileIntent(t, "intent-001"))
 	if err != nil {
 		t.Fatalf("Run: unexpected err: %v", err)
 	}
@@ -189,7 +208,7 @@ func TestLocal_Run_ApplyError_RollbackSucceeds(t *testing.T) {
 	audit := new(atomic.Uint64)
 	tx := New(backend, apply.Fn, t.TempDir(), audit, nil)
 
-	resp, err := tx.Run(context.Background(), sampleIntent())
+	resp, err := tx.Run(context.Background(), fileIntent(t, "intent-001"))
 	if err != nil {
 		t.Fatalf("Run: unexpected err: %v", err)
 	}
@@ -222,7 +241,7 @@ func TestLocal_Run_ApplyError_RollbackFails_PersistentFailure(t *testing.T) {
 	audit := new(atomic.Uint64)
 	tx := New(backend, apply.Fn, t.TempDir(), audit, nil)
 
-	resp, err := tx.Run(context.Background(), sampleIntent())
+	resp, err := tx.Run(context.Background(), fileIntent(t, "intent-001"))
 	if err != nil {
 		t.Fatalf("Run: unexpected err: %v", err)
 	}
@@ -298,27 +317,74 @@ func TestLocal_NilAuditSeq_UsesPrivateCounter(t *testing.T) {
 	}
 }
 
-// TestLocal_PathsBuildFromDataDir verifies the path convention
-// used by Run: <dataDir>/intent-target/<target> for the source,
-// <dataDir>/snapshots/<intent_id>.snap for the snapshot. The
-// mock backend records both so an assertion failure pinpoints
-// the exact (src, snap) pair the tx derived.
+// TestLocal_PathsBuildFromDataDir verifies the snapshot-path convention
+// used by Run: <dataDir>/snapshots/<intent_id>.snap。快照源不再由 tx
+// 拼——它就是 intent.Target 本体,由 file 用例单独断。
 func TestLocal_PathsBuildFromDataDir(t *testing.T) {
 	backend := &txMockBackend{}
 	apply := &txSpyApply{}
 	dir := t.TempDir()
 	tx := New(backend, apply.Fn, dir, nil, nil)
 
-	if _, err := tx.Run(context.Background(), sampleIntent()); err != nil {
+	if _, err := tx.Run(context.Background(), fileIntent(t, "intent-001")); err != nil {
 		t.Fatalf("Run: %v", err)
-	}
-	wantSrc := filepath.Join(dir, "intent-target", "nginx")
-	if backend.lastSrc != wantSrc {
-		t.Errorf("source path = %q, want %q", backend.lastSrc, wantSrc)
 	}
 	wantSnap := filepath.Join(dir, "snapshots", "intent-001.snap")
 	if backend.lastSnap != wantSnap {
 		t.Errorf("snapshot path = %q, want %q", backend.lastSnap, wantSnap)
+	}
+}
+
+// 无回滚点的 kind 不得拍快照,也不得在失败后假装还原。错误文案必须
+// 说明真实原因,且不能出现 "rolled back"。
+func TestLocal_Run_NonFileKind_NoSnapshotNoRestore(t *testing.T) {
+	backend := &txMockBackend{}
+	apply := &txSpyApply{err: errors.New("boom")}
+	tx := New(backend, apply.Fn, t.TempDir(), nil, nil)
+
+	resp, err := tx.Run(context.Background(), &agentv1.ApplyIntentRequest{
+		IntentId: "i1", Kind: "package", Target: "nginx",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backend.createCalls != 0 || backend.restoreCalls != 0 {
+		t.Errorf("无回滚点的 kind 不应拍快照/还原: create=%d restore=%d", backend.createCalls, backend.restoreCalls)
+	}
+	if !strings.Contains(resp.ErrorMessage, "no rollback point") {
+		t.Errorf("错误文案 = %q, want 含 no rollback point", resp.ErrorMessage)
+	}
+	if strings.Contains(resp.ErrorMessage, "rolled back") {
+		t.Errorf("错误文案不应出现 rolled back: %q", resp.ErrorMessage)
+	}
+}
+
+// file kind 的快照源必须是被改路径本体,而不是 dataDir 下的暂存目录;
+// apply 失败后要把这份副本还原回去,并在文案里点名路径。
+func TestLocal_Run_FileKind_SnapshotsTargetAndRestores(t *testing.T) {
+	backend := &txMockBackend{}
+	apply := &txSpyApply{err: errors.New("boom")}
+	tx := New(backend, apply.Fn, t.TempDir(), nil, nil)
+
+	intent := fileIntent(t, "i2")
+	resp, err := tx.Run(context.Background(), intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backend.createCalls != 1 {
+		t.Errorf("file kind 应拍一次快照, got %d", backend.createCalls)
+	}
+	if backend.lastSrc != intent.Target {
+		t.Errorf("快照源 = %q, want %q(被改路径本体)", backend.lastSrc, intent.Target)
+	}
+	if backend.restoreCalls != 1 {
+		t.Errorf("apply 失败应还原一次, got %d", backend.restoreCalls)
+	}
+	if !strings.Contains(resp.ErrorMessage, "rolled back") {
+		t.Errorf("错误文案 = %q, want 含 rolled back", resp.ErrorMessage)
+	}
+	if !strings.Contains(resp.ErrorMessage, intent.Target) {
+		t.Errorf("错误文案 = %q, want 含被还原路径 %q", resp.ErrorMessage, intent.Target)
 	}
 }
 
@@ -395,7 +461,8 @@ func TestLocal_AuditEmitsOnRollback(t *testing.T) {
 	apply := &txSpyApply{err: errors.New("apply failed: package not signed")}
 	tx := New(backend, apply.Fn, dir, new(atomic.Uint64), auditLog)
 
-	resp, err := tx.Run(context.Background(), sampleIntent())
+	intent := fileIntent(t, "intent-001")
+	resp, err := tx.Run(context.Background(), intent)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -416,8 +483,8 @@ func TestLocal_AuditEmitsOnRollback(t *testing.T) {
 	if ev.Identity != "intent-001" {
 		t.Errorf("audit identity = %q, want intent-001", ev.Identity)
 	}
-	if ev.Args["target"] != "nginx" {
-		t.Errorf("audit args[target] = %q, want nginx", ev.Args["target"])
+	if ev.Args["target"] != intent.Target {
+		t.Errorf("audit args[target] = %q, want %q", ev.Args["target"], intent.Target)
 	}
 	if !strings.Contains(ev.Outcome, "apply_failed:") {
 		t.Errorf("audit outcome must reference apply failure; got %q", ev.Outcome)
@@ -444,7 +511,7 @@ func TestLocal_AuditEmitsOnRollbackFailed(t *testing.T) {
 	apply := &txSpyApply{err: errors.New("apply failed: checksum mismatch")}
 	tx := New(backend, apply.Fn, dir, new(atomic.Uint64), auditLog)
 
-	resp, err := tx.Run(context.Background(), sampleIntent())
+	resp, err := tx.Run(context.Background(), fileIntent(t, "intent-001"))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -591,6 +658,13 @@ func TestLocal_ApplyFailureWritesFailureEntry(t *testing.T) {
 	if !strings.Contains(events[0].Outcome, "executor exploded") {
 		t.Errorf("outcome = %q must carry the executor error", events[0].Outcome)
 	}
+	// 没有回滚点就别在审计里写 "rolled back":那是留给真的拷回过的路径的。
+	if !strings.Contains(events[0].Outcome, "no rollback point") {
+		t.Errorf("outcome = %q must say there was no rollback point", events[0].Outcome)
+	}
+	if strings.Contains(events[0].Outcome, "rolled back") {
+		t.Errorf("outcome = %q must not claim a rollback", events[0].Outcome)
+	}
 }
 
 // apply 之后链仍然是完整可验的哈希链(SDK 是权威校验器)。
@@ -617,7 +691,8 @@ func TestLocal_ChainStaysIntactAfterApply(t *testing.T) {
 }
 
 // 不可重试的执行器失败必须映射成 PERSISTENT_FAILURE,否则控制面会自动重试
-// 一个永远不会成功的操作(Review Focus #2)。回滚照旧要发生。
+// 一个永远不会成功的操作(Review Focus #2)。txTestKind 没有回滚点,所以
+// 这里同时断言"不假装还原"。
 func TestLocal_PersistentApplyErrorYieldsPersistentFailure(t *testing.T) {
 	backend := &txMockBackend{}
 	setApplyErr(t, fmt.Errorf("%w: package nope does not exist", exec.ErrPersistent))
@@ -630,8 +705,30 @@ func TestLocal_PersistentApplyErrorYieldsPersistentFailure(t *testing.T) {
 	if resp.Result != agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_PERSISTENT_FAILURE {
 		t.Fatalf("Result = %v, got %v, want PERSISTENT_FAILURE", resp.Result, resp.Result)
 	}
+	if backend.restoreCalls != 0 {
+		t.Errorf("Restore calls = %d, got %d, want 0 (kind 无回滚点)", backend.restoreCalls, backend.restoreCalls)
+	}
+}
+
+// 有回滚点时,不可重试的失败仍然先还原再报 PERSISTENT —— 结果码与
+// "已还原"是两件事,不能因为不重试就跳过还原。
+func TestLocal_FileKindPersistentErrorStillRollsBack(t *testing.T) {
+	backend := &txMockBackend{}
+	apply := &txSpyApply{err: fmt.Errorf("%w: package nope does not exist", exec.ErrPersistent)}
+
+	tx := New(backend, apply.Fn, t.TempDir(), new(atomic.Uint64), nil)
+	resp, err := tx.Run(context.Background(), fileIntent(t, "intent-001"))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if resp.Result != agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_PERSISTENT_FAILURE {
+		t.Fatalf("Result = %v, got %v, want PERSISTENT_FAILURE", resp.Result, resp.Result)
+	}
 	if backend.restoreCalls != 1 {
 		t.Errorf("Restore calls = %d, got %d, want 1 (rollback still runs)", backend.restoreCalls, backend.restoreCalls)
+	}
+	if !strings.Contains(resp.ErrorMessage, "rolled back") {
+		t.Errorf("ErrorMessage = %q, want 含 rolled back", resp.ErrorMessage)
 	}
 }
 
@@ -683,39 +780,24 @@ func TestLocal_CancelledApplyWritesCancelledEntry(t *testing.T) {
 	}
 }
 
-// 事务必须在 pre-snapshot 之前把暂存目标建出来:文件级快照后端(btrfs /
-// rsync)对不存在的源路径直接失败,而资源 kind(package/service)的 intent
-// 动的是宿主状态,没有谁会预先 materialize 这个目录 —— 不建出来,事务在
-// pre-snapshot 就 dead-end,真正的执行器根本没机会跑。
-func TestLocal_Run_CreatesStagedTargetBeforeSnapshot(t *testing.T) {
+// 没有回滚点的 kind 不该在 dataDir 下留下任何东西:不快照,也就没有快照
+// 目录要建。
+func TestLocal_Run_NonFileKindLeavesNoArtifacts(t *testing.T) {
 	dir := t.TempDir()
 	tx := New(&txMockBackend{}, (&txSpyApply{}).Fn, dir, nil, nil)
 
 	if _, err := tx.Run(context.Background(), sampleIntent()); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	wantSrc := filepath.Join(dir, "intent-target", "nginx")
-	fi, err := os.Stat(wantSrc)
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		t.Fatalf("staged target %q not created before snapshot: %v", wantSrc, err)
+		t.Fatalf("ReadDir: %v", err)
 	}
-	if !fi.IsDir() {
-		t.Errorf("%q is not a directory", wantSrc)
-	}
-}
-
-// 暂存路径不得被 intent.Target 里的 ".." 带出 dataDir(它会走 MkdirAll,
-// 建到外面就是路径穿越)。
-func TestLocal_Run_StagedTargetCannotEscapeDataDir(t *testing.T) {
-	dir := t.TempDir()
-	tx := New(&txMockBackend{}, (&txSpyApply{}).Fn, dir, nil, nil)
-
-	intent := &agentv1.ApplyIntentRequest{IntentId: "i-esc", Kind: "package", Target: "../../escaped"}
-	if _, err := tx.Run(context.Background(), intent); err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	outside := filepath.Join(filepath.Dir(dir), "escaped")
-	if _, err := os.Stat(outside); err == nil {
-		t.Errorf("staged target escaped dataDir and created %q", outside)
+	if len(entries) != 0 {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("package kind 不该留下产物, got %v", names)
 	}
 }

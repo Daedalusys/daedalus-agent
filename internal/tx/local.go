@@ -3,18 +3,22 @@
 //
 // 状态机(伪码):
 //
-//	pre-snapshot:   backend.CreateSnapshot(target → snap)
-//	apply:          applyFn(ctx, intent)              [internal/exec]
+//	point = rollback.PointFor(intent.Kind)
+//	if point == file:
+//	    pre-snapshot: backend.CreateSnapshot(intent.Target → <dataDir>/snapshots/<intent_id>.snap)
+//	apply:            applyFn(ctx, intent)              [internal/exec]
 //	if apply.ok:
-//	    success:    result = SUCCESS, audit_seq++, log
-//	else:
-//	    rollback:   backend.Restore(snap → target)
+//	    success:      result = SUCCESS, audit_seq++, log
+//	else if point == file:
+//	    rollback:     backend.Restore(snap → intent.Target)
 //	    if rollback.ok:
 //	        result = PERSISTENT_FAILURE,若执行器把该失败判为不可重试
 //	                 (exec.ErrPersistent / ErrUnsupportedKind);
 //	                 否则 TRANSIENT_FAILURE(已回滚,重试安全)
 //	    else:
 //	        result = PERSISTENT_FAILURE(回滚机制本身也坏了,需人工介入)
+//	else:
+//	    no rollback:  result 仍按可重试性分;文案写明 no rollback point
 //
 // 三种失败模式(快照失败、apply 失败但回滚成功、apply 失败且回滚失败)刻意
 // 分开上报,控制面才能给出有用的失败分桶。一句笼统的 "ApplyIntent failed"
@@ -24,13 +28,12 @@
 // 不该自动重试;包管理器锁被占、网络抖动可以。执行器判不出来时按不可重试
 // 上报 —— 自动重试一个永远不会成功的操作,代价更大。
 //
-// RF3 面(plan §RF3 + spec §5.2):
+// 准入面:
 //
-//	handler 层的「snap_capability == NONE → 拒绝」在
-//	internal/rpc/apply_intent.go,不在这里。tx 假定调用方已受理该 intent
-//	(即已选中非 nil backend)。纵深防御:即便未来有调用方漏了受理检查,
-//	这里对 nil backend 做 pre-snapshot 也会以一个清楚的 nil 解引用炸出来,
-//	而不是被 "best-effort" 悄悄吞掉。
+//	handler 层的准入(高危且无回滚点 → 拒绝)在 internal/rpc/apply_intent.go,
+//	不在这里。tx 假定调用方已受理该 intent。纵深防御:即便未来有调用方漏了
+//	受理检查,这里对 nil backend 做 pre-snapshot 也会以一个清楚的 nil 解引用
+//	炸出来,而不是被 "best-effort" 悄悄吞掉。
 //
 // 审计 / audit_seq:
 //
@@ -39,11 +42,9 @@
 //
 // 回滚能力边界:
 //
-//	文件级快照只捕获 <dataDir>/intent-target/<target> 这个暂存路径。当前
-//	wire 上只有资源 kind(package/service),它们改的是宿主状态(包库 /
-//	单元文件),文件级快照对它们没有还原能力 —— agent 的回滚本就是
-//	best-effort(产品叙事 "best-effort rollback, not bootc");"精确到
-//	kind 的快照源选择"是另一个待决的设计缺口。
+//	只有 kind=file 有回滚点,快照源就是被改文件本体。package / service 改的
+//	是宿主状态(包库 / 单元文件),文件级副本对它们没有还原能力,因此不快照、
+//	不还原,也不说 "rolled back"。
 package tx
 
 import (
@@ -51,7 +52,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"os"
 	"path/filepath"
 	"sync/atomic"
 
@@ -70,7 +70,7 @@ import (
 type ApplyFunc func(ctx context.Context, intent *agentv1.ApplyIntentRequest) error
 
 // Tx is the per-intent transaction. Construct via New() with
-// a non-nil rollback.Backend (the handler enforces the RF3
+// a non-nil rollback.Backend (the handler enforces the
 // admission check separately).
 type Tx interface {
 	// Run executes the pre-snapshot → apply → post-snapshot
@@ -103,7 +103,7 @@ type Local struct {
 }
 
 // New constructs a Local transaction. The backend MUST be
-// non-nil (callers enforce RF3 admission upstream).
+// non-nil (callers enforce admission upstream).
 //
 // auditSeq may be nil — in that case the tx uses a private
 // counter. Production wires a shared *atomic.Uint64 so audit
@@ -141,84 +141,100 @@ func (t *Local) Run(ctx context.Context, intent *agentv1.ApplyIntentRequest) (*a
 		return nil, fmt.Errorf("tx: nil intent")
 	}
 
-	// 1. Build paths. We use filepath.Join (not path.Join)
-	// because the agent runs on linux only — '/' is the
-	// separator regardless of host OS. filepath.Join also
-	// cleans redundant separators that an intent_id might
-	// carry.
-	//
-	// 暂存目标名走 filepath.Base:intent.Target 由控制面提供,含 ".." 时
-	// 会让 Join 的结果爬出 dataDir —— 而那一步之后是 MkdirAll,等于路径穿越。
-	sourcePath := filepath.Join(t.dataDir, "intent-target", filepath.Base(intent.Target))
-	snapshotPath := filepath.Join(t.dataDir, "snapshots", intent.IntentId+".snap")
+	// 1. 按 kind 取回滚点。表外 kind 一律没有回滚点 —— 「不认识」不等于
+	// 「有还原手段」。
+	point := rollback.PointFor(intent.Kind)
 
-	// 2. Pre-snapshot.
-	//
-	// 先把暂存目标建出来:文件级快照后端(btrfs / rsync)对不存在的源路径
-	// 直接失败,而资源 kind(package/service)的 intent 动的是宿主状态,
-	// 没有谁会预先 materialize 这个目录。不建出来,事务会在 pre-snapshot
-	// 就 dead-end,真正的执行器根本没机会跑。
-	//
-	// 注意这**不**等于"回滚万事大吉":文件级快照只捕获这个暂存路径,对
-	// package 安装 / service 启停这类宿主状态变更并无还原能力 —— agent 的
-	// 回滚本就是 best-effort(产品叙事 "best-effort rollback, not bootc"),
-	// 精确到 kind 的快照源选择是另一个待决的设计缺口。
-	if mkErr := os.MkdirAll(sourcePath, 0o755); mkErr != nil {
-		seq := t.auditSeq.Add(1)
-		log.Printf("agent: tx staged-target mkdir failed: intent_id=%q target=%q err=%v audit_seq=%d",
-			intent.IntentId, intent.Target, mkErr, seq)
-		return &agentv1.ApplyIntentResponse{
-			Result:       agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_TRANSIENT_FAILURE,
-			ErrorMessage: fmt.Sprintf("staged target unavailable: %v", mkErr),
-			AuditSeq:     seq,
-		}, nil
-	}
+	// 2. 快照路径按 intent_id 固定:同一 intent 重投时要能认出上一轮的
+	// 副本,而不是每次落一份新的。Base 挡住 intent_id 里的路径分隔符 ——
+	// 它来自控制面,不该有机会把写点带出 dataDir。
+	snapshotPath := filepath.Join(t.dataDir, "snapshots", filepath.Base(intent.IntentId)+".snap")
 
-	// A failure here means we never modified the host — return
-	// TRANSIENT_FAILURE so the control plane retries (e.g.
-	// transient ENOSPC on the snapshot volume).
 	seq := t.auditSeq.Add(1)
-	if err := t.backend.CreateSnapshot(sourcePath, snapshotPath); err != nil {
-		log.Printf("agent: tx pre-snapshot failed: intent_id=%q target=%q err=%v audit_seq=%d",
-			intent.IntentId, intent.Target, err, seq)
-		// Audit the pre-snapshot failure too: without
-		// the pre-snapshot we did NOT modify the host,
-		// but we still want a tamper-evident record of
-		// "tx was attempted, pre-snapshot broke".
-		if t.audit != nil {
-			if _, aerr := t.audit.Log(audit.Event{
-				Identity: intent.IntentId,
-				Tool:     "apply_intent.presnapshot_failed",
-				Args: map[string]string{
-					"target": intent.Target,
-					"kind":   intent.Kind,
-				},
-				Outcome: fmt.Sprintf("presnapshot_failed: %v", err),
-			}); aerr != nil {
-				log.Printf("agent: audit log (presnapshot_failed) failed: %v", aerr)
+
+	// 3. Pre-snapshot。只有存在回滚点的 kind 才拍:package / service 改的
+	// 是宿主状态,文件级副本对它们没有还原能力,拍了只会给"rolled back"
+	// 这句谎话提供口径。
+	var sourcePath string
+	if point == rollback.PointFile {
+		sourcePath = intent.Target
+		// 失败意味着宿主还没被改动 —— 报 TRANSIENT 让控制面重试(典型是
+		// 快照卷 ENOSPC)。
+		if err := t.backend.CreateSnapshot(sourcePath, snapshotPath); err != nil {
+			log.Printf("agent: tx pre-snapshot failed: intent_id=%q target=%q err=%v audit_seq=%d",
+				intent.IntentId, intent.Target, err, seq)
+			// 快照失败也要留痕:虽然没改宿主,但"事务被尝试过、快照坏了"
+			// 本身要有可追溯的记录。
+			if t.audit != nil {
+				if _, aerr := t.audit.Log(audit.Event{
+					Identity: intent.IntentId,
+					Tool:     "apply_intent.presnapshot_failed",
+					Args: map[string]string{
+						"target": intent.Target,
+						"kind":   intent.Kind,
+					},
+					Outcome: fmt.Sprintf("presnapshot_failed: %v", err),
+				}); aerr != nil {
+					log.Printf("agent: audit log (presnapshot_failed) failed: %v", aerr)
+				}
 			}
+			return &agentv1.ApplyIntentResponse{
+				Result:       agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_TRANSIENT_FAILURE,
+				ErrorMessage: fmt.Sprintf("pre-snapshot failed: %v", err),
+				AuditSeq:     seq,
+			}, nil
 		}
-		return &agentv1.ApplyIntentResponse{
-			Result:       agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_TRANSIENT_FAILURE,
-			ErrorMessage: fmt.Sprintf("pre-snapshot failed: %v", err),
-			AuditSeq:     seq,
-		}, nil
 	}
 
-	// 3. Apply. 真实执行器(internal/exec)在这里改机器。失败时先看
-	// 错误是可重试还是不可重试,再决定回滚后的上报结果 —— 控制面据此
-	// 决定要不要自动重试(TRANSIENT 最多 3 次;PERSISTENT 不重试)。
+	// 4. Apply。真实执行器(internal/exec)在这里改机器。失败时先看错误
+	// 是可重试还是不可重试,再决定要不要还原、以及上报什么结果码 ——
+	// 控制面据此决定要不要自动重试(TRANSIENT 最多 3 次;PERSISTENT 不重试)。
 	if err := t.apply(ctx, intent); err != nil {
 		cancelled := errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 		persistent := errors.Is(err, exec.ErrPersistent) || errors.Is(err, exec.ErrUnsupportedKind)
 
-		// Apply failed. Attempt rollback.
+		// 4a. 没有回滚点。不快照也就不还原,文案必须如实说明 —— 这句
+		// "no rollback point" 是控制面区分"已还原可重试"与"宿主状态未知"
+		// 的唯一依据。
+		if point == rollback.PointNone {
+			rbSeq := t.auditSeq.Add(1)
+			log.Printf("agent: tx apply failed, no rollback point: intent_id=%q kind=%q apply_err=%v audit_seq=%d",
+				intent.IntentId, intent.Kind, err, rbSeq)
+			if t.audit != nil {
+				tool := "apply_intent.failure"
+				outcome := fmt.Sprintf("apply_failed: %v (no rollback point for kind=%s)", err, intent.Kind)
+				if cancelled {
+					tool = "apply_intent.cancelled"
+					outcome = fmt.Sprintf("cancelled: %v (no rollback point for kind=%s)", err, intent.Kind)
+				}
+				if _, aerr := t.audit.Log(audit.Event{
+					Identity: intent.IntentId,
+					Tool:     tool,
+					Args: map[string]string{
+						"target": intent.Target,
+						"kind":   intent.Kind,
+					},
+					Outcome: outcome,
+				}); aerr != nil {
+					log.Printf("agent: audit log (failure) failed: %v", aerr)
+				}
+			}
+			result := agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_TRANSIENT_FAILURE
+			if persistent {
+				result = agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_PERSISTENT_FAILURE
+			}
+			return &agentv1.ApplyIntentResponse{
+				Result:       result,
+				ErrorMessage: fmt.Sprintf("apply failed, no rollback point for kind=%s: %v", intent.Kind, err),
+				AuditSeq:     rbSeq,
+			}, nil
+		}
+
+		// 4b. 有回滚点:先把副本拷回去。
 		rbErr := t.backend.Restore(snapshotPath, sourcePath)
 		if rbErr != nil {
-			// Rollback ALSO failed. This is the
-			// PERSISTENT_FAILURE case — host may be
-			// in an undefined state. Audit it loudly
-			// so the operator sees the dual failure.
+			// 还原也失败。这是 PERSISTENT_FAILURE 的场合 —— 宿主可能
+			// 处于未定义状态,必须大喊出来。
 			rbSeq := t.auditSeq.Add(1)
 			log.Printf("agent: tx apply failed AND rollback failed: intent_id=%q apply_err=%v rollback_err=%v audit_seq=%d",
 				intent.IntentId, err, rbErr, rbSeq)
@@ -241,12 +257,12 @@ func (t *Local) Run(ctx context.Context, intent *agentv1.ApplyIntentRequest) (*a
 				AuditSeq:     rbSeq,
 			}, nil
 		}
-		// apply 失败但回滚成功。上报结果取决于这次失败值不值得重试:
-		// 不可重试的失败即便回滚成功也必须报 PERSISTENT,否则控制面会
-		// 自动重试一个永远不会成功的操作。
+		// 还原成功。结果码仍取决于这次失败值不值得重试:不可重试的失败
+		// 即便还原成功也必须报 PERSISTENT,否则控制面会重试一个永远不会
+		// 成功的操作。
 		rbSeq := t.auditSeq.Add(1)
-		log.Printf("agent: tx apply failed, rolled back: intent_id=%q apply_err=%v audit_seq=%d",
-			intent.IntentId, err, rbSeq)
+		log.Printf("agent: tx apply failed, rolled back: intent_id=%q path=%q apply_err=%v audit_seq=%d",
+			intent.IntentId, sourcePath, err, rbSeq)
 		if t.audit != nil {
 			tool := "apply_intent.failure"
 			outcome := fmt.Sprintf("apply_failed: %v (rolled back)", err)
@@ -268,16 +284,13 @@ func (t *Local) Run(ctx context.Context, intent *agentv1.ApplyIntentRequest) (*a
 				log.Printf("agent: audit log (failure) failed: %v", aerr)
 			}
 		}
+		result := agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_TRANSIENT_FAILURE
 		if persistent {
-			return &agentv1.ApplyIntentResponse{
-				Result:       agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_PERSISTENT_FAILURE,
-				ErrorMessage: fmt.Sprintf("apply failed with a non-retryable error, rolled back successfully: %v", err),
-				AuditSeq:     rbSeq,
-			}, nil
+			result = agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_PERSISTENT_FAILURE
 		}
 		return &agentv1.ApplyIntentResponse{
-			Result:       agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_TRANSIENT_FAILURE,
-			ErrorMessage: fmt.Sprintf("apply failed, rolled back successfully: %v", err),
+			Result:       result,
+			ErrorMessage: fmt.Sprintf("apply failed, rolled back %s: %v", sourcePath, err),
 			AuditSeq:     rbSeq,
 		}, nil
 	}

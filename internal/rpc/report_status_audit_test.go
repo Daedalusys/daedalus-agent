@@ -21,7 +21,10 @@ func TestReportStatus_SurfacesRefusedApplyIntent(t *testing.T) {
 		t.Fatalf("Register: %v", err)
 	}
 	if _, err := rig.Client.ApplyIntent(ctx, &agentv1.ApplyIntentRequest{
-		IntentId: "intent-wire-rf3", Kind: "package", Target: "nginx",
+		IntentId:  "intent-wire-high-risk",
+		Kind:      "package",
+		Target:    "nginx",
+		RiskClass: agentv1.RiskClass_RISK_CLASS_HIGH,
 	}); err != nil {
 		t.Fatalf("ApplyIntent: %v", err)
 	}
@@ -51,11 +54,11 @@ func TestReportStatus_SurfacesRefusedApplyIntent(t *testing.T) {
 	if err := json.Unmarshal([]byte(ev.PayloadJson), &payload); err != nil {
 		t.Fatalf("PayloadJson: %v", err)
 	}
-	if payload.Identity != "intent-wire-rf3" {
-		t.Errorf("payload.identity = %q, want intent-wire-rf3", payload.Identity)
+	if payload.Identity != "intent-wire-high-risk" {
+		t.Errorf("payload.identity = %q, want intent-wire-high-risk", payload.Identity)
 	}
-	if payload.Outcome != "refused: snapshot_capability_none" {
-		t.Errorf("payload.outcome = %q, want refused: snapshot_capability_none", payload.Outcome)
+	if want := "refused: high-risk intent on a kind without rollback point: kind=package"; payload.Outcome != want {
+		t.Errorf("payload.outcome = %q, want %q", payload.Outcome, want)
 	}
 	if payload.Args["target"] != "nginx" || payload.Args["kind"] != "package" {
 		t.Errorf("payload.args = %+v, want target=nginx kind=package", payload.Args)

@@ -89,13 +89,14 @@ func Register(kind string, e Executor) {
 //
 // 键是**资源 kind**(objectmodel.Kind):控制面把 Intent.Kind 原样发上
 // wire,`package.set` / `service.set` 只是 core 风险判定表内部的适配器名,
-// 不会出现在这里。`package` 与 `service` 各对应一个执行器;未登记的 kind
-// 由 Apply 统一按 ErrUnsupportedKind 拒绝(fail-closed)。
+// 不会出现在这里。`package` / `service` / `file` 各对应一个执行器;未登记的
+// kind 由 Apply 统一按 ErrUnsupportedKind 拒绝(fail-closed)。
 //
 // 各执行器文件各自往这里追加一行注册。
 func registerAll() {
 	Register(kindPackage, packageExecutor{})
 	Register(kindService, serviceExecutor{})
+	Register(kindFile, fileExecutor{})
 }
 
 // lookup 返回 kind 对应的执行器。第二个返回值为 false 表示未注册。

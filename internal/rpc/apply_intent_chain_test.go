@@ -35,7 +35,10 @@ func TestApplyIntent_ConcurrentRefusalsKeepChainIntact(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			if _, err := svc.ApplyIntent(context.Background(), &agentv1.ApplyIntentRequest{
-				IntentId: fmt.Sprintf("intent-concurrent-%d", i), Kind: "package", Target: "nginx",
+				IntentId:  fmt.Sprintf("intent-concurrent-%d", i),
+				Kind:      "package",
+				Target:    "nginx",
+				RiskClass: agentv1.RiskClass_RISK_CLASS_HIGH,
 			}); err != nil {
 				t.Errorf("ApplyIntent[%d]: %v", i, err)
 			}
