@@ -552,56 +552,32 @@ func TestApplyIntent_UnknownKind_Refused(t *testing.T) {
 	}
 }
 
-// TestSnapshotRequest_OnBtrfsCapability_StubReturnsID verifies the
-// SnapshotRequest happy path returns a non-empty snapshot_id and a
-// backend_used that matches the agent's capability. Real btrfs /
-// rsync snapshot primitives are T6.
-func TestSnapshotRequest_OnBtrfsCapability_StubReturnsID(t *testing.T) {
-	rig := startTestServerWithSnapshot(t, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_BTRFS_SUBVOLUME)
-	defer rig.Cleanup()
+// SnapshotRequest 不再拍 intent-target 目录(该概念已删),而请求本身
+// 只有 reason、没有目标路径 —— 无从决定拍谁,所以恒拒绝。结果不随宿主
+// 能力变化:装了 btrfs 也一样 FailedPrecondition。
+func TestSnapshotRequest_RefusedRegardlessOfCapability(t *testing.T) {
+	for _, cap := range []agentv1.SnapshotCapability{
+		agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE,
+		agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_BTRFS_SUBVOLUME,
+	} {
+		t.Run(cap.String(), func(t *testing.T) {
+			rig := startTestServerWithSnapshot(t, cap)
+			defer rig.Cleanup()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if _, err := rig.Client.Register(ctx, &agentv1.RegisterRequest{AgentId: "agent-test-1"}); err != nil {
-		t.Fatalf("Register: %v", err)
-	}
-	resp, err := rig.Client.SnapshotRequest(ctx, &agentv1.SnapshotRequestRequest{Reason: "test"})
-	if err != nil {
-		t.Fatalf("SnapshotRequest: %v", err)
-	}
-	if resp.SnapshotId == "" {
-		t.Errorf("SnapshotId empty; want non-empty (stub)")
-	}
-	if resp.BackendUsed != agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_BTRFS_SUBVOLUME {
-		t.Errorf("BackendUsed = %v, want BTRFS_SUBVOLUME", resp.BackendUsed)
-	}
-	if resp.CreatedAtUnix == 0 {
-		t.Errorf("CreatedAtUnix = 0; want positive Unix seconds")
-	}
-}
-
-// TestSnapshotRequest_OnNoneCapability_FailedPrecondition verifies
-// that an agent with no snapshot backend rejects SnapshotRequest
-// with a clear gRPC FailedPrecondition. We surface this via a
-// status code (rather than a stub SnapshotResponse) because the
-// control plane treats "no backend" as an environment failure, not
-// a successful empty operation.
-func TestSnapshotRequest_OnNoneCapability_FailedPrecondition(t *testing.T) {
-	rig := startTestServerWithSnapshot(t, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE)
-	defer rig.Cleanup()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if _, err := rig.Client.Register(ctx, &agentv1.RegisterRequest{AgentId: "agent-test-1"}); err != nil {
-		t.Fatalf("Register: %v", err)
-	}
-	_, err := rig.Client.SnapshotRequest(ctx, &agentv1.SnapshotRequestRequest{Reason: "test"})
-	if err == nil {
-		t.Fatal("SnapshotRequest on NONE capability: nil err; want FailedPrecondition")
-	}
-	st, _ := status.FromError(err)
-	if st.Code() != codes.FailedPrecondition {
-		t.Errorf("code = %v, want FailedPrecondition", st.Code())
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if _, err := rig.Client.Register(ctx, &agentv1.RegisterRequest{AgentId: "agent-test-1"}); err != nil {
+				t.Fatalf("Register: %v", err)
+			}
+			_, err := rig.Client.SnapshotRequest(ctx, &agentv1.SnapshotRequestRequest{Reason: "test"})
+			if err == nil {
+				t.Fatal("SnapshotRequest: nil err; want FailedPrecondition")
+			}
+			st, _ := status.FromError(err)
+			if st.Code() != codes.FailedPrecondition {
+				t.Errorf("code = %v, want FailedPrecondition", st.Code())
+			}
+		})
 	}
 }
 
