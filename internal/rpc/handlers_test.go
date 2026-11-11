@@ -581,6 +581,42 @@ func TestSnapshotRequest_RefusedRegardlessOfCapability(t *testing.T) {
 	}
 }
 
+// file kind 端到端:ApplyIntent → tx.New(真实 exec.Apply)→ fileExecutor,
+// 内容落到目标文件。准入只认 file / package / service,测试专用 kind 进
+// 不来,所以这条接线用真实执行器覆盖。
+func TestApplyIntent_FileKind_DispatchesToFileExecutor(t *testing.T) {
+	rig := startTestServerWithSnapshot(t, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE)
+	defer rig.Cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := rig.Client.Register(ctx, &agentv1.RegisterRequest{AgentId: "agent-test-1"}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	target := filepath.Join(t.TempDir(), "app.conf")
+	resp, err := rig.Client.ApplyIntent(ctx, &agentv1.ApplyIntentRequest{
+		IntentId:  "intent-file",
+		Kind:      "file",
+		Target:    target,
+		SpecJson:  `{"content":"hello"}`,
+		RiskClass: agentv1.RiskClass_RISK_CLASS_LOW,
+	})
+	if err != nil {
+		t.Fatalf("ApplyIntent: %v", err)
+	}
+	if resp.Result != agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_SUCCESS {
+		t.Fatalf("Result = %v, want SUCCESS (%q)", resp.Result, resp.ErrorMessage)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read target: %v", err)
+	}
+	if string(got) != "hello" {
+		t.Errorf("内容 = %q, want hello", got)
+	}
+}
+
 // TestReportStatus_ReturnsEmptyEvents covers the T5 contract:
 // ReportStatus returns an empty events list and final_seq=0.
 // Real audit hash-chain replay is T7 (which will pull events from
