@@ -841,3 +841,38 @@ func TestLocal_Run_NonFileKindLeavesNoArtifacts(t *testing.T) {
 		t.Errorf("package kind 不该留下产物, got %v", names)
 	}
 }
+
+// 有回滚点却没有后端:装配错误必须当场失败,不能拖到 CreateSnapshot 上空指针。
+func TestLocal_NilBackendWithRollbackPointFailsClosed(t *testing.T) {
+	apply := &txSpyApply{}
+	tx := New(nil, apply.Fn, t.TempDir(), nil, nil)
+
+	_, err := tx.Run(context.Background(), &agentv1.ApplyIntentRequest{
+		IntentId: "i-nil-backend", Kind: "file", Target: "/etc/app.conf",
+	})
+	if err == nil {
+		t.Fatal("nil backend + file intent: nil err; want fail-closed error")
+	}
+	if apply.calls != 0 {
+		t.Errorf("apply 被调用 %d 次,应在快照之前就失败", apply.calls)
+	}
+}
+
+// 没有回滚点的 kind:backend 为 nil 是正常的,不得报错(低危照常执行)。
+func TestLocal_NilBackendWithoutRollbackPointRuns(t *testing.T) {
+	apply := &txSpyApply{}
+	tx := New(nil, apply.Fn, t.TempDir(), nil, nil)
+
+	resp, err := tx.Run(context.Background(), &agentv1.ApplyIntentRequest{
+		IntentId: "i-nil-backend-pkg", Kind: "package", Target: "nginx",
+	})
+	if err != nil {
+		t.Fatalf("PointNone + nil backend 不该报错: %v", err)
+	}
+	if resp == nil {
+		t.Fatal("resp 为 nil")
+	}
+	if apply.calls != 1 {
+		t.Errorf("apply 次数 = %d, want 1", apply.calls)
+	}
+}
