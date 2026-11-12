@@ -257,19 +257,22 @@ func containsToken(tokens []string, want string) bool {
 	return false
 }
 
-// lvm-snap 后端的参数形状守卫:它按**逻辑卷**寻址,传进来的却是目录时
-// 必须当场报错,而不是把目录当 LV 名发给 lvcreate 后失败在半路。
-func TestLVMSnapBackend_RejectsNonDeviceSource(t *testing.T) {
+// TestLVMSnapshotRequiresDevicePath 是 lvm-snap 的形状守卫:sourcePath 不是
+// /dev/ 设备路径时必须当场报错,且 lvcreate 一次都不执行 —— 把文件路径发给
+// lvcreate 会把错误推迟到半路才暴露。
+func TestLVMSnapshotRequiresDevicePath(t *testing.T) {
 	resetRunCommand(t)
 	called := 0
 	runCommand = func(string, ...string) error { called++; return nil }
 
-	b := &lvmSnapBackend{}
-	err := b.CreateSnapshot("/var/lib/daedalus-agent/data/app.conf", "/var/lib/daedalus-agent/snapshots/i-1.snap")
+	err := (&lvmSnapBackend{}).CreateSnapshot("/etc/hosts", filepath.Join(t.TempDir(), "i-1.snap"))
 	if err == nil {
-		t.Fatal("CreateSnapshot: nil err; want a shape-guard rejection")
+		t.Fatal("CreateSnapshot: nil err; want shape-guard rejection")
+	}
+	if !strings.Contains(err.Error(), "logical-volume device path") {
+		t.Errorf("err = %q, want 含 logical-volume device path", err)
 	}
 	if called != 0 {
-		t.Errorf("lvcreate invoked %d times, want 0 (guard must reject before running anything)", called)
+		t.Errorf("lvcreate invoked %d times, want 0", called)
 	}
 }
