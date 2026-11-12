@@ -1,7 +1,7 @@
 // Package snapshot — Detector wrapper.
 //
-// Detect() 恒报 NONE(宿主自带机制不再探测),但 RPC 层仍需要"多次调用
-// 看到同一个答案",所以用 Detector 把结果缓存起来。
+// Detect() 真实探测宿主自带的快照机制,但 RPC 层仍需要"多次调用看到同一个
+// 答案",所以用 Detector 把结果缓存起来。
 //
 // Detector is concurrency-safe: the cache is guarded by a mutex
 // so two simultaneous Register / ApplyIntent calls cannot race
@@ -18,7 +18,7 @@ import (
 
 // Detector is the agent's snapshot-capability cache. Construct
 // with NewDetector(); the first Capability() call invokes
-// Detect() (恒 NONE); subsequent calls return the cached answer.
+// Detect(); subsequent calls return the cached answer.
 //
 // Tests can override the cached answer with SetCapability()
 // to simulate any backend state without touching the host

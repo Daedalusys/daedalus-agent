@@ -1,10 +1,9 @@
 // Package snapshot owns the daedalus-agent snapshot backend
 // capability probe.
 //
-// Detect() 恒报 SNAPSHOT_CAPABILITY_NONE:这个字段只描述宿主自带的快照
-// 机制(btrfs subvolume / rsync / LVM / snapper),而 agent 的回滚点按
-// kind 定义、由内建的纯 Go copy 后端落地,与宿主能力无关。btrfs /
-// rsync 的探测函数保留(probeBtrfs / probeRsync),但生产路径不再调用。
+// Detect() 上报宿主自带的快照机制,优先级 snapper > lvm > btrfs > rsync > none。
+// 这个字段只描述"宿主自带什么手段",不是"这次变更有没有还原点" —— 后者按
+// kind 判,由内建的 copy 后端落地(见 internal/rollback 与 internal/tx)。
 //
 // The result of Detect() flows into the gRPC Register response
 // (`snapshot_capability` field on the Register RPC, see SDK
@@ -41,7 +40,11 @@ var (
 	}
 )
 
-// probeBtrfs reports whether the host has a usable btrfs
+// probeBtrfs 是包级变量而非函数:测试把它整个换掉,就能在没有 btrfs 的
+// 机器上验证优先级分派。
+var probeBtrfs = detectBtrfs
+
+// detectBtrfs reports whether the host has a usable btrfs
 // subvolume snapshot path. It returns (true, nil) only when both
 // (a) the `btrfs` binary is on PATH and (b) `btrfs subvolume
 // show /` exits 0 with non-empty output — i.e. the root
@@ -53,7 +56,7 @@ var (
 // btrfs. A naive PATH check would false-positive in that case and
 // later mislead the control plane into issuing ApplyIntents
 // against an unwritable snapshot backend.
-func probeBtrfs() (bool, error) {
+func detectBtrfs() (bool, error) {
 	if _, err := execLookPath("btrfs"); err != nil {
 		// Not installed — that is a normal outcome, not an error.
 		if errors.Is(err, errNotFound) {
@@ -74,7 +77,10 @@ func probeBtrfs() (bool, error) {
 	return true, nil
 }
 
-// probeRsync reports whether the host has a usable rsync binary.
+// probeRsync 是包级变量,理由同 probeBtrfs。
+var probeRsync = detectRsync
+
+// detectRsync reports whether the host has a usable rsync binary.
 // The agent can use rsync as a file-copy snapshot fallback when
 // btrfs is unavailable: slower than btrfs subvolume snapshots
 // (no copy-on-write) but at least gives the rollback machinery
@@ -85,7 +91,7 @@ func probeBtrfs() (bool, error) {
 // requiring an actual remote / target. We do NOT use --version's
 // exit code alone because a wrapper script could exit 0 while
 // the underlying rsync binary is broken.
-func probeRsync() (bool, error) {
+func detectRsync() (bool, error) {
 	if _, err := execLookPath("rsync"); err != nil {
 		if errors.Is(err, errNotFound) {
 			return false, nil
@@ -102,17 +108,30 @@ func probeRsync() (bool, error) {
 	return true, nil
 }
 
-// Detect 恒报 NONE:宿主自带的快照机制不再参与回滚点判定。
+// Detect 按 snapper > lvm > btrfs > rsync > none 的顺序上报宿主自带的
+// 快照机制。
 //
-// 能力字段回答的是"宿主自带什么手段",不是"这次变更有没有还原点" —— 后者
-// 按 kind 判,由内建的 copy 后端落地(见 internal/rollback 与 internal/tx)。
-// 在 ext4 / xfs 的通用镜像上探测 btrfs / rsync 只会得到一个与回滚能力无关
-// 的答案,却容易被读成"这台机器能回滚一切"。
-//
-// probeBtrfs / probeRsync 保留给扩展(btrfs / rsync 后端接回来时复用),
-// 生产路径不再调用它们;这里仍打一行日志,免得操作员把 NONE 读成"什么都
-// 不能回滚"。
+// 顺序是产品裁定而不是实现细节:snapper 已经在一个受管子卷上工作了,
+// 再报 lvm 只会让控制面以为能从卷层整体还原;lvm 又比 btrfs 覆盖面广。
+// 探测失败一律落到下一档,缺工具是正常结局,不是需要上报的错误。
 func Detect() agentv1.SnapshotCapability {
-	log.Print("agent: snapshot capability reported as NONE by design (host snapshot mechanisms are not probed); rollback points are per-kind and use the built-in copy backend")
+	c := detect()
+	log.Printf("agent: snapshot capability=%s", c)
+	return c
+}
+
+func detect() agentv1.SnapshotCapability {
+	if ok, _ := probeSnapper(); ok {
+		return agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_SNAPSHOT_SNAPPER
+	}
+	if ok, _ := probeLVM(); ok {
+		return agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_LVM_SNAP
+	}
+	if ok, _ := probeBtrfs(); ok {
+		return agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_BTRFS_SUBVOLUME
+	}
+	if ok, _ := probeRsync(); ok {
+		return agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_RSYNC_TARGET
+	}
 	return agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE
 }
