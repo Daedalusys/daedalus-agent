@@ -89,9 +89,10 @@ func (s *agentService) ApplyIntent(ctx context.Context, req *agentv1.ApplyIntent
 		return s.refuseIntent(req, "apply_intent.refused", fmt.Sprintf("refused: high-risk intent on a kind without rollback point: kind=%s", req.Kind), nil), nil
 	}
 
-	// 3. 其余放行。copy 后端是纯 Go 内建的,选不出来只可能是配置错误;
-	// 带病往下跑会把一次确定的失败拖成宿主状态未知。
-	backend, err := s.selectedBackend()
+	// 3. 其余放行。回滚点形态 + 宿主能力共同选后端:file 恒走内建 copy,
+	// 能力只在卷级回滚点时有发言权。选不出来只可能是配置错误;带病往下跑
+	// 会把一次确定的失败拖成宿主状态未知。
+	backend, err := s.selectedBackend(point)
 	if err != nil {
 		return s.refuseIntent(req, "apply_intent.backend_unavailable", fmt.Sprintf("backend_unavailable: %v", err), map[string]string{"error": err.Error()}), nil
 	}

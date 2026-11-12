@@ -193,10 +193,10 @@ func (t *Local) Run(ctx context.Context, intent *agentv1.ApplyIntentRequest) (*a
 		cancelled := errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 		persistent := errors.Is(err, exec.ErrPersistent) || errors.Is(err, exec.ErrUnsupportedKind)
 
-		// 4a. 没有回滚点。不快照也就不还原,文案必须如实说明 —— 这句
-		// "no rollback point" 是控制面区分"已还原可重试"与"宿主状态未知"
-		// 的唯一依据。
-		if point == rollback.PointNone {
+		// 4a. 没有回滚点(PointNone,以及本期无 producer 的 PointVolume)。
+		// 不快照也就不还原,文案必须如实说明 —— 这句 "no rollback point"
+		// 是控制面区分"已还原可重试"与"宿主状态未知"的唯一依据。
+		if point != rollback.PointFile {
 			rbSeq := t.auditSeq.Add(1)
 			log.Printf("agent: tx apply failed, no rollback point: intent_id=%q kind=%q apply_err=%v audit_seq=%d",
 				intent.IntentId, intent.Kind, err, rbSeq)

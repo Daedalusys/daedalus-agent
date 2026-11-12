@@ -9,11 +9,12 @@ import (
 
 	"github.com/Daedalusys/daedalus-agent/internal/audit"
 	"github.com/Daedalusys/daedalus-agent/internal/config"
+	"github.com/Daedalusys/daedalus-agent/internal/rollback"
 	"github.com/Daedalusys/daedalus-agent/internal/snapshot"
 )
 
-// 畸形 detector 状态(未来 proto 新增枚举而本 agent 不认识)必须被拒并落链,
-// 而不是掉进"best-effort"或直接 panic。
+// 无回滚点的 kind 走到后端选择时必须被拒并落链:service 按低危放行到
+// selectedBackend(PointNone),在这里以"没有回滚点"终局,而不是进事务。
 func TestApplyIntent_BackendSelectionFailureWritesAuditEvent(t *testing.T) {
 	dir := t.TempDir()
 	auditLog, err := audit.New(dir)
@@ -51,7 +52,7 @@ func TestApplyIntent_BackendSelectionFailureWritesAuditEvent(t *testing.T) {
 	if !strings.Contains(ev.Outcome, "backend_unavailable:") {
 		t.Errorf("outcome = %q, must be prefixed backend_unavailable:", ev.Outcome)
 	}
-	if !strings.Contains(ev.Outcome, "unsupported snapshot capability") {
+	if !strings.Contains(ev.Outcome, "no rollback point") {
 		t.Errorf("outcome = %q, must carry the SelectBackend error", ev.Outcome)
 	}
 	if ev.Args["target"] != "nginx.service" || ev.Args["kind"] != "service" {
@@ -59,6 +60,18 @@ func TestApplyIntent_BackendSelectionFailureWritesAuditEvent(t *testing.T) {
 	}
 	if ev.Args["error"] == "" {
 		t.Error("args[error] empty; the raw backend-selection error must be preserved")
+	}
+}
+
+// selectedBackend 把回滚点形态转发给 SelectBackend:PointVolume + 未知
+// 能力必须拒绝。本期 PointVolume 无 producer,这里钉的是 RPC 层转发契约。
+func TestSelectedBackend_RefusesUnknownCapabilityForVolume(t *testing.T) {
+	det := snapshot.NewDetector()
+	det.SetCapability(agentv1.SnapshotCapability(99))
+	svc := newAgentService(&config.Config{DataDir: t.TempDir()}, nil, det, nil, nil, nil, nil)
+
+	if _, err := svc.selectedBackend(rollback.PointVolume); err == nil {
+		t.Fatal("selectedBackend(PointVolume, unknown): nil err; want refusal")
 	}
 }
 

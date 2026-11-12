@@ -388,6 +388,46 @@ func TestLocal_Run_FileKind_SnapshotsTargetAndRestores(t *testing.T) {
 	}
 }
 
+// PointNone 的 intent 不得调用 CreateSnapshot:package / service / 表外
+// kind 都改的是宿主状态,文件级副本救不了,拍了只会给"已回滚"提供口径。
+func TestLocal_PointNoneNeverCallsCreateSnapshot(t *testing.T) {
+	for _, kind := range []string{"package", "service", "unknown.kind"} {
+		t.Run(kind, func(t *testing.T) {
+			backend := &txMockBackend{}
+			tx := New(backend, (&txSpyApply{}).Fn, t.TempDir(), nil, nil)
+
+			if _, err := tx.Run(context.Background(), &agentv1.ApplyIntentRequest{
+				IntentId: "i-" + kind, Kind: kind, Target: "x",
+			}); err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if backend.createCalls != 0 {
+				t.Errorf("PointNone kind=%s CreateSnapshot calls = %d, want 0", kind, backend.createCalls)
+			}
+			if backend.restoreCalls != 0 {
+				t.Errorf("PointNone kind=%s Restore calls = %d, want 0", kind, backend.restoreCalls)
+			}
+		})
+	}
+}
+
+// PointFile 的快照源必须是被改路径本体。
+func TestLocal_PointFileUsesIntentTargetAsSource(t *testing.T) {
+	backend := &txMockBackend{}
+	tx := New(backend, (&txSpyApply{}).Fn, t.TempDir(), nil, nil)
+
+	intent := fileIntent(t, "i-pointfile")
+	if _, err := tx.Run(context.Background(), intent); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if backend.createCalls != 1 {
+		t.Fatalf("PointFile CreateSnapshot calls = %d, want 1", backend.createCalls)
+	}
+	if backend.lastSrc != intent.Target {
+		t.Errorf("快照源 = %q, want intent.Target %q", backend.lastSrc, intent.Target)
+	}
+}
+
 // TestLocal_AuditEmitsOnSuccess covers T7's primary contract:
 // a successful ApplyIntent MUST write a hash-chained audit
 // event with tool="apply_intent.success", outcome="ok", and

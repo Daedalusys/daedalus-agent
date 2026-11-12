@@ -1,12 +1,8 @@
 // Tests for the rollback package's SelectBackend function.
 //
-// SelectBackend is the boundary that maps an agent's detected
-// snapshot_capability (from internal/snapshot.Detector) onto a
-// concrete on-host Backend.
-//
-// 能力与回滚点是两件事:能力回答"宿主自带什么手段",回滚点回答"这次
-// 变更有没有还原手段"。MVP 里回滚点按 kind 判(file 才有),宿主能力
-// 一律 NONE —— copy 后端是 agent 内建的,所以 NONE 也选得出后端。
+// SelectBackend 有两个输入:回滚点形态(Point)与宿主能力
+// (snapshot_capability)。回滚点决定"这次变更有没有还原手段",宿主能力只在
+// PointVolume 时决定"用哪种手段",PointFile 恒走内建 copy。
 package rollback
 
 import (
@@ -19,10 +15,49 @@ import (
 	agentv1 "github.com/Daedalusys/daedalus-sdk/proto/agent/v1"
 )
 
+// TestSelectBackendByPointAndCapability 钉住 Review Focus 前两条:
+// file 在 LVM 宿主上仍走 copy;PointNone 一律拒绝。
+func TestSelectBackendByPointAndCapability(t *testing.T) {
+	cases := []struct {
+		name  string
+		point Point
+		cap   agentv1.SnapshotCapability
+		want  any
+		err   bool
+	}{
+		{"file 在 LVM 宿主上仍走 copy", PointFile, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_LVM_SNAP, &CopyBackend{}, false},
+		{"file 在无能力宿主上走 copy", PointFile, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE, &CopyBackend{}, false},
+		{"file 忽略未知能力仍走 copy", PointFile, agentv1.SnapshotCapability(99), &CopyBackend{}, false},
+		{"volume 在 LVM 宿主上走 lvm", PointVolume, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_LVM_SNAP, &lvmSnapBackend{}, false},
+		{"volume 在 snapper 宿主上走 snapper", PointVolume, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_SNAPSHOT_SNAPPER, &snapperBackend{}, false},
+		{"volume 在 btrfs 宿主上走 btrfs", PointVolume, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_BTRFS_SUBVOLUME, &BtrfsBackend{}, false},
+		{"volume 在无能力宿主上拒绝", PointVolume, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE, nil, true},
+		{"volume 在 rsync 宿主上拒绝", PointVolume, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_RSYNC_TARGET, nil, true},
+		{"none 一律拒绝", PointNone, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE, nil, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := SelectBackend(c.point, c.cap)
+			if c.err {
+				if err == nil {
+					t.Fatalf("SelectBackend(%v,%v) 期望报错, got %T", c.point, c.cap, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("SelectBackend(%v,%v) 意外报错: %v", c.point, c.cap, err)
+			}
+			if reflect.TypeOf(got) != reflect.TypeOf(c.want) {
+				t.Errorf("后端类型 = %T, want %T", got, c.want)
+			}
+		})
+	}
+}
+
 // TestSelectBackend_Btrfs_ReturnsBtrfsBackend covers the
 // priority-1 capability: btrfs subvolume snapshot.
 func TestSelectBackend_Btrfs_ReturnsBtrfsBackend(t *testing.T) {
-	b, err := SelectBackend(agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_BTRFS_SUBVOLUME)
+	b, err := SelectBackend(PointVolume, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_BTRFS_SUBVOLUME)
 	if err != nil {
 		t.Fatalf("SelectBackend: %v", err)
 	}
@@ -31,22 +66,22 @@ func TestSelectBackend_Btrfs_ReturnsBtrfsBackend(t *testing.T) {
 	}
 }
 
-// TestSelectBackend_Rsync_ReturnsRsyncBackend covers the
-// priority-2 fallback capability: rsync file-copy.
-func TestSelectBackend_Rsync_ReturnsRsyncBackend(t *testing.T) {
-	b, err := SelectBackend(agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_RSYNC_TARGET)
-	if err != nil {
-		t.Fatalf("SelectBackend: %v", err)
+// rsync 只能复制文件,覆盖不了卷级状态:PointVolume + rsync 必须拒绝,
+// 不能把 RSYNC_TARGET 当成包/卷的回滚点。
+func TestSelectBackend_RsyncNotUsableForVolume(t *testing.T) {
+	b, err := SelectBackend(PointVolume, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_RSYNC_TARGET)
+	if err == nil {
+		t.Fatalf("SelectBackend(PointVolume, RSYNC_TARGET) = %T; want refusal", b)
 	}
-	if _, ok := b.(*RsyncBackend); !ok {
-		t.Errorf("backend type = %T, want *RsyncBackend", b)
+	if b != nil {
+		t.Errorf("backend = %v, want nil", b)
 	}
 }
 
-// NONE 是"宿主没有自带快照机制",不是"这次变更没有还原手段":copy
-// 后端是 agent 内建的,应当兜底选出来,而不是把 ApplyIntent 一并拒掉。
-func TestSelectBackend_NoneYieldsCopyBackend(t *testing.T) {
-	b, err := SelectBackend(agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE)
+// NONE 是"宿主没有自带快照机制",不是"这次变更没有还原手段":file 的
+// copy 后端是 agent 内建的,与宿主能力无关。
+func TestSelectBackend_NoneYieldsCopyBackendForFile(t *testing.T) {
+	b, err := SelectBackend(PointFile, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE)
 	if err != nil {
 		t.Fatalf("NONE 应给出 copy 后端: %v", err)
 	}
@@ -55,10 +90,9 @@ func TestSelectBackend_NoneYieldsCopyBackend(t *testing.T) {
 	}
 }
 
-// UNSPECIFIED 是能力枚举的零值(从未探测过)。既然宿主能力不再决定
-// 回滚点,零值同样落到内建的 copy 后端。
-func TestSelectBackend_UnspecifiedYieldsCopyBackend(t *testing.T) {
-	b, err := SelectBackend(agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_UNSPECIFIED)
+// UNSPECIFIED 是能力枚举的零值(从未探测过)。file 仍走 copy。
+func TestSelectBackend_UnspecifiedYieldsCopyBackendForFile(t *testing.T) {
+	b, err := SelectBackend(PointFile, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_UNSPECIFIED)
 	if err != nil {
 		t.Fatalf("UNSPECIFIED 应给出 copy 后端: %v", err)
 	}
@@ -67,22 +101,12 @@ func TestSelectBackend_UnspecifiedYieldsCopyBackend(t *testing.T) {
 	}
 }
 
-// TestSelectBackend_DeferredCapabilities_ReturnsError covers
-// the LVM / snapper enum values (and any future proto addition
-// the agent doesn't know). The agent MUST refuse these too —
-// silently picking no backend for an unsupported capability
-// would look identical to NONE on the wire, but we want the
-// audit / control-plane UI to be able to distinguish "we know
-// about this but deferred to P0.6+" from "we probed and found
-// nothing" so the upgrade signal is preserved.
+// 未知枚举值不能猜:PointVolume 上不认识的能力必须拒绝,拿错后端会动错宿主。
 func TestSelectBackend_DeferredCapabilities_ReturnsError(t *testing.T) {
-	// The current proto doesn't define LVM / snapper values
-	// (deferred to daedalus-agent#8); use a high-numbered unknown
-	// enum value to exercise the default branch.
 	unknown := agentv1.SnapshotCapability(99)
-	b, err := SelectBackend(unknown)
+	b, err := SelectBackend(PointVolume, unknown)
 	if err == nil {
-		t.Fatal("SelectBackend(unknown): nil err; want error")
+		t.Fatal("SelectBackend(volume, unknown): nil err; want error")
 	}
 	if b != nil {
 		t.Errorf("backend = %v, want nil", b)
@@ -91,9 +115,7 @@ func TestSelectBackend_DeferredCapabilities_ReturnsError(t *testing.T) {
 
 // --- LVM-snap / snapper 后端(Task 8)----------------------------------------
 
-// 探测链顺序:System.Detector 报哪个能力,SelectBackend 就选哪个后端。
-// "snapper present" 指能力已被探测为 SNAPSHOT_SNAPPER —— 该分支必须存在,
-// 且不能被 deferred 兜底吞掉。
+// 探测链顺序:System.Detector 报哪个能力,PointVolume 就选哪个后端。
 func TestSelectBackend_PrefersSnapperWhenPresent(t *testing.T) {
 	cases := []struct {
 		name string
@@ -103,11 +125,10 @@ func TestSelectBackend_PrefersSnapperWhenPresent(t *testing.T) {
 		{"btrfs", agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_BTRFS_SUBVOLUME, &BtrfsBackend{}},
 		{"snapper", agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_SNAPSHOT_SNAPPER, &snapperBackend{}},
 		{"lvm-snap", agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_LVM_SNAP, &lvmSnapBackend{}},
-		{"rsync", agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_RSYNC_TARGET, &RsyncBackend{}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			b, err := SelectBackend(tc.cap)
+			b, err := SelectBackend(PointVolume, tc.cap)
 			if err != nil {
 				t.Fatalf("SelectBackend(%v): unexpected err: %v", tc.cap, err)
 			}
@@ -118,9 +139,9 @@ func TestSelectBackend_PrefersSnapperWhenPresent(t *testing.T) {
 	}
 }
 
-// 宿主有 LVM thin-pool(能力探测为 LVM_SNAP)时选中 lvm-snap 后端。
+// 宿主有 LVM 卷组(能力探测为 LVM_SNAP)时,卷级回滚点选中 lvm-snap 后端。
 func TestSelectBackend_LVMSnapWhenThinPoolPresent(t *testing.T) {
-	b, err := SelectBackend(agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_LVM_SNAP)
+	b, err := SelectBackend(PointVolume, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_LVM_SNAP)
 	if err != nil {
 		t.Fatalf("SelectBackend(LVM_SNAP): unexpected err: %v", err)
 	}
@@ -129,10 +150,10 @@ func TestSelectBackend_LVMSnapWhenThinPoolPresent(t *testing.T) {
 	}
 }
 
-// 未知枚举仍拒绝:NONE / UNSPECIFIED 有内建后端兜底,但"未来 proto 新增
-// 而本 agent 不认识的能力"不能猜 —— 猜错会拿错的后端去动宿主。
+// 未知枚举仍拒绝:NONE 对 file 有内建后端兜底,但"未来 proto 新增而本
+// agent 不认识的能力"不能猜 —— 猜错会拿错的后端去动宿主。
 func TestSelectBackend_RefusesUnknownCapability(t *testing.T) {
-	b, err := SelectBackend(agentv1.SnapshotCapability(99))
+	b, err := SelectBackend(PointVolume, agentv1.SnapshotCapability(99))
 	if err == nil {
 		t.Fatalf("SelectBackend(unknown): nil err; want refusal")
 	}
