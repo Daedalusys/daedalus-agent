@@ -508,6 +508,44 @@ func TestApplyIntent_LowRiskWithoutRollbackPoint_Allowed(t *testing.T) {
 	}
 }
 
+// TestApplyIntent_LowRiskWithoutRollbackPoint_ProductionBackendPath 钉住**生产
+// 路径**:不注入 backend(`s.backend == nil`,handler 自己调 rollback.SelectBackend)
+// 时,低危 package 仍必须放行 —— 它根本不建快照,不该被"选不出后端"挡住。
+//
+// 2026-11-12 真机回归(vma/AlmaLinux 9 + LVM 宿主):低危 package 被
+// `backend_unavailable: this kind has no rollback point` 拒。上面那条注入
+// backend 的用例短路了 selectedBackend,测不到这条。
+func TestApplyIntent_LowRiskWithoutRollbackPoint_ProductionBackendPath(t *testing.T) {
+	var got *agentv1.ApplyIntentRequest
+	rig := startTestServerFull(t, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_LVM_SNAP, nil,
+		func(d *rpc.ServiceDeps) {
+			d.Backend = nil // 生产路径:让 handler 自己选后端
+			d.TxFactory = successTxFactory(&got)
+		})
+	defer rig.Cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := rig.Client.Register(ctx, &agentv1.RegisterRequest{AgentId: "agent-test-1"}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	resp, err := rig.Client.ApplyIntent(ctx, &agentv1.ApplyIntentRequest{
+		IntentId:  "i2-prod",
+		Kind:      "package",
+		Target:    "nginx",
+		RiskClass: agentv1.RiskClass_RISK_CLASS_LOW,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.GetResult() == agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_REFUSED_SNAPSHOT_CAPABILITY_NONE {
+		t.Fatalf("低危 package 应放行, got REFUSED: %q", resp.GetErrorMessage())
+	}
+	if got == nil {
+		t.Fatal("intent 没有进入事务")
+	}
+}
+
 // 高危 + 有回滚点(file)→ 放行。file 是唯一有回滚点的 kind。
 func TestApplyIntent_HighRiskWithRollbackPoint_Allowed(t *testing.T) {
 	var got *agentv1.ApplyIntentRequest

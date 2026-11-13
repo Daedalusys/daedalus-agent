@@ -388,6 +388,46 @@ func TestLocal_Run_FileKind_SnapshotsTargetAndRestores(t *testing.T) {
 	}
 }
 
+// PointNone 的 intent 不得调用 CreateSnapshot:package / service / 表外
+// kind 都改的是宿主状态,文件级副本救不了,拍了只会给"已回滚"提供口径。
+func TestLocal_PointNoneNeverCallsCreateSnapshot(t *testing.T) {
+	for _, kind := range []string{"package", "service", "unknown.kind"} {
+		t.Run(kind, func(t *testing.T) {
+			backend := &txMockBackend{}
+			tx := New(backend, (&txSpyApply{}).Fn, t.TempDir(), nil, nil)
+
+			if _, err := tx.Run(context.Background(), &agentv1.ApplyIntentRequest{
+				IntentId: "i-" + kind, Kind: kind, Target: "x",
+			}); err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if backend.createCalls != 0 {
+				t.Errorf("PointNone kind=%s CreateSnapshot calls = %d, want 0", kind, backend.createCalls)
+			}
+			if backend.restoreCalls != 0 {
+				t.Errorf("PointNone kind=%s Restore calls = %d, want 0", kind, backend.restoreCalls)
+			}
+		})
+	}
+}
+
+// PointFile 的快照源必须是被改路径本体。
+func TestLocal_PointFileUsesIntentTargetAsSource(t *testing.T) {
+	backend := &txMockBackend{}
+	tx := New(backend, (&txSpyApply{}).Fn, t.TempDir(), nil, nil)
+
+	intent := fileIntent(t, "i-pointfile")
+	if _, err := tx.Run(context.Background(), intent); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if backend.createCalls != 1 {
+		t.Fatalf("PointFile CreateSnapshot calls = %d, want 1", backend.createCalls)
+	}
+	if backend.lastSrc != intent.Target {
+		t.Errorf("快照源 = %q, want intent.Target %q", backend.lastSrc, intent.Target)
+	}
+}
+
 // TestLocal_AuditEmitsOnSuccess covers T7's primary contract:
 // a successful ApplyIntent MUST write a hash-chained audit
 // event with tool="apply_intent.success", outcome="ok", and
@@ -799,5 +839,40 @@ func TestLocal_Run_NonFileKindLeavesNoArtifacts(t *testing.T) {
 			names = append(names, e.Name())
 		}
 		t.Errorf("package kind 不该留下产物, got %v", names)
+	}
+}
+
+// 有回滚点却没有后端:装配错误必须当场失败,不能拖到 CreateSnapshot 上空指针。
+func TestLocal_NilBackendWithRollbackPointFailsClosed(t *testing.T) {
+	apply := &txSpyApply{}
+	tx := New(nil, apply.Fn, t.TempDir(), nil, nil)
+
+	_, err := tx.Run(context.Background(), &agentv1.ApplyIntentRequest{
+		IntentId: "i-nil-backend", Kind: "file", Target: "/etc/app.conf",
+	})
+	if err == nil {
+		t.Fatal("nil backend + file intent: nil err; want fail-closed error")
+	}
+	if apply.calls != 0 {
+		t.Errorf("apply 被调用 %d 次,应在快照之前就失败", apply.calls)
+	}
+}
+
+// 没有回滚点的 kind:backend 为 nil 是正常的,不得报错(低危照常执行)。
+func TestLocal_NilBackendWithoutRollbackPointRuns(t *testing.T) {
+	apply := &txSpyApply{}
+	tx := New(nil, apply.Fn, t.TempDir(), nil, nil)
+
+	resp, err := tx.Run(context.Background(), &agentv1.ApplyIntentRequest{
+		IntentId: "i-nil-backend-pkg", Kind: "package", Target: "nginx",
+	})
+	if err != nil {
+		t.Fatalf("PointNone + nil backend 不该报错: %v", err)
+	}
+	if resp == nil {
+		t.Fatal("resp 为 nil")
+	}
+	if apply.calls != 1 {
+		t.Errorf("apply 次数 = %d, want 1", apply.calls)
 	}
 }

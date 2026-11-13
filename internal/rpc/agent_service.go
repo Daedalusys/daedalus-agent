@@ -217,13 +217,13 @@ func (s *agentService) pendingIntentCount() int {
 // the agent selects via rollback.SelectBackend based on the
 // live detector capability.
 //
-// NONE / UNSPECIFIED 落到内建的 copy 后端,未知枚举值返回错误。
-// 这次变更有没有回滚点不在这一层判定(见 internal/rollback.PointFor)。
-func (s *agentService) selectedBackend() (rollback.Backend, error) {
+// 回滚点形态由调用方传入(PointFor 已在 handler 里算过),宿主能力才从
+// detector 取:PointFile 恒走 copy,能力只在 PointVolume 时参与选择。
+func (s *agentService) selectedBackend(point rollback.Point) (rollback.Backend, error) {
 	if s.backend != nil {
 		return s.backend, nil
 	}
-	return rollback.SelectBackend(s.snapshot.Capability())
+	return rollback.SelectBackend(point, s.snapshot.Capability())
 }
 
 // buildTx 构造每次 ApplyIntent 的事务:测试注入的 txFactory 优先,否则走

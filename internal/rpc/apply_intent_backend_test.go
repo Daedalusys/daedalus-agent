@@ -2,19 +2,47 @@ package rpc
 
 import (
 	"context"
-	"strings"
+	"sync/atomic"
 	"testing"
 
 	agentv1 "github.com/Daedalusys/daedalus-sdk/proto/agent/v1"
 
 	"github.com/Daedalusys/daedalus-agent/internal/audit"
 	"github.com/Daedalusys/daedalus-agent/internal/config"
+	"github.com/Daedalusys/daedalus-agent/internal/rollback"
 	"github.com/Daedalusys/daedalus-agent/internal/snapshot"
+	"github.com/Daedalusys/daedalus-agent/internal/tx"
 )
 
-// 畸形 detector 状态(未来 proto 新增枚举而本 agent 不认识)必须被拒并落链,
-// 而不是掉进"best-effort"或直接 panic。
-func TestApplyIntent_BackendSelectionFailureWritesAuditEvent(t *testing.T) {
+// stubTx 记录收到的 intent 并直接成功:本文件只验准入与后端选择的接线,
+// 不验事务状态机(那是 internal/tx 的事)。
+type stubTx struct{ seen **agentv1.ApplyIntentRequest }
+
+func (s stubTx) Run(_ context.Context, req *agentv1.ApplyIntentRequest) (*agentv1.ApplyIntentResponse, error) {
+	if s.seen != nil {
+		*s.seen = req
+	}
+	return &agentv1.ApplyIntentResponse{
+		Result: agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_SUCCESS,
+		TxId:   "tx-" + req.IntentId,
+	}, nil
+}
+
+func stubTxFactory(seen **agentv1.ApplyIntentRequest) TxFactory {
+	return func(rollback.Backend, string, *atomic.Uint64, *audit.Local) tx.Tx {
+		return stubTx{seen: seen}
+	}
+}
+
+// 无回滚点的 kind **不进后端选择**:它根本不建快照,所以「选不出后端」不该
+// 成为拒绝理由(D9:低危不因缺回滚点被拒)。
+//
+// 2026-11-12 真机回归:这里曾经断言「service 走到 selectedBackend 必须以
+// backend_unavailable 终局」,把 D9 与「PointNone 也选后端」的矛盾当成契约钉住
+// 了,vma(AlmaLinux 9)上的低危 package 因此被拒。现在钉的是正面契约:照常
+// 进事务、链上不出现 backend_unavailable、pending 归零。未知能力(99)也不该
+// 影响 PointNone —— 没有回滚点就不看能力。
+func TestApplyIntent_PointNoneSkipsBackendSelectionAndRuns(t *testing.T) {
 	dir := t.TempDir()
 	auditLog, err := audit.New(dir)
 	if err != nil {
@@ -22,81 +50,67 @@ func TestApplyIntent_BackendSelectionFailureWritesAuditEvent(t *testing.T) {
 	}
 	det := snapshot.NewDetector()
 	det.SetCapability(agentv1.SnapshotCapability(99))
-	svc := newAgentService(&config.Config{DataDir: dir}, nil, det, nil, nil, nil, auditLog)
+	var got *agentv1.ApplyIntentRequest
+	svc := newAgentService(&config.Config{DataDir: dir}, nil, det, nil, nil, stubTxFactory(&got), auditLog)
 
 	resp, err := svc.ApplyIntent(context.Background(), &agentv1.ApplyIntentRequest{
-		IntentId: "intent-bad-backend", Kind: "service", Target: "nginx.service",
+		IntentId: "intent-point-none", Kind: "service", Target: "nginx.service",
+		RiskClass: agentv1.RiskClass_RISK_CLASS_LOW,
 	})
 	if err != nil {
 		t.Fatalf("ApplyIntent: %v", err)
 	}
-	if resp.Result != agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_REFUSED_SNAPSHOT_CAPABILITY_NONE {
-		t.Fatalf("Result = %v, want REFUSED_SNAPSHOT_CAPABILITY_NONE", resp.Result)
+	if resp.Result == agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_REFUSED_SNAPSHOT_CAPABILITY_NONE {
+		t.Fatalf("低危 service 应放行, got REFUSED: %q", resp.GetErrorMessage())
+	}
+	if got == nil {
+		t.Fatal("intent 没有进入事务")
+	}
+	if n := svc.pendingIntentCount(); n != 0 {
+		t.Errorf("pending = %d, want 0(事务已收尾)", n)
 	}
 
-	events, final, err := auditLog.Since(0)
+	events, _, err := auditLog.Since(0)
 	if err != nil {
 		t.Fatalf("audit.Since: %v", err)
 	}
-	if final != 1 || len(events) != 1 {
-		t.Fatalf("chain events = %d (final %d), want 1 (final 1)", len(events), final)
-	}
-	ev := events[0]
-	if ev.Tool != "apply_intent.backend_unavailable" {
-		t.Errorf("tool = %q, want apply_intent.backend_unavailable", ev.Tool)
-	}
-	if ev.Identity != "intent-bad-backend" {
-		t.Errorf("identity = %q, want intent-bad-backend", ev.Identity)
-	}
-	if !strings.Contains(ev.Outcome, "backend_unavailable:") {
-		t.Errorf("outcome = %q, must be prefixed backend_unavailable:", ev.Outcome)
-	}
-	if !strings.Contains(ev.Outcome, "unsupported snapshot capability") {
-		t.Errorf("outcome = %q, must carry the SelectBackend error", ev.Outcome)
-	}
-	if ev.Args["target"] != "nginx.service" || ev.Args["kind"] != "service" {
-		t.Errorf("args = %+v, want target=nginx.service kind=service", ev.Args)
-	}
-	if ev.Args["error"] == "" {
-		t.Error("args[error] empty; the raw backend-selection error must be preserved")
+	for _, ev := range events {
+		if ev.Tool == "apply_intent.backend_unavailable" {
+			t.Errorf("PointNone 不该产生 backend_unavailable 事件, got %+v", ev)
+		}
 	}
 }
 
-func TestApplyIntent_BackendSelectionFailureNilAuditDoesNotPanic(t *testing.T) {
+// 无回滚点 + 未配置审计链:照常进事务,不得 panic(recordOutcome 在 nil 链上跳过)。
+func TestApplyIntent_PointNoneNilAuditDoesNotPanic(t *testing.T) {
+	det := snapshot.NewDetector()
+	det.SetCapability(agentv1.SnapshotCapability(99))
+	var got *agentv1.ApplyIntentRequest
+	svc := newAgentService(&config.Config{DataDir: t.TempDir()}, nil, det, nil, nil, stubTxFactory(&got), nil)
+
+	resp, err := svc.ApplyIntent(context.Background(), &agentv1.ApplyIntentRequest{
+		IntentId: "intent-point-none-nil-audit", Kind: "service", Target: "nginx.service",
+		RiskClass: agentv1.RiskClass_RISK_CLASS_LOW,
+	})
+	if err != nil {
+		t.Fatalf("ApplyIntent: %v", err)
+	}
+	if resp.Result == agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_REFUSED_SNAPSHOT_CAPABILITY_NONE {
+		t.Errorf("低危 service 应放行, got REFUSED: %q", resp.GetErrorMessage())
+	}
+	if got == nil {
+		t.Fatal("intent 没有进入事务")
+	}
+}
+
+// selectedBackend 把回滚点形态转发给 SelectBackend:PointVolume + 未知
+// 能力必须拒绝。本期 PointVolume 无 producer,这里钉的是 RPC 层转发契约。
+func TestSelectedBackend_RefusesUnknownCapabilityForVolume(t *testing.T) {
 	det := snapshot.NewDetector()
 	det.SetCapability(agentv1.SnapshotCapability(99))
 	svc := newAgentService(&config.Config{DataDir: t.TempDir()}, nil, det, nil, nil, nil, nil)
 
-	resp, err := svc.ApplyIntent(context.Background(), &agentv1.ApplyIntentRequest{
-		IntentId: "intent-bad-backend-nil", Kind: "service", Target: "nginx.service",
-	})
-	if err != nil {
-		t.Fatalf("ApplyIntent: %v", err)
-	}
-	if resp.Result != agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_REFUSED_SNAPSHOT_CAPABILITY_NONE {
-		t.Errorf("Result = %v, want REFUSED_SNAPSHOT_CAPABILITY_NONE", resp.Result)
-	}
-	if resp.AuditSeq != 1 {
-		t.Errorf("AuditSeq = %d, want 1", resp.AuditSeq)
-	}
-}
-
-func TestApplyIntent_BackendSelectionFailureIsNotPending(t *testing.T) {
-	dir := t.TempDir()
-	auditLog, err := audit.New(dir)
-	if err != nil {
-		t.Fatalf("audit.New: %v", err)
-	}
-	det := snapshot.NewDetector()
-	det.SetCapability(agentv1.SnapshotCapability(99))
-	svc := newAgentService(&config.Config{DataDir: dir}, nil, det, nil, nil, nil, auditLog)
-
-	if _, err := svc.ApplyIntent(context.Background(), &agentv1.ApplyIntentRequest{
-		IntentId: "intent-bad-backend-pending", Kind: "service", Target: "nginx.service",
-	}); err != nil {
-		t.Fatalf("ApplyIntent: %v", err)
-	}
-	if got := svc.pendingIntentCount(); got != 0 {
-		t.Errorf("pending = %d, want 0 (backend failure ends the RPC before beginIntent)", got)
+	if _, err := svc.selectedBackend(rollback.PointVolume); err == nil {
+		t.Fatal("selectedBackend(PointVolume, unknown): nil err; want refusal")
 	}
 }

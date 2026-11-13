@@ -7,10 +7,10 @@
 //   - copy 后端(CopyBackend)是生产路径。纯 Go 单文件副本,不依赖宿主
 //     上的任何二进制;回滚点由 kind 决定(目前只有 file)。
 //   - btrfs / rsync / lvm / snapper 是宿主自带机制,对应 BtrfsBackend /
-//     RsyncBackend / lvmSnapBackend / snapperBackend。它们的代码保留,
-//     但 MVP 不再探测、不再选中(见 daedalus-agent#8):通用云镜像的根
-//     文件系统是 ext4 / xfs,btrfs subvolume snapshot 又要求源本身是子卷。
-//     把它们留在 SelectBackend 里是为了扩展时能接回来。
+//     RsyncBackend / lvmSnapBackend / snapperBackend。snapshot 包会探测并
+//     上报它们,但只有 PointVolume 才把它们选进回滚路径;PointVolume 本期
+//     没有 producer(卷级还原归 atomic 侧,见 daedalus-agent#8)。rsync
+//     只复制文件,即便 PointVolume 也不选它。
 //
 // 包内沿用 hook 替换惯例:多数测试只需替换包级 `runCommand`;另有
 // `runCommandOutput` 覆盖"答案在 stdout 里"的命令(snapper 会打印刚建的
@@ -91,29 +91,35 @@ type Backend interface {
 	Restore(snapshotPath, targetPath string) error
 }
 
-// SelectBackend 把快照能力映射到具体的回滚后端。
+// SelectBackend 把「回滚点形态 + 宿主能力」映射到具体的回滚后端。
 //
-// NONE / UNSPECIFIED 落到内建的 copy 后端:能力字段只描述"宿主自带什么
-// 机制",而回滚点是按 kind 判的 —— 宿主没装 btrfs 不等于这次变更没有
-// 还原手段。宿主自带机制(BTRFS / RSYNC / LVM / SNAPPER)的分支保持原样,
-// 但生产路径不再走到它们(探测已停用),留作扩展。
+// 两个输入的分工:
 //
-// 未知枚举值(未来 proto 新增而本 agent 不认识的)仍然拒绝,不猜:猜错会
-// 拿错的后端去动宿主。
-func SelectBackend(capability agentv1.SnapshotCapability) (Backend, error) {
-	switch capability {
-	case agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_BTRFS_SUBVOLUME:
-		return &BtrfsBackend{}, nil
-	case agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_RSYNC_TARGET:
-		return &RsyncBackend{}, nil
-	case agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_LVM_SNAP:
-		return &lvmSnapBackend{}, nil
-	case agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_SNAPSHOT_SNAPPER:
-		return &snapperBackend{}, nil
-	case agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE,
-		agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_UNSPECIFIED:
+//   - Point 决定"这次变更有没有还原手段"。PointFile 恒走内建的 copy 后端,
+//     与宿主能力无关 —— 把文件路径喂给 lvcreate 会被 lvm.go 的 /dev/ 守卫
+//     拒绝,进而让 LVM 宿主上的所有 file intent 直接坏掉。
+//   - capability 只在 PointVolume 时有发言权:它回答"用哪种宿主手段还原"。
+//
+// PointNone 一律拒绝;PointVolume 上不认识的能力也拒绝,不猜:猜错会拿
+// 错的后端去动宿主。rsync 只能复制文件,覆盖不了卷级状态,因此也不接受。
+func SelectBackend(point Point, capability agentv1.SnapshotCapability) (Backend, error) {
+	switch point {
+	case PointFile:
 		return &CopyBackend{}, nil
+	case PointVolume:
+		switch capability {
+		case agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_LVM_SNAP:
+			return &lvmSnapBackend{}, nil
+		case agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_SNAPSHOT_SNAPPER:
+			return &snapperBackend{}, nil
+		case agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_BTRFS_SUBVOLUME:
+			return &BtrfsBackend{}, nil
+		default:
+			return nil, fmt.Errorf("rollback: volume rollback point needs a volume-capable host snapshot mechanism, got %v; refuse", capability)
+		}
+	case PointNone:
+		return nil, fmt.Errorf("rollback: this kind has no rollback point; refuse")
 	default:
-		return nil, fmt.Errorf("rollback: unsupported snapshot capability %v; refuse", capability)
+		return nil, fmt.Errorf("rollback: unknown rollback point %v; refuse", point)
 	}
 }

@@ -70,7 +70,7 @@ func TestApplyIntent_ConcurrentRefusalsKeepChainIntact(t *testing.T) {
 	}
 }
 
-func TestReportStatus_IncludesBackendUnavailableOutcome(t *testing.T) {
+func TestReportStatus_IncludesServiceApplyFailureOutcome(t *testing.T) {
 	dir := t.TempDir()
 	auditLog, err := audit.New(dir)
 	if err != nil {
@@ -88,8 +88,10 @@ func TestReportStatus_IncludesBackendUnavailableOutcome(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReportStatus: %v", err)
 	}
-	if len(resp.Events) != 1 || resp.Events[0].EventType != "apply_intent.backend_unavailable" {
-		t.Fatalf("events = %+v, want one apply_intent.backend_unavailable", resp.Events)
+	// PointNone 不进后端选择,所以这条链上记的是事务自己的结局:service.set 缺
+	// spec_json → 执行器 fail-closed 成 persistent failure(不再是 backend_unavailable)。
+	if len(resp.Events) != 1 || resp.Events[0].EventType != "apply_intent.failure" {
+		t.Fatalf("events = %+v, want one apply_intent.failure", resp.Events)
 	}
 	if resp.FinalSeq != 1 {
 		t.Errorf("FinalSeq = %d, want 1", resp.FinalSeq)

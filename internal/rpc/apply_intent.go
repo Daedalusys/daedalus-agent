@@ -89,11 +89,17 @@ func (s *agentService) ApplyIntent(ctx context.Context, req *agentv1.ApplyIntent
 		return s.refuseIntent(req, "apply_intent.refused", fmt.Sprintf("refused: high-risk intent on a kind without rollback point: kind=%s", req.Kind), nil), nil
 	}
 
-	// 3. 其余放行。copy 后端是纯 Go 内建的,选不出来只可能是配置错误;
-	// 带病往下跑会把一次确定的失败拖成宿主状态未知。
-	backend, err := s.selectedBackend()
-	if err != nil {
-		return s.refuseIntent(req, "apply_intent.backend_unavailable", fmt.Sprintf("backend_unavailable: %v", err), map[string]string{"error": err.Error()}), nil
+	// 3. 其余放行。只有**存在回滚点**的 intent 才需要后端:file 恒走内建
+	// copy,卷级(v0 无 producer)才看宿主能力。低危 + 无回滚点的 intent 根本
+	// 不建快照,这里若也去选后端,就会把"没有回滚点"错判成"配置错误",把整条
+	// 低危腿拒掉(真机回归:vma/AlmaLinux 9 上低危 package 就是这么被拒的)。
+	var backend rollback.Backend
+	if point != rollback.PointNone {
+		var berr error
+		backend, berr = s.selectedBackend(point)
+		if berr != nil {
+			return s.refuseIntent(req, "apply_intent.backend_unavailable", fmt.Sprintf("backend_unavailable: %v", berr), map[string]string{"error": berr.Error()}), nil
+		}
 	}
 
 	// pending 只覆盖真正进入事务的 intent:准入拒绝已终结,不该把

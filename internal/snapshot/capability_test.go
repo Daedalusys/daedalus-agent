@@ -1,14 +1,15 @@
 // Tests for the snapshot backend capability probe.
 //
-// Detect() 恒报 NONE:宿主自带机制(btrfs / rsync / lvm / snapper)不再参与
-// 回滚点判定,copy 后端是 agent 内建的。probeBtrfs / probeRsync 保留给
-// 扩展复用,所以这里直接测它们,而不是让空转的 Detect 把测试也带空。
+// Detect() 恢复真实探测:宿主自带机制按 snapper > lvm > btrfs > rsync 的
+// 优先级上报。探针之间是包级变量缝,测试替换它们即可,不碰真机。
 package snapshot
 
 import (
 	"bytes"
 	"errors"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -32,9 +33,7 @@ func resetHooks(t *testing.T) {
 
 // captureStderr swaps log's default writer with an in-memory
 // buffer for the duration of fn, then returns whatever the agent
-// emitted. The agent uses the standard log package (per T1-T3);
-// rerouting the package writer is the least invasive way to
-// assert that the RF3 WARN was emitted.
+// emitted.
 func captureStderr(t *testing.T, fn func()) string {
 	t.Helper()
 	origOut := log.Writer()
@@ -53,71 +52,166 @@ func captureStderr(t *testing.T, fn func()) string {
 	return buf.String()
 }
 
-// Detect 必须给出一个与宿主无关的答案:宿主装了 btrfs 或 rsync 也不改变
-// 结果。能力字段只报"宿主自带机制",而 MVP 明确不依赖它们。
-func TestDetect_ReportsNoneRegardlessOfHost(t *testing.T) {
-	resetHooks(t)
-	// 让宿主看起来"什么都有":若 Detect 还敢探测,它会拿到 btrfs 的
-	// 非空输出,从而报 BTRFS —— 断言随即失败。
-	execLookPath = func(string) (string, error) { return "/usr/bin/whatever", nil }
-	runCommandOutput = func(string, ...string) ([]byte, error) {
-		return []byte("subvolume show response\n"), nil
-	}
-
-	if got := Detect(); got != agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE {
-		t.Errorf("Detect() = %v, want NONE(宿主机制不再探测)", got)
+// stubProbes 把四个探针换成返回常量的 fake,并返回还原函数。
+func stubProbes(t *testing.T, snapper, lvm, btrfs, rsync bool) func() {
+	t.Helper()
+	origSnapper, origLVM, origBtrfs, origRsync := probeSnapper, probeLVM, probeBtrfs, probeRsync
+	probeSnapper = func() (bool, error) { return snapper, nil }
+	probeLVM = func() (bool, error) { return lvm, nil }
+	probeBtrfs = func() (bool, error) { return btrfs, nil }
+	probeRsync = func() (bool, error) { return rsync, nil }
+	return func() {
+		probeSnapper = origSnapper
+		probeLVM = origLVM
+		probeBtrfs = origBtrfs
+		probeRsync = origRsync
 	}
 }
 
-// Detect 不得触碰宿主:一次 exec 都不该发生。这不只是性能问题 —— 探测
-// 会把"宿主能力"重新变成 ApplyIntent 的隐性前提,而那正是要拆掉的耦合。
-func TestDetect_DoesNotProbeHost(t *testing.T) {
+// Detect 的优先级钉死:snapper > lvm > btrfs > rsync > none。
+func TestDetectPriority(t *testing.T) {
+	cases := []struct {
+		name                       string
+		snapper, lvm, btrfs, rsync bool
+		want                       agentv1.SnapshotCapability
+	}{
+		{"snapper 优先于 btrfs", true, false, true, true, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_SNAPSHOT_SNAPPER},
+		{"lvm 优先于 btrfs", false, true, true, true, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_LVM_SNAP},
+		{"只有 btrfs", false, false, true, false, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_BTRFS_SUBVOLUME},
+		{"只有 rsync", false, false, false, true, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_RSYNC_TARGET},
+		{"什么都没有", false, false, false, false, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			restore := stubProbes(t, c.snapper, c.lvm, c.btrfs, c.rsync)
+			defer restore()
+			if got := Detect(); got != c.want {
+				t.Errorf("Detect() = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// Detect 仍要留一行能力日志:操作员读 journald 时要能看见上报值。
+func TestDetectLogsCapability(t *testing.T) {
+	restore := stubProbes(t, false, false, false, false)
+	defer restore()
+
+	var got agentv1.SnapshotCapability
+	stderr := captureStderr(t, func() { got = Detect() })
+	if got != agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE {
+		t.Fatalf("Detect() = %v, want NONE", got)
+	}
+	if !strings.Contains(stderr, "snapshot capability=") {
+		t.Errorf("日志 = %q, want 含 snapshot capability=", stderr)
+	}
+}
+
+// btrfs 装了但根文件系统不是 btrfs:必须报"不可用",不能因为 PATH 里有
+// 这个二进制就误判。
+func TestProbeBtrfsNeedsBtrfsRoot(t *testing.T) {
 	resetHooks(t)
 	execLookPath = func(name string) (string, error) {
-		t.Fatalf("Detect 不应探测宿主二进制: %q", name)
-		return "", errors.New("unexpected")
+		if name == "btrfs" {
+			return "/usr/sbin/btrfs", nil
+		}
+		return "", errors.New("not found")
 	}
 	runCommandOutput = func(name string, args ...string) ([]byte, error) {
-		t.Fatalf("Detect 不应运行宿主命令: %q %v", name, args)
-		return nil, errors.New("unexpected")
+		return []byte("ERROR: not a btrfs filesystem\n"), errors.New("exit status 1")
 	}
 
-	if got := Detect(); got != agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE {
-		t.Errorf("Detect() = %v, want NONE", got)
+	ok, err := probeBtrfs()
+	if err != nil {
+		t.Fatalf("probeBtrfs: %v", err)
+	}
+	if ok {
+		t.Error("probeBtrfs = true, want false (btrfs-progs 在但根不是 btrfs)")
 	}
 }
 
-// Detect 仍要留下一条说明,操作员读日志时不该以为"这台机器什么都不能
-// 回滚":NONE 说的是宿主没有自带机制。
-func TestDetectNoneEmitsRF3Warn(t *testing.T) {
+// snapper 二进制在、但缺少配置文件:不能报 SNAPSHOT_SNAPPER,否则后端
+// 建快照时才发现无配置。
+func TestProbeSnapperNeedsConfig(t *testing.T) {
+	resetHooks(t)
+	execLookPath = func(name string) (string, error) {
+		if name == "snapper" {
+			return "/usr/bin/snapper", nil
+		}
+		return "", errors.New("not found")
+	}
+	origPath := snapperConfigPath
+	snapperConfigPath = filepath.Join(t.TempDir(), "missing-root")
+	t.Cleanup(func() { snapperConfigPath = origPath })
+
+	ok, err := probeSnapper()
+	if err != nil {
+		t.Fatalf("probeSnapper: %v", err)
+	}
+	if ok {
+		t.Error("probeSnapper = true, want false (snapper 在但缺 /etc/snapper/configs/root)")
+	}
+}
+
+// 二进制与配置都在时才算可用。
+func TestProbeSnapperNeedsBinaryAndConfig(t *testing.T) {
+	resetHooks(t)
+	execLookPath = func(name string) (string, error) {
+		if name == "snapper" {
+			return "/usr/bin/snapper", nil
+		}
+		return "", errors.New("not found")
+	}
+	cfg := filepath.Join(t.TempDir(), "root")
+	if err := os.WriteFile(cfg, []byte("[root]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	origPath := snapperConfigPath
+	snapperConfigPath = cfg
+	t.Cleanup(func() { snapperConfigPath = origPath })
+
+	ok, err := probeSnapper()
+	if err != nil {
+		t.Fatalf("probeSnapper: %v", err)
+	}
+	if !ok {
+		t.Error("probeSnapper = false, want true (二进制与配置都在)")
+	}
+}
+
+// LVM 只认"有卷组":vgs 输出非空。二进制缺失/命令失败是正常结局。
+func TestProbeLVMReportsVolumeGroup(t *testing.T) {
+	resetHooks(t)
+	execLookPath = func(name string) (string, error) { return "/usr/sbin/vgs", nil }
+	runCommandOutput = func(name string, args ...string) ([]byte, error) {
+		return []byte("  vgtest\n  vgroot\n"), nil
+	}
+	ok, err := probeLVM()
+	if err != nil {
+		t.Fatalf("probeLVM: %v", err)
+	}
+	if !ok {
+		t.Error("probeLVM = false, want true (vgs 输出有卷组)")
+	}
+}
+
+func TestProbeLVMMissingBinary(t *testing.T) {
 	resetHooks(t)
 	execLookPath = func(string) (string, error) { return "", errors.New("not found") }
 	runCommandOutput = func(string, ...string) ([]byte, error) {
-		t.Fatalf("runCommandOutput should not be called when no binary is on PATH")
+		t.Fatal("vgs 不该在二进制缺失时被调用")
 		return nil, nil
 	}
-
-	var got agentv1.SnapshotCapability
-	stderr := captureStderr(t, func() {
-		got = Detect()
-	})
-
-	if got != agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE {
-		t.Fatalf("Detect() = %v, want SNAPSHOT_CAPABILITY_NONE", got)
+	ok, err := probeLVM()
+	if err != nil {
+		t.Fatalf("probeLVM: %v", err)
 	}
-	if stderr == "" {
-		t.Fatalf("Detect() did not emit a notice; operators must not read NONE as 'no rollback at all'")
-	}
-	if !strings.Contains(stderr, "snapshot") {
-		t.Errorf("notice must mention snapshot capability; got %q", stderr)
-	}
-	if strings.Contains(strings.ToLower(stderr), "best-effort") {
-		t.Errorf("notice must not use the phrase 'best-effort' alone; got %q", stderr)
+	if ok {
+		t.Error("probeLVM = true, want false (缺 vgs)")
 	}
 }
 
-// probeBtrfs 仍要能回答"这台机器的根文件系统是不是 btrfs" —— 扩展
-// (btrfs 后端)接回来时靠它。这里只验它自己的输出判定,不经 Detect。
+// probeBtrfs 仍要能回答"这台机器的根文件系统是不是 btrfs"。
 func TestProbeBtrfs_DetectsSubvolume(t *testing.T) {
 	resetHooks(t)
 	execLookPath = func(name string) (string, error) {
@@ -142,26 +236,7 @@ func TestProbeBtrfs_DetectsSubvolume(t *testing.T) {
 	}
 }
 
-// btrfs 装了但根文件系统不是 btrfs:必须报"不可用",不能因为 PATH 里有
-// 这个二进制就误判。
-func TestProbeBtrfs_NotBtrfsRoot(t *testing.T) {
-	resetHooks(t)
-	execLookPath = func(string) (string, error) { return "/usr/sbin/btrfs", nil }
-	runCommandOutput = func(string, ...string) ([]byte, error) {
-		return []byte("ERROR: not a btrfs filesystem\n"), errors.New("exit status 1")
-	}
-
-	ok, err := probeBtrfs()
-	if err != nil {
-		t.Fatalf("probeBtrfs: %v", err)
-	}
-	if ok {
-		t.Error("probeBtrfs = true, want false (根文件系统不是 btrfs)")
-	}
-}
-
-// probeRsync 仍要能回答"宿主的 rsync 可用吗"。用它自己的 --version
-// 存活探测,不经 Detect。
+// probeRsync 仍要能回答"宿主的 rsync 可用吗"。
 func TestProbeRsync_DetectsBinary(t *testing.T) {
 	resetHooks(t)
 	execLookPath = func(name string) (string, error) {

@@ -102,8 +102,9 @@ type Local struct {
 	audit    *audit.Local
 }
 
-// New constructs a Local transaction. The backend MUST be
-// non-nil (callers enforce admission upstream).
+// New constructs a Local transaction. backend 在 intent 没有回滚点
+// (PointNone)时可以是 nil —— 那种 intent 根本不建快照;一旦有回滚点却拿到
+// nil 后端,Run 会 fail-closed 报错,而不是等到 CreateSnapshot 上空指针。
 //
 // auditSeq may be nil — in that case the tx uses a private
 // counter. Production wires a shared *atomic.Uint64 so audit
@@ -144,6 +145,12 @@ func (t *Local) Run(ctx context.Context, intent *agentv1.ApplyIntentRequest) (*a
 	// 1. 按 kind 取回滚点。表外 kind 一律没有回滚点 —— 「不认识」不等于
 	// 「有还原手段」。
 	point := rollback.PointFor(intent.Kind)
+
+	// 有回滚点就必须有后端:装配错了当场失败,别等到 CreateSnapshot 上空指针。
+	// 没有回滚点时 backend 允许为 nil(handler 不给 PointNone 选后端)。
+	if point != rollback.PointNone && t.backend == nil {
+		return nil, fmt.Errorf("tx: rollback point %v needs a backend, got nil", point)
+	}
 
 	// 2. 快照路径按 intent_id 固定:同一 intent 重投时要能认出上一轮的
 	// 副本,而不是每次落一份新的。Base 挡住 intent_id 里的路径分隔符 ——
@@ -193,10 +200,10 @@ func (t *Local) Run(ctx context.Context, intent *agentv1.ApplyIntentRequest) (*a
 		cancelled := errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 		persistent := errors.Is(err, exec.ErrPersistent) || errors.Is(err, exec.ErrUnsupportedKind)
 
-		// 4a. 没有回滚点。不快照也就不还原,文案必须如实说明 —— 这句
-		// "no rollback point" 是控制面区分"已还原可重试"与"宿主状态未知"
-		// 的唯一依据。
-		if point == rollback.PointNone {
+		// 4a. 没有回滚点(PointNone,以及本期无 producer 的 PointVolume)。
+		// 不快照也就不还原,文案必须如实说明 —— 这句 "no rollback point"
+		// 是控制面区分"已还原可重试"与"宿主状态未知"的唯一依据。
+		if point != rollback.PointFile {
 			rbSeq := t.auditSeq.Add(1)
 			log.Printf("agent: tx apply failed, no rollback point: intent_id=%q kind=%q apply_err=%v audit_seq=%d",
 				intent.IntentId, intent.Kind, err, rbSeq)
