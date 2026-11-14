@@ -67,20 +67,21 @@ type Plan struct {
 
 // Hash 是计划的稳定身份(token 绑定它,admin 改了命令就得重新 PLAN)。
 //
+// 只覆盖**上了 wire 的字段**(句柄 + 每步的 kind/命令/说明/人审标记):
+// APPLY 请求里只有这些,agent 要靠它们从请求本身重算出同一个哈希。内部
+// 字段(OwnedPaths 等)不参与 —— 它们不是控制面能改的东西,而且不进
+// 请求就无法在 APPLY 时重算。
+//
 // 字段按长度前缀编码:命令/说明里出现分隔符也不会让两份不同计划撞出同一
 // 个哈希。
 func (p Plan) Hash() string {
 	h := sha256.New()
 	writeHashField(h, "handle", p.Handle)
-	writeHashField(h, "auto_ok", strconv.FormatBool(p.AutoOK))
 	for _, s := range p.Steps {
 		writeHashField(h, "kind", strconv.Itoa(int(s.Kind)))
 		writeHashField(h, "cmd", s.Command)
 		writeHashField(h, "why", s.Rationale)
 		writeHashField(h, "review", strconv.FormatBool(s.HumanReview))
-		writeHashField(h, "handle", s.Handle)
-		writeHashField(h, "paths", strings.Join(s.Paths, ","))
-		writeHashField(h, "owned", strings.Join(s.OwnedPaths, ","))
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }

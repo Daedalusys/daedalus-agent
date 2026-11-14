@@ -14,6 +14,11 @@
 package rpc
 
 import (
+	"context"
+	"crypto/rand"
+	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -105,6 +110,14 @@ type agentService struct {
 	// nil 表示走生产默认(tx.New + internal/exec 的真实执行器)。
 	txFactory TxFactory
 
+	// rollbackTokens 签发 / 校验回滚的 approve token。nil 表示回滚通道未
+	// 装配(dataDir 不可用时),RollbackIntent 一律 REFUSED。
+	rollbackTokens *rollback.TokenManager
+
+	// rollbackRunner 执行回滚步骤。接口化是为了让 PLAN 用例能断言"一条
+	// 命令都没执行"。
+	rollbackRunner RollbackRunner
+
 	// nodeID is the control-plane-assigned identifier for
 	// this agent. It is empty until the first successful
 	// Register, then stable for the daemon's lifetime. The
@@ -132,6 +145,66 @@ type agentService struct {
 // (forward-compat), the build will fail at this line — which is
 // exactly the signal we want: a proto change we must handle.
 var _ agentv1.AgentServiceServer = (*agentService)(nil)
+
+// RollbackRunner 执行一份回滚计划。
+//
+// 接口化(而不是直接用 *rollback.StepRunner)是为了让测试能注入一个只
+// 记账、不碰宿主的实现 —— PLAN 用例要断言"一步都没执行"。
+type RollbackRunner interface {
+	Run(ctx context.Context, steps []rollback.Step) error
+}
+
+// rollbackKeyFile 是 approve token 的 HMAC key 的落盘名(在 dataDir 下)。
+const rollbackKeyFile = "rollback_token.key"
+
+// loadOrCreateRollbackKey 读 <dataDir>/rollback_token.key;不存在就生成
+// 32 字节随机并以 0600 落盘。
+//
+// 权限必须是 0600:这把 key 是回滚通道的根 —— 拿到它就能给自己签 approve
+// token。
+func loadOrCreateRollbackKey(dataDir string) ([]byte, error) {
+	path := filepath.Join(dataDir, rollbackKeyFile)
+	b, err := os.ReadFile(path)
+	switch {
+	case err == nil:
+		if len(b) == 0 {
+			return nil, fmt.Errorf("rpc: rollback token key %s is empty", path)
+		}
+		return b, nil
+	case !os.IsNotExist(err):
+		return nil, fmt.Errorf("rpc: read rollback token key %s: %w", path, err)
+	}
+
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		return nil, fmt.Errorf("rpc: generate rollback token key: %w", err)
+	}
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		return nil, fmt.Errorf("rpc: mkdir %s: %w", dataDir, err)
+	}
+	if err := os.WriteFile(path, key, 0o600); err != nil {
+		return nil, fmt.Errorf("rpc: write rollback token key %s: %w", path, err)
+	}
+	return key, nil
+}
+
+// initRollbackTokens 装配回滚通道的 token 管理器。
+//
+// dataDir 为空时只把通道标成未启用(handler 一律 REFUSED),不拒绝启动:生产
+// 配置校验已经要求 data_dir,走到这里的空值只可能来自绕过校验的测试。key 文件
+// 的读写失败仍然让启动失败 —— 那是真实的 I/O 故障,悄悄降级成"永远 REFUSED"
+// 的回滚通道比启动报错更难被发现。
+func (s *agentService) initRollbackTokens() error {
+	if s.cfg == nil || s.cfg.DataDir == "" {
+		return nil
+	}
+	key, err := loadOrCreateRollbackKey(s.cfg.DataDir)
+	if err != nil {
+		return err
+	}
+	s.rollbackTokens = rollback.NewTokenManager(key)
+	return nil
+}
 
 // newAgentService constructs a fresh agentService with the
 // supplied dependencies. main() (or a test helper) calls this
@@ -163,15 +236,16 @@ func newAgentService(cfg *config.Config, certInfo *cert.Info, det *snapshot.Dete
 		auditSeq = new(atomic.Uint64)
 	}
 	return &agentService{
-		cfg:       cfg,
-		certInfo:  certInfo,
-		snapshot:  det,
-		auditSeq:  auditSeq,
-		backend:   backend,
-		txFactory: txFactory,
-		audit:     auditLog,
-		pending:   map[string]int{},
-		startedAt: time.Now().UTC(),
+		cfg:            cfg,
+		certInfo:       certInfo,
+		snapshot:       det,
+		auditSeq:       auditSeq,
+		backend:        backend,
+		txFactory:      txFactory,
+		audit:          auditLog,
+		rollbackRunner: rollback.NewStepRunner(),
+		pending:        map[string]int{},
+		startedAt:      time.Now().UTC(),
 	}
 }
 
@@ -241,5 +315,5 @@ func (s *agentService) buildTx(backend rollback.Backend, opts ...tx.Option) tx.T
 	if s.txFactory != nil {
 		return s.txFactory(backend, s.cfg.DataDir, s.auditSeq, s.audit)
 	}
-	return tx.New(backend, exec.Apply, s.cfg.DataDir, s.auditSeq, s.audit, opts...)
+	return tx.New(backend, exec.ApplyWithHandle, s.cfg.DataDir, s.auditSeq, s.audit, opts...)
 }

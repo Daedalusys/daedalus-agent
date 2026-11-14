@@ -133,7 +133,7 @@ func (r *StepRunner) Run(ctx context.Context, steps []Step) error {
 		if s.Handle != handle {
 			return fmt.Errorf("%w: step %d belongs to another handle", ErrPlanUnsupported, i)
 		}
-		if err := validateStep(s); err != nil {
+		if err := ValidateStep(s); err != nil {
 			return fmt.Errorf("rollback: step %d: %w", i, err)
 		}
 	}
@@ -158,8 +158,11 @@ func (r *StepRunner) Run(ctx context.Context, steps []Step) error {
 	return nil
 }
 
-// validateStep 校验一条步骤能不能执行。
-func validateStep(s Step) error {
+// ValidateStep 校验一条步骤能不能执行。
+//
+// 导出它是因为 RPC 层在 PLAN 阶段要校验 admin 改过的步骤:白名单、人审
+// 标记、路径归属必须与执行阶段是同一套判定。
+func ValidateStep(s Step) error {
 	if s.Kind == StepManual {
 		// MANUAL 只给文字:带命令就成了绕过白名单的后门。
 		if s.Command != "" {

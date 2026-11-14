@@ -30,6 +30,7 @@ import (
 	agentv1 "github.com/Daedalusys/daedalus-sdk/proto/agent/v1"
 
 	"github.com/Daedalusys/daedalus-agent/internal/audit"
+	"github.com/Daedalusys/daedalus-agent/internal/exec"
 	"github.com/Daedalusys/daedalus-agent/internal/filespec"
 	"github.com/Daedalusys/daedalus-agent/internal/rollback"
 	"github.com/Daedalusys/daedalus-agent/internal/tx"
@@ -85,9 +86,12 @@ func (s *agentService) ApplyIntent(ctx context.Context, req *agentv1.ApplyIntent
 		return s.refuseIntent(req, "apply_intent.refused", fmt.Sprintf("refused: unknown intent kind %q", req.Kind), nil), nil
 	}
 
-	// 2. 高危且无回滚点:拒绝。低危不因缺回滚点被拒 —— 该不该做是风险
-	// 问题,不是能力问题。
-	if point == rollback.PointNone && req.RiskClass == agentv1.RiskClass_RISK_CLASS_HIGH {
+	// 2. 高危且这个 kind 连"可能产出句柄"都谈不上:拒绝。低危不因缺回滚点
+	// 被拒 —— 该不该做是风险问题,不是能力问题。
+	//
+	// package / service 的句柄要等 apply 之后才抓得到,它们的判定放在事务
+	// 之后(见第 5 步):有句柄就放行,空句柄对高危拒绝。
+	if point == rollback.PointNone && req.RiskClass == agentv1.RiskClass_RISK_CLASS_HIGH && !exec.HandleCapable(req.Kind) {
 		return s.refuseIntent(req, "apply_intent.refused", fmt.Sprintf("refused: high-risk intent on a kind without rollback point: kind=%s", req.Kind), nil), nil
 	}
 
@@ -131,7 +135,23 @@ func (s *agentService) ApplyIntent(ctx context.Context, req *agentv1.ApplyIntent
 	defer s.endIntent(req.IntentId)
 
 	tx := s.buildTx(backend, txOpts...)
-	return tx.Run(ctx, req)
+	resp, err := tx.Run(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	// 5. 高危的 package / service:拿不到回滚锚点就不算数。
+	//
+	// 为什么放在事务之后:句柄只有执行器在 apply 之后才知道,事务之前判不了。
+	// 为什么"改判"而不是"提前拒":提前拒会把高危装包全部挡在门外 —— 那正是
+	// 这套回滚句柄要解决的事(高危变更本来就没有可承诺的回滚点)。
+	// 低危不受影响:低危变更做不做是风险问题,不是能力问题。
+	if req.RiskClass == agentv1.RiskClass_RISK_CLASS_HIGH && exec.HandleCapable(req.Kind) && resp.GetRollbackHandle() == "" {
+		return s.refuseIntent(req, "apply_intent.refused",
+			fmt.Sprintf("refused: high-risk intent applied but produced no rollback handle: kind=%s target=%s", req.Kind, req.Target),
+			map[string]string{"reason": "rollback_handle_unavailable"}), nil
+	}
+	return resp, nil
 }
 
 // recordOutcome 把一个"在进入事务之前就已终结"的 ApplyIntent 结局写进进程级

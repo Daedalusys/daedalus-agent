@@ -12,9 +12,12 @@ import (
 	"github.com/Daedalusys/daedalus-agent/internal/snapshot"
 )
 
-// highRiskRefusalOutcome 是"高危 + 无回滚点"拒绝在链上留下的 outcome。
-// package 是认识的 kind,但没有回滚点,所以高危时走准入拒绝而不是执行器。
-const highRiskRefusalOutcome = "refused: high-risk intent on a kind without rollback point: kind=package"
+// highRiskRefusalOutcome 是"高危 + package/service + 空句柄"在链上留下的
+// outcome。
+//
+// 判定落在事务之后:句柄只有 apply 之后才抓得到,所以高危 package 会先跑完
+// 事务,再由 handler 按"没有回滚锚点"改判拒绝。
+const highRiskRefusalOutcome = "refused: high-risk intent applied but produced no rollback handle: kind=package target=nginx"
 
 // 拒绝结局必须落链:tool / outcome / identity / args 四元组是控制面的
 // 分桶依据,少一个都读不出"是谁、想改什么、为什么被拒"。
@@ -26,7 +29,7 @@ func TestApplyIntent_RefusalWritesAuditEvent(t *testing.T) {
 	}
 	det := snapshot.NewDetector()
 	det.SetCapability(agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE)
-	svc := newAgentService(&config.Config{DataDir: dir}, nil, det, nil, nil, nil, auditLog)
+	svc := newAgentService(&config.Config{DataDir: dir}, nil, det, nil, nil, stubTxFactory(nil), auditLog)
 
 	resp, err := svc.ApplyIntent(context.Background(), &agentv1.ApplyIntentRequest{
 		IntentId: "intent-high-risk", Kind: "package", Target: "nginx",
@@ -101,7 +104,7 @@ func TestApplyIntent_UnknownKindRefusalWritesAuditEvent(t *testing.T) {
 func TestApplyIntent_RefusalNilAuditDoesNotPanic(t *testing.T) {
 	det := snapshot.NewDetector()
 	det.SetCapability(agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE)
-	svc := newAgentService(&config.Config{DataDir: t.TempDir()}, nil, det, nil, nil, nil, nil)
+	svc := newAgentService(&config.Config{DataDir: t.TempDir()}, nil, det, nil, nil, stubTxFactory(nil), nil)
 
 	resp, err := svc.ApplyIntent(context.Background(), &agentv1.ApplyIntentRequest{
 		IntentId: "intent-nil-audit", Kind: "package", Target: "nginx",
@@ -118,7 +121,8 @@ func TestApplyIntent_RefusalNilAuditDoesNotPanic(t *testing.T) {
 	}
 }
 
-// 拒绝不应计入 pending:beginIntent 只在事务真正开始时调用。
+// 拒绝不留 pending:高危 package 现在要先跑事务(句柄在 apply 之后才抓得到),
+// 但事务已收尾,拒绝也不该把在途计数留着。
 func TestApplyIntent_RefusalIsNotPending(t *testing.T) {
 	dir := t.TempDir()
 	auditLog, err := audit.New(dir)
@@ -127,7 +131,7 @@ func TestApplyIntent_RefusalIsNotPending(t *testing.T) {
 	}
 	det := snapshot.NewDetector()
 	det.SetCapability(agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE)
-	svc := newAgentService(&config.Config{DataDir: dir}, nil, det, nil, nil, nil, auditLog)
+	svc := newAgentService(&config.Config{DataDir: dir}, nil, det, nil, nil, stubTxFactory(nil), auditLog)
 
 	if _, err := svc.ApplyIntent(context.Background(), &agentv1.ApplyIntentRequest{
 		IntentId: "intent-pending", Kind: "package", Target: "nginx",
@@ -136,7 +140,7 @@ func TestApplyIntent_RefusalIsNotPending(t *testing.T) {
 		t.Fatalf("ApplyIntent: %v", err)
 	}
 	if got := svc.pendingIntentCount(); got != 0 {
-		t.Errorf("pending after refusal = %d, want 0 (beginIntent must not run)", got)
+		t.Errorf("pending after refusal = %d, want 0 (事务/拒绝都必须收尾)", got)
 	}
 }
 
@@ -156,7 +160,7 @@ func TestApplyIntent_AuditSeqIsNotChainSeq(t *testing.T) {
 
 	det := snapshot.NewDetector()
 	det.SetCapability(agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE)
-	svc := newAgentService(&config.Config{DataDir: dir}, nil, det, new(atomic.Uint64), nil, nil, auditLog)
+	svc := newAgentService(&config.Config{DataDir: dir}, nil, det, new(atomic.Uint64), nil, stubTxFactory(nil), auditLog)
 
 	resp, err := svc.ApplyIntent(context.Background(), &agentv1.ApplyIntentRequest{
 		IntentId: "intent-after-restart", Kind: "package", Target: "nginx",

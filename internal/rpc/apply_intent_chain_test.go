@@ -26,7 +26,9 @@ func TestApplyIntent_ConcurrentRefusalsKeepChainIntact(t *testing.T) {
 	}
 	det := snapshot.NewDetector()
 	det.SetCapability(agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE)
-	svc := newAgentService(&config.Config{DataDir: dir}, nil, det, nil, nil, nil, auditLog)
+	// 用假事务:高危 package 的准入判定在事务之后(等句柄),真事务会真的
+	// 去调宿主包管理器。
+	svc := newAgentService(&config.Config{DataDir: dir}, nil, det, nil, nil, stubTxFactory(nil), auditLog)
 
 	const n = 8
 	var wg sync.WaitGroup

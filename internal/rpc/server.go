@@ -91,6 +91,12 @@ type ServiceDeps struct {
 	// substitute a canned-response Tx.
 	TxFactory TxFactory
 
+	// RollbackRunner, if non-nil, overrides the step runner used by
+	// RollbackIntent's APPLY mode. Production leaves this nil (the
+	// production runner executes whitelisted commands); tests inject a
+	// recorder so PLAN-mode assertions can prove "nothing ran".
+	RollbackRunner RollbackRunner
+
 	// Audit is the per-process hash-chained audit log. nil is
 	// permitted — ReportStatus then returns an empty response
 	// (the documented "no audit yet" wire shape). Production
@@ -150,7 +156,16 @@ func NewServer(addr string, tlsCfg *tls.Config, deps ServiceDeps) (*Server, erro
 	}
 	creds := credentials.NewTLS(tlsCfg)
 	gs := grpc.NewServer(grpc.Creds(creds))
-	agentv1.RegisterAgentServiceServer(gs, newAgentService(deps.Cfg, deps.CertInfo, det, deps.AuditSeq, deps.Backend, deps.TxFactory, deps.Audit))
+	svc := newAgentService(deps.Cfg, deps.CertInfo, det, deps.AuditSeq, deps.Backend, deps.TxFactory, deps.Audit)
+	if deps.RollbackRunner != nil {
+		svc.rollbackRunner = deps.RollbackRunner
+	}
+	// 回滚通道的 token key 装配失败就让启动失败:降级成"永远 REFUSED"的
+	// 回滚通道比启动时报错更难被发现。
+	if err := svc.initRollbackTokens(); err != nil {
+		return nil, err
+	}
+	agentv1.RegisterAgentServiceServer(gs, svc)
 	return &Server{grpc: gs, addr: addr}, nil
 }
 
