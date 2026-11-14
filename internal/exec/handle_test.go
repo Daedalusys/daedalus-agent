@@ -90,9 +90,9 @@ func TestService_HandleCapturesPreState(t *testing.T) {
 	if !strings.HasPrefix(handle, handleService) {
 		t.Fatalf("handle = %q, want prefix %q", handle, handleService)
 	}
-	st, err := decodeServiceState(strings.TrimPrefix(handle, handleService))
+	st, err := DecodeServiceState(strings.TrimPrefix(handle, handleService))
 	if err != nil {
-		t.Fatalf("decodeServiceState: %v", err)
+		t.Fatalf("DecodeServiceState: %v", err)
 	}
 	if st.Unit != unit {
 		t.Errorf("Unit = %q, want %q", st.Unit, unit)

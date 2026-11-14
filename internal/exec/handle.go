@@ -38,11 +38,11 @@ const (
 	HandleService = "service-state"
 )
 
-// serviceState 是回滚要用的 systemd 单元**前置**状态。
+// ServiceState 是回滚要用的 systemd 单元**前置**状态。
 //
 // 只有 ActiveState / UnitFileState / SubState:回滚就是拿它们决定反向动词
 // (停 → 起 / 启用 → 禁用),别的属性与"这次变更怎么撤"无关。
-type serviceState struct {
+type ServiceState struct {
 	Unit          string `json:"unit"`
 	ActiveState   string `json:"active_state"`
 	UnitFileState string `json:"unit_file_state"`
@@ -52,7 +52,7 @@ type serviceState struct {
 // encodeServiceState 把前置状态编码成完整句柄(前缀 + JSON + base64url)。
 //
 // base64url 而不是原文:句柄要能安全地穿过 JSON / URL / shell 参数。
-func encodeServiceState(unit string, st serviceState) string {
+func encodeServiceState(unit string, st ServiceState) string {
 	st.Unit = unit
 	b, err := json.Marshal(st)
 	if err != nil {
@@ -61,15 +61,18 @@ func encodeServiceState(unit string, st serviceState) string {
 	return handleService + base64.RawURLEncoding.EncodeToString(b)
 }
 
-// decodeServiceState 是 encodeServiceState 的逆运算。
-func decodeServiceState(s string) (serviceState, error) {
+// DecodeServiceState 是 encodeServiceState 的逆运算。
+//
+// 导出它是因为 internal/rollback 生成回滚计划要按前置状态算反向动词 ——
+// 句柄的编码格式只在本包实现一处。
+func DecodeServiceState(s string) (ServiceState, error) {
 	b, err := base64.RawURLEncoding.DecodeString(s)
 	if err != nil {
-		return serviceState{}, fmt.Errorf("exec: decode service state: %v", err)
+		return ServiceState{}, fmt.Errorf("exec: decode service state: %v", err)
 	}
-	var st serviceState
+	var st ServiceState
 	if err := json.Unmarshal(b, &st); err != nil {
-		return serviceState{}, fmt.Errorf("exec: decode service state: %v", err)
+		return ServiceState{}, fmt.Errorf("exec: decode service state: %v", err)
 	}
 	return st, nil
 }

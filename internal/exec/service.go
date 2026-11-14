@@ -35,6 +35,14 @@ var serviceVerbs = map[string]string{
 // "--foo" / "/etc/passwd" / 带空白的注入串都进不来。
 var unitNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9:_.@-]*\.(service|socket|target|timer|mount|automount|path|slice|scope|swap|device)$`)
 
+// ValidUnitName 报告 name 是否是合法的 systemd 单元名。
+//
+// 白名单正则只在本包存在一份:句柄里带回来的单元名(internal/rollback 生成
+// 反向动词时要用)必须过同一道门。
+func ValidUnitName(name string) bool {
+	return unitNameRe.MatchString(name)
+}
+
 // serviceSpec 是 service.set 的 SpecJson schema。
 type serviceSpec struct {
 	DesiredState string `json:"desired_state"`
@@ -119,7 +127,7 @@ func (serviceExecutor) Apply(ctx context.Context, intent *agentv1.ApplyIntentReq
 	// 只有真动过单元才留句柄:no-op 的"回滚"会把本来就在跑的服务停掉。
 	// 这里用的 st 是上面观测到的**前置**状态,不是变更后的结果。
 	if col := collectorFrom(ctx); col != nil {
-		col.setService(encodeServiceState(unit, serviceState{
+		col.setService(encodeServiceState(unit, ServiceState{
 			ActiveState:   st.ActiveState,
 			UnitFileState: st.UnitFileState,
 			SubState:      st.SubState,
