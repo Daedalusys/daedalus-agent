@@ -233,6 +233,21 @@ func (t *Local) Run(ctx context.Context, intent *agentv1.ApplyIntentRequest) (*a
 			rbSeq := t.auditSeq.Add(1)
 			log.Printf("agent: tx cannot resolve snapshot paths: intent_id=%q err=%v audit_seq=%d",
 				intent.IntentId, perr, rbSeq)
+			// 这也是一个终局:链上不留痕,事后就分不清"没收到这个 intent"
+			// 与"收到但连快照路径都解析不出来"。
+			if t.audit != nil {
+				if _, aerr := t.audit.Log(audit.Event{
+					Identity: intent.IntentId,
+					Tool:     "apply_intent.presnapshot_failed",
+					Args: map[string]string{
+						"target": intent.Target,
+						"kind":   intent.Kind,
+					},
+					Outcome: fmt.Sprintf("presnapshot_failed: %v", perr),
+				}); aerr != nil {
+					log.Printf("agent: audit log (presnapshot_failed) failed: %v", aerr)
+				}
+			}
 			return &agentv1.ApplyIntentResponse{
 				Result:       agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_PERSISTENT_FAILURE,
 				ErrorMessage: fmt.Sprintf("directory rollback needs snapshot paths: %v", perr),

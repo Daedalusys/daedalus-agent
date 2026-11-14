@@ -1112,3 +1112,44 @@ func TestTx_TreeWithoutPathsFailsClosed(t *testing.T) {
 		t.Errorf("CreateSnapshotSet calls = %d, want 0", backend.createSetCalls)
 	}
 }
+
+// 解析不出快照路径时要留审计痕:tx 的约定是"每个终局都进链",这条新的
+// 早退分支也不能例外。
+func TestLocal_AuditEmitsOnSnapshotPathResolutionFailure(t *testing.T) {
+	dir := t.TempDir()
+	auditLog, err := audit.New(dir)
+	if err != nil {
+		t.Fatalf("audit.New: %v", err)
+	}
+	backend := &txPathSetBackend{}
+	apply := &txSpyApply{}
+	tx := New(backend, apply.Fn, dir, new(atomic.Uint64), auditLog,
+		WithSnapshotPaths(func(*agentv1.ApplyIntentRequest) ([]string, error) {
+			return nil, errors.New("spec has no named paths")
+		}))
+
+	resp, err := tx.Run(context.Background(), treeIntent(t, "intent-nopaths"))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if resp.Result != agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_PERSISTENT_FAILURE {
+		t.Errorf("Result = %v, want PERSISTENT_FAILURE", resp.Result)
+	}
+	if apply.calls != 0 {
+		t.Errorf("apply 被调用 %d 次, want 0", apply.calls)
+	}
+
+	events, _, err := auditLog.Since(0)
+	if err != nil {
+		t.Fatalf("audit.Since: %v", err)
+	}
+	found := false
+	for _, ev := range events {
+		if ev.Tool == "apply_intent.presnapshot_failed" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("链上没有 presnapshot_failed 事件, got %+v", events)
+	}
+}

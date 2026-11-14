@@ -486,3 +486,23 @@ func TestTree_CreateSnapshotSetTriggersGC(t *testing.T) {
 		t.Errorf("超过保留数后最旧的快照应被自动清理, stat err = %v", err)
 	}
 }
+
+// 字节上限是软上限:最新那份快照即便自己就超了上限也要留着 —— 它可能就是
+// 正在执行的这条 intent 的还原点,删掉等于让它裸奔。
+func TestTree_GCKeepsNewestEvenOverByteLimit(t *testing.T) {
+	dataDir, b := treeFixture(t)
+	root := t.TempDir()
+	p := filepath.Join(root, "big.conf")
+	writeFile(t, p, strings.Repeat("x", 4096), 0o644)
+	dir := treeSnapDir(dataDir, "intent-big")
+	if err := b.CreateSnapshotSet([]string{p}, dir); err != nil {
+		t.Fatalf("CreateSnapshotSet: %v", err)
+	}
+
+	if err := b.GC(20, 1); err != nil {
+		t.Fatalf("GC: %v", err)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Errorf("最新快照即便超出字节上限也必须保留: %v", err)
+	}
+}

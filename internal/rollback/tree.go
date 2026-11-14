@@ -561,7 +561,9 @@ func (t *TreeBackend) GC(maxSets int, maxBytes int64) error {
 		total -= remaining[0].size
 		remaining = remaining[1:]
 	}
-	for total > maxBytes && len(remaining) > 0 {
+	// 字节上限是软上限:至少留最新那份。它可能就是正在执行的这条 intent
+	// 的还原点,删掉等于让它没有退路。
+	for total > maxBytes && len(remaining) > 1 {
 		if err := removeSet(remaining[0]); err != nil {
 			return err
 		}
