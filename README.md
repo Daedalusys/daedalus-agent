@@ -127,10 +127,12 @@ Auto vs human review:
 - Service rollback restores the pre-apply unit state (`start`/`stop`, `enable`/`disable`); the
   verb for a dimension that did not change is a no-op.
 
-`rm -rf` is **always** `human_review_required`, only allowed for paths the package owns, and
-only behind a valid token. Ownership is never taken from the request: APPLY steps carry no
-file list, so the agent re-queries it from the handle (`apt history-info` → `dpkg-query -L`)
-and refuses the whole plan when the list cannot be re-derived. APPLY is refused when the token
+`rm -rf` is **always** `human_review_required`, and only allowed for paths dpkg records as that
+package's **conffiles** — matched exactly and cross-checked against `dpkg-query -L` (no prefix or
+directory matching: `-L` lists `/etc`, so prefix matching would allow `/etc/passwd`). Ownership is
+never taken from the request: APPLY steps carry no file list, so the agent re-queries it from the
+handle (`apt history-info` → `dpkg-query -L` + `${Conffiles}`) and refuses the whole plan when the
+records cannot be re-derived. APPLY is refused when the token
 is missing, expired, already used, bound to another plan or another intent, or when a step
 falls outside the command allowlist.
 The token proves "this APPLY is bound to that plan hash" — it does **not** prove a human read

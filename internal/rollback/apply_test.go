@@ -91,15 +91,28 @@ func TestApply_RejectsUnmarkedDestructiveStep(t *testing.T) {
 }
 
 // aptOwnedFake 伪造一台"nginx 已装"的宿主:执行期复核 rm 路径要重查
-// apt 历史(拿包名)与 dpkg 的文件清单。
+// apt 历史(拿包名)、dpkg 的 conffile 记录与文件清单。
+//
+// -L 里带目录(真机形状),所以归属判定必须精确匹配 conffile —— 按目录
+// 前缀放行会让 /etc 下的任何文件都算"包拥有"。
 func aptOwnedFake() *fakeCommands {
 	fc := newFakeCommands()
 	fc.out["apt history-info 7"] = "Commandline: apt-get install nginx\n"
-	fc.out["dpkg-query -L nginx"] = "/etc/nginx/nginx.conf\n/var/lib/nginx\n/usr/sbin/nginx\n"
+	fc.out["dpkg-query -L nginx"] = strings.Join([]string{
+		"/.",
+		"/etc",
+		"/etc/nginx",
+		"/etc/nginx/nginx.conf",
+		"/usr",
+		"/usr/sbin",
+		"/usr/sbin/nginx",
+	}, "\n") + "\n"
+	fc.out["dpkg-query -W -f=${Conffiles}\\n nginx"] =
+		" /etc/nginx/nginx.conf " + conffileMD5Nginx + "\n"
 	return fc
 }
 
-// 重查清单里有这个路径 + 标了人审 → 放行。
+// 重查到的 conffile + 标了人审 → 放行。
 func TestApply_AllowsPackageOwnedRmAfterReview(t *testing.T) {
 	fr := newFakeRunner()
 	withFakeRun(t, fr)
@@ -108,19 +121,19 @@ func TestApply_AllowsPackageOwnedRmAfterReview(t *testing.T) {
 	r := NewStepRunner()
 	err := r.Run(context.Background(), []Step{{
 		Kind:        StepFileDelete,
-		Command:     "rm -rf /var/lib/nginx",
+		Command:     "rm -rf /etc/nginx/nginx.conf",
 		HumanReview: true,
 		Handle:      "apt-history:7",
 	}})
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if got := fr.recorded(); len(got) != 1 || got[0] != "rm -rf /var/lib/nginx" {
-		t.Fatalf("calls = %v, want [rm -rf /var/lib/nginx]", got)
+	if got := fr.recorded(); len(got) != 1 || got[0] != "rm -rf /etc/nginx/nginx.conf" {
+		t.Fatalf("calls = %v, want [rm -rf /etc/nginx/nginx.conf]", got)
 	}
 }
 
-// 路径不在**重查**到的清单里 → 拒绝。句柄是包管理器给的,不该能删包以外的文件。
+// 路径不在**重查**到的记录里 → 拒绝。句柄是包管理器给的,不该能删包以外的文件。
 func TestApply_RejectsNonPackageOwnedRm(t *testing.T) {
 	fr := newFakeRunner()
 	withFakeRun(t, fr)
@@ -130,6 +143,50 @@ func TestApply_RejectsNonPackageOwnedRm(t *testing.T) {
 	err := r.Run(context.Background(), []Step{{
 		Kind:        StepFileDelete,
 		Command:     "rm -rf /etc/shadow",
+		HumanReview: true,
+		Handle:      "apt-history:7",
+	}})
+	if !errors.Is(err, ErrPathNotOwned) {
+		t.Fatalf("got %v, want ErrPathNotOwned", err)
+	}
+	if got := fr.recorded(); len(got) != 0 {
+		t.Fatalf("calls = %v, want none", got)
+	}
+}
+
+// 包拥有(文件清单里有)但不是 conffile 的文件也不能删:apt-get remove 已经
+// 处理掉非配置文件,删除步越界就是越权。
+func TestApply_RejectsOwnedButNonConffile(t *testing.T) {
+	fr := newFakeRunner()
+	withFakeRun(t, fr)
+	withFakeCommands(t, aptOwnedFake())
+
+	r := NewStepRunner()
+	err := r.Run(context.Background(), []Step{{
+		Kind:        StepFileDelete,
+		Command:     "rm -rf /usr/sbin/nginx", // 在 -L 里,但不是 conffile
+		HumanReview: true,
+		Handle:      "apt-history:7",
+	}})
+	if !errors.Is(err, ErrPathNotOwned) {
+		t.Fatalf("got %v, want ErrPathNotOwned", err)
+	}
+	if got := fr.recorded(); len(got) != 0 {
+		t.Fatalf("calls = %v, want none", got)
+	}
+}
+
+// -L 会列出 /etc 这类目录。归属判定不许按目录前缀放行,否则 /etc/passwd 也
+// 算"包拥有",整个闸门形同虚设。
+func TestApply_RejectsRmUnderOwnedDirectory(t *testing.T) {
+	fr := newFakeRunner()
+	withFakeRun(t, fr)
+	withFakeCommands(t, aptOwnedFake())
+
+	r := NewStepRunner()
+	err := r.Run(context.Background(), []Step{{
+		Kind:        StepFileDelete,
+		Command:     "rm -rf /etc/passwd", // /etc 在 -L 里,但 /etc/passwd 不是
 		HumanReview: true,
 		Handle:      "apt-history:7",
 	}})
@@ -164,11 +221,12 @@ func TestApply_IgnoresStepDeclaredOwnedPaths(t *testing.T) {
 	}
 }
 
-// 重查失败 → fail-closed:拿不到清单就不执行,不猜、不放行。
+// 重查失败 → fail-closed:拿不到证明就不执行,不猜、不放行。
 func TestApply_RejectsFileDeleteWhenOwnershipLookupFails(t *testing.T) {
 	for _, key := range []string{
 		"apt history-info 7",
 		"dpkg-query -L nginx",
+		"dpkg-query -W -f=${Conffiles}\\n nginx",
 	} {
 		t.Run(key, func(t *testing.T) {
 			fr := newFakeRunner()
@@ -180,7 +238,7 @@ func TestApply_RejectsFileDeleteWhenOwnershipLookupFails(t *testing.T) {
 			r := NewStepRunner()
 			err := r.Run(context.Background(), []Step{{
 				Kind:        StepFileDelete,
-				Command:     "rm -rf /var/lib/nginx",
+				Command:     "rm -rf /etc/nginx/nginx.conf",
 				HumanReview: true,
 				Handle:      "apt-history:7",
 			}})

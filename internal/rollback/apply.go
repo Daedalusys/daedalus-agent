@@ -218,10 +218,14 @@ func VerifyOwnership(steps []Step) error {
 	return nil
 }
 
-// verifyStepOwnership 按句柄重查包的文件清单,复核 rm 要删的路径 ⊆ 清单。
+// verifyStepOwnership 按句柄重查包的文件记录,复核 rm 要删的路径。
+//
+// 判据只有"完全相等":目标必须同时是 dpkg 记的 conffile、又精确出现在
+// dpkg-query -L 的清单里。不做前缀匹配 —— 清单里有 /etc 目录,按前缀放行
+// 会把 /etc/passwd 也算成"包拥有"。
 //
 // 为什么必须重查:APPLY 请求里的步骤只带 kind/命令/说明/人审标记,拥有清单
-// 不上 wire(它进不了 plan_hash)。所以执行期的清单只能从**包管理器自己的
+// 不上 wire(它进不了 plan_hash)。所以执行期的证明只能从**包管理器自己的
 // 数据库**重新取 —— 句柄是包管理器给的事实,不是请求方能编辑的字段。
 func verifyStepOwnership(s Step) error {
 	argv := strings.Fields(s.Command)
@@ -229,23 +233,24 @@ func verifyStepOwnership(s Step) error {
 		// 白名单会先拒掉非 "rm -rf <路径>..." 的形状;这里只处理有路径可查的。
 		return nil
 	}
-	owned, err := ownedPathsForHandle(s.Handle)
+	provable, err := provableConffilesForHandle(s.Handle)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrOwnershipUnverifiable, err)
 	}
 	for _, p := range argv[2:] {
-		if !pathOwned(owned, p) {
+		if _, ok := provable[p]; !ok {
 			return fmt.Errorf("%w: %q", ErrPathNotOwned, p)
 		}
 	}
 	return nil
 }
 
-// ownedPathsForHandle 从句柄重查包声明拥有的文件清单。
+// provableConffilesForHandle 从句柄重查"能证明归属"的配置文件路径集合。
 //
-// 只有 apt 句柄有这条可证明路径(dpkg-query -L)。别的句柄知道自己撤的是哪
-// 次变更,却说不出"那个包拥有哪些文件" —— 没有清单就不删,fail-closed。
-func ownedPathsForHandle(handle string) ([]string, error) {
+// 只有 apt 句柄有这条可证明路径(dpkg 的 conffile 记录 + 文件清单互相印证)。
+// 别的句柄知道自己撤的是哪次变更,却说不出"那个包拥有哪些配置文件" ——
+// 没有证明就不删,fail-closed。
+func provableConffilesForHandle(handle string) (map[string]struct{}, error) {
 	kind, id, err := exec.ParseHandle(handle)
 	if err != nil {
 		return nil, err
@@ -260,21 +265,18 @@ func ownedPathsForHandle(handle string) ([]string, error) {
 	if err := validatePackageName(pkg); err != nil {
 		return nil, err
 	}
-	return dpkgOwnedPaths(pkg)
-}
-
-// pathOwned 报告 p 是否落在拥有清单里(或其目录之下)。
-func pathOwned(owned []string, p string) bool {
-	for _, o := range owned {
-		if o == "" {
-			continue
-		}
-		if p == o {
-			return true
-		}
-		if strings.HasPrefix(p, strings.TrimSuffix(o, "/")+"/") {
-			return true
-		}
+	owned, err := dpkgOwnedPaths(pkg)
+	if err != nil {
+		return nil, err
 	}
-	return false
+	conffiles, err := dpkgConffiles(pkg)
+	if err != nil {
+		return nil, err
+	}
+	deletable, _ := provableDeletePaths(conffiles, owned)
+	provable := make(map[string]struct{}, len(deletable))
+	for _, p := range deletable {
+		provable[p] = struct{}{}
+	}
+	return provable, nil
 }

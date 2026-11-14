@@ -76,21 +76,37 @@ func TestPlan_DnfHistoryUndo(t *testing.T) {
 	}
 }
 
+// 真机 dpkg 1.21 的 conffile 记录形状(经 cat -A 核过):
+// 前导空格 + "<路径> <md5>[ obsolete| remove-on-upgrade]"。md5 是 .deb 里的
+// 校验和,文件不在 .deb 里时是字面量 newconffile。
+const (
+	conffileMD5Nginx   = "89269e1298235f1b12b4c16e4065ad0d"
+	conffileMD5Default = "ee35a240758f374832e809ae0ea4883a"
+)
+
 // aptFallbackFake 伪造一台"老 apt(无原生 undo)+ nginx 已装"的宿主。
-// 输出形状按真机:dpkg 的 Conffiles 每行以空格开头,状态词在路径之后。
+//
+// dpkg-query -L 的输出**包含目录**(/.、/etc、/usr...),这是真机形状,也是
+// 归属校验不能按目录前缀放行的原因。
 func aptFallbackFake() *fakeCommands {
 	fc := newFakeCommands()
 	fc.out["apt-get --version"] = "apt 2.4.11 (amd64)\n"
 	fc.out["apt history-info 7"] = "Commandline: apt-get install nginx\n"
 	fc.out["dpkg-query -L nginx"] = strings.Join([]string{
+		"/.",
+		"/etc",
 		"/etc/nginx",
 		"/etc/nginx/nginx.conf",
 		"/etc/nginx/sites-available",
 		"/etc/nginx/sites-available/default",
+		"/usr",
+		"/usr/sbin",
 		"/usr/sbin/nginx",
 	}, "\n") + "\n"
-	fc.out["dpkg-query -W -f=${Conffiles}\\n nginx"] =
-		" /etc/nginx/nginx.conf\n /etc/nginx/sites-available/default obsolete\n"
+	fc.out["dpkg-query -W -f=${Conffiles}\\n nginx"] = strings.Join([]string{
+		" /etc/nginx/nginx.conf " + conffileMD5Nginx,
+		" /etc/nginx/sites-available/default " + conffileMD5Default + " obsolete",
+	}, "\n") + "\n"
 	return fc
 }
 
@@ -174,12 +190,12 @@ func TestPlan_AptFallbackStepsPassValidation(t *testing.T) {
 	}
 }
 
-// dpkg 把清单里的特殊字符写成 \ddd(十进制):解析时必须还原,否则删除路径
+// dpkg 把清单里的特殊字符写成 \ddd(八进制):解析时必须还原,否则删除路径
 // 与拥有清单对不上。
 func TestPlan_AptFallbackUnescapesConffiles(t *testing.T) {
 	fc := aptFallbackFake()
 	// \134 是反斜杠;它没有空白,rm 的 argv 形状仍能表达。
-	fc.out["dpkg-query -W -f=${Conffiles}\\n nginx"] = " /etc/nginx/a\\134b.conf\n"
+	fc.out["dpkg-query -W -f=${Conffiles}\\n nginx"] = " /etc/nginx/a\\134b.conf " + conffileMD5Nginx + "\n"
 	fc.out["dpkg-query -L nginx"] = "/etc/nginx/a\\134b.conf\n"
 	withFakeCommands(t, fc)
 
@@ -207,7 +223,7 @@ func TestPlan_AptFallbackUnescapesConffiles(t *testing.T) {
 // (白名单要求路径里没有空白)。这种情况留给人,不塞进删除步。
 func TestPlan_AptFallbackSkipsUnsafeConffilePath(t *testing.T) {
 	fc := aptFallbackFake()
-	fc.out["dpkg-query -W -f=${Conffiles}\\n nginx"] = " /etc/nginx/a\\040b.conf\n"
+	fc.out["dpkg-query -W -f=${Conffiles}\\n nginx"] = " /etc/nginx/a\\040b.conf " + conffileMD5Nginx + "\n"
 	fc.out["dpkg-query -L nginx"] = "/etc/nginx/a\\040b.conf\n"
 	withFakeCommands(t, fc)
 
@@ -249,6 +265,26 @@ func TestPlan_AptFallbackEmptyConffiles(t *testing.T) {
 	}
 }
 
+// conffile 记录与 dpkg-query -L 对不上(清单里没有这个路径) → 不删,点名给人。
+func TestPlan_AptFallbackSkipsConffileMissingFromFileList(t *testing.T) {
+	fc := aptFallbackFake()
+	fc.out["dpkg-query -W -f=${Conffiles}\\n nginx"] =
+		" /etc/nginx/ghost.conf " + conffileMD5Nginx + "\n"
+	fc.out["dpkg-query -L nginx"] = "/etc/nginx\n/usr/sbin/nginx\n"
+	withFakeCommands(t, fc)
+
+	p, err := BuildPlan(context.Background(), "apt-history:7", allowAll{})
+	if err != nil {
+		t.Fatalf("BuildPlan: %v", err)
+	}
+	if len(p.Steps) != 2 {
+		t.Fatalf("steps = %d, want 2(两份 dpkg 记录对不上时不出删除步):%+v", len(p.Steps), p.Steps)
+	}
+	if !strings.Contains(p.Steps[1].Rationale, "/etc/nginx/ghost.conf") {
+		t.Errorf("MANUAL 说明 = %q, want 点名没被证明的路径", p.Steps[1].Rationale)
+	}
+}
+
 // 拿不到包管理器事实 → 计划期失败,不产生半截计划。
 func TestPlan_AptFallbackFailsWhenDpkgQueryFails(t *testing.T) {
 	for _, key := range []string{
@@ -271,11 +307,13 @@ func TestPlan_AptFallbackFailsWhenDpkgQueryFails(t *testing.T) {
 	}
 }
 
-// 拆不清路径与状态词的行不能被"猜着"处理:猜错就是把别人的文件写进删除目标。
-func TestPlan_AptFallbackRejectsAmbiguousConffileLine(t *testing.T) {
+// 形状不合 dpkg 的 conffile 记录就不能"猜着"处理:猜错就是把别人的文件写进
+// 删除目标。
+func TestPlan_AptFallbackRejectsMalformedConffiles(t *testing.T) {
 	for _, line := range []string{
-		" /etc/nginx/a.conf bogus-status\n",   // 不认识的状态词
-		" /etc/nginx/a.conf obsolete extra\n", // 超过"路径 + 状态词"两段
+		" /etc/nginx/a.conf\n",                                     // 只有路径,缺 md5
+		" /etc/nginx/a.conf " + conffileMD5Nginx + " bogus\n",      // 不认识的状态词
+		" /etc/nginx/a.conf " + conffileMD5Nginx + " obsolete x\n", // 四段
 	} {
 		t.Run(strings.TrimSpace(line), func(t *testing.T) {
 			fc := aptFallbackFake()
@@ -289,15 +327,41 @@ func TestPlan_AptFallbackRejectsAmbiguousConffileLine(t *testing.T) {
 	}
 }
 
-// dpkg 的 Conffiles 每行是 " <路径> [状态词]":前导空格与状态词都不是路径。
-func TestParseConffiles_StripsLeadingSpaceAndStatus(t *testing.T) {
-	got, err := parseConffiles(" /etc/a.conf\n /etc/b.conf obsolete\n /etc/c.conf remove\n")
+// dpkg 的 Conffiles 每行是 " <路径> <md5|newconffile> [obsolete|remove-on-upgrade]":
+// 前导空格与 md5 都不是路径。
+func TestParseConffiles_RealDpkgShape(t *testing.T) {
+	out := strings.Join([]string{
+		" /etc/a.conf " + conffileMD5Nginx,
+		" /etc/b.conf " + conffileMD5Nginx + " obsolete",
+		" /etc/c.conf " + conffileMD5Nginx + " remove-on-upgrade",
+		" /etc/d.conf newconffile",
+	}, "\n") + "\n"
+
+	got, err := parseConffiles(out)
 	if err != nil {
 		t.Fatalf("parseConffiles: %v", err)
 	}
-	want := []string{"/etc/a.conf", "/etc/b.conf", "/etc/c.conf"}
+	want := []string{"/etc/a.conf", "/etc/b.conf", "/etc/c.conf", "/etc/d.conf"}
 	if !slices.Equal(got, want) {
 		t.Errorf("parseConffiles = %v, want %v", got, want)
+	}
+}
+
+// 第二段必须是 32 位小写十六进制或 newconffile;第三段只能是两个状态词之一。
+func TestParseConffiles_RejectsMalformedLines(t *testing.T) {
+	for name, line := range map[string]string{
+		"只有路径":     " /etc/a.conf",
+		"第二段不是校验和": " /etc/a.conf notamd5",
+		"大写 md5":   " /etc/a.conf 89269E1298235F1B12B4C16E4065AD0D",
+		"短 md5":    " /etc/a.conf 89269e12",
+		"未知状态词":    " /etc/a.conf " + conffileMD5Nginx + " bogus",
+		"四段":       " /etc/a.conf " + conffileMD5Nginx + " obsolete extra",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := parseConffiles(line + "\n"); err == nil {
+				t.Fatalf("parseConffiles(%q) = nil error, want fail-closed", line)
+			}
+		})
 	}
 }
 

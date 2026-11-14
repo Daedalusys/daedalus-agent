@@ -278,11 +278,16 @@ func parsePathList(out string) []string {
 
 // parseConffiles 解析 dpkg 的 ${Conffiles} 输出。
 //
-// 每行形如 " <路径> [obsolete|remove]":状态词是 dpkg 的记账,不是路径的一
-// 部分;路径里的空白等特殊字符 dpkg 已转义成 \ddd,所以按空白切词是安全的。
+// 真机形状(dpkg 1.21,cat -A 核过)是:
 //
-// 切不出"路径 + 至多一个状态词"的行直接报错:拿前缀当路径去 rm,删掉的
-// 可能是别的包的文件 —— 这种不确定性只能交给 fail-closed。
+//	<路径> <md5|newconffile> [obsolete|remove-on-upgrade]
+//
+// 前导空格是控制文件续行的格式;第二段是 .deb 里的 md5(该文件不在 .deb 里
+// 时是字面量 newconffile),第三段才是 dpkg 的记账状态。把 md5 当状态词、
+// 或只认两个旧状态词,都会让整条计划在真机上失败(第一版就是这样)。
+//
+// 路径里的空白等特殊字符 dpkg 已转义成 \ddd,所以按空白切词是安全的。
+// 切不出这个形状的行一律报错:拿前缀当路径去 rm,删掉的可能是别的包的文件。
 func parseConffiles(out string) ([]string, error) {
 	var paths []string
 	for _, line := range strings.Split(out, "\n") {
@@ -291,15 +296,14 @@ func parseConffiles(out string) ([]string, error) {
 			continue
 		}
 		fields := strings.Fields(t)
-		switch len(fields) {
-		case 1:
-			// 只有路径,没有状态词。
-		case 2:
-			if !isConffileStatus(fields[1]) {
-				return nil, fmt.Errorf("%w: unrecognized conffile line %q", ErrPlanUnsupported, t)
-			}
-		default:
-			return nil, fmt.Errorf("%w: ambiguous conffile line %q", ErrPlanUnsupported, t)
+		if len(fields) < 2 || len(fields) > 3 {
+			return nil, fmt.Errorf("%w: conffile line %q is not <path> <md5> [flag]", ErrPlanUnsupported, t)
+		}
+		if !isConffileChecksum(fields[1]) {
+			return nil, fmt.Errorf("%w: conffile line %q has no md5sum", ErrPlanUnsupported, t)
+		}
+		if len(fields) == 3 && !isConffileStatus(fields[2]) {
+			return nil, fmt.Errorf("%w: conffile line %q has an unknown flag", ErrPlanUnsupported, t)
 		}
 		if p := unescapeDpkgPath(fields[0]); p != "" {
 			paths = append(paths, p)
@@ -308,9 +312,27 @@ func parseConffiles(out string) ([]string, error) {
 	return paths, nil
 }
 
-// isConffileStatus 报告 dpkg 记在 conffile 路径后的状态词。
+// isConffileChecksum 报告第二段是否是 dpkg 记的校验和:32 位小写十六进制,
+// 或 "newconffile"(该文件不在 .deb 里,由维护者脚本生成)。
+func isConffileChecksum(s string) bool {
+	if s == "newconffile" {
+		return true
+	}
+	if len(s) != 32 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// isConffileStatus 报告 dpkg 记在 conffile 记录后的状态词。
 func isConffileStatus(s string) bool {
-	return s == "obsolete" || s == "remove"
+	return s == "obsolete" || s == "remove-on-upgrade"
 }
 
 // unescapeDpkgPath 还原 dpkg 清单里 \ddd(三位八进制)形式的转义。
@@ -346,22 +368,31 @@ func isOctDigit(c byte) bool { return c >= '0' && c <= '7' }
 // provableDeletePaths 从 conffiles 里挑出"能证明归属、也能安全写进 rm argv"
 // 的路径。
 //
+// 归属判定只有一种:路径必须**完全等于** dpkg 记为 conffile 的某条记录,并且
+// 精确出现在 dpkg-query -L 的清单里 —— 两份 dpkg 记录互相印证。不做前缀
+// 匹配,也不认目录:dpkg-query -L 本来就会列出 /etc、/usr 这些目录,按目录
+// 前缀放行等于把"按包清理"变成"按任意目录清理"。
+//
 // 被挑掉的路径进第二个返回值:它们没法自动删,但必须让人看见,而不是静悄悄
 // 留在磁盘上假装删过了。
 func provableDeletePaths(conffiles, owned []string) (deletable, skipped []string) {
+	ownedSet := make(map[string]struct{}, len(owned))
+	for _, o := range owned {
+		ownedSet[o] = struct{}{}
+	}
 	seen := make(map[string]struct{}, len(conffiles))
 	for _, p := range conffiles {
 		if _, ok := seen[p]; ok {
 			continue
 		}
 		seen[p] = struct{}{}
-		// rm 白名单只认绝对路径、且路径里不能有空白:表达不了的路径不能硬塞,
-		// 否则整条删除步会被白名单拒掉。
-		if !strings.HasPrefix(p, "/") || strings.ContainsAny(p, " \t\n") {
+		if _, ok := ownedSet[p]; !ok {
 			skipped = append(skipped, p)
 			continue
 		}
-		if !pathOwned(owned, p) {
+		// rm 白名单只认绝对路径、且路径里不能有空白:表达不了的路径不能硬塞,
+		// 否则整条删除步会被白名单拒掉。
+		if !strings.HasPrefix(p, "/") || strings.ContainsAny(p, " \t\n") {
 			skipped = append(skipped, p)
 			continue
 		}
