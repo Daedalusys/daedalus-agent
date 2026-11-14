@@ -160,6 +160,35 @@ func TestStop_StopContextDeadline_ReturnsError(t *testing.T) {
 	}
 }
 
+// TestStop_StopContextDeadline_NeverReportsSuccess 是上面那条的加固版:同一个
+// 场景连跑 200 次,每次都必须报 DeadlineExceeded。旧实现的 select 在两个分支
+// 同时就绪时随机挑一个,本机慢(关机流程比 select 长)基本复现不出,只有 CI 的
+// 快机器才偶发红 —— 所以这条测试的作用是"在快机器上把随机性压到可察觉"。
+func TestStop_StopContextDeadline_NeverReportsSuccess(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		d := daemon.New(newTestConfig(t))
+		runCtx, cancelRun := context.WithCancel(context.Background())
+		runDone := make(chan error, 1)
+		go func() { runDone <- d.Start(runCtx) }()
+		if !waitFor(t, 2*time.Second, func() bool { return d.State() == daemon.StateRunning }) {
+			cancelRun()
+			t.Fatalf("第 %d 轮:daemon 未在 2s 内进入 Running", i)
+		}
+		deadlineCtx, cancelDeadline := context.WithTimeout(context.Background(), time.Millisecond)
+		time.Sleep(2 * time.Millisecond)
+		err := d.Stop(deadlineCtx)
+		cancelDeadline()
+		if !errors.Is(err, context.DeadlineExceeded) {
+			cancelRun()
+			t.Fatalf("第 %d 轮:Stop 过期 deadline 返回 %v, want DeadlineExceeded", i, err)
+		}
+		cancelRun()
+		if err := <-runDone; err != nil {
+			t.Fatalf("第 %d 轮:Start 返回意外错误 %v", i, err)
+		}
+	}
+}
+
 func TestStartStop_IsConcurrencySafe(t *testing.T) {
 	// Hammer Start+Stop from multiple goroutines, each on its own
 	// freshly-constructed Daemon (the daemon is single-use). The state

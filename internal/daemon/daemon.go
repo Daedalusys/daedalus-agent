@@ -223,6 +223,18 @@ func (d *Daemon) Stop(ctx context.Context) error {
 
 	stopOnce.Do(func() { close(stopCh) })
 
+	// deadline 已过就先如实报出来,别进 select —— 两个分支同时就绪时 Go 是
+	// **随机挑一个**的:关机快的那台机器上,`done` 与 `ctx.Done()` 会在
+	// select 时一起就绪,于是同一份输入时而返回 nil 时而返回
+	// DeadlineExceeded(CI 上偶发红,agent#29 撞到)。
+	//
+	// 语义:调用方给了一个已经过期的期限,就意味着"在期限内停完"这个承诺
+	// 已经不可能兑现,必须如实报超时,不能让调用方把一次超时读成成功。
+	// 关机本身照常触发(上面 stopOnce 已经放闸),daemon 仍会停干净。
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	select {
 	case <-done:
 		return nil
