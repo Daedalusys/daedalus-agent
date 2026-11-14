@@ -1,4 +1,4 @@
-# 新建 issue 自动落进组织看板 Daedalus Roadmap(project #1)。
+# 新建 issue 自动落进组织看板 Daedalus Roadmap(project 1)。
 #
 # 为什么不用项目内置的 "Auto-add to project":那个工作流只能绑一个仓
 # (2026-11-15 实测:daedalus-core 开单 50 秒内自动进板,daedalus-plugins 开单
@@ -6,7 +6,7 @@
 # 所以用官方 action 补这一刀。
 #
 # 需要 secret:ADD_TO_PROJECT_TOKEN —— classic PAT,勾 project + repo。
-# 没配时这一步跳过(不让每次建单都红一条),message 会提示改用 /board add 手工搬。
+# 没配时这一步跳过(不让每次建单都红一条),message 会提示改用 board add 手工搬。
 
 name: Add issues to Daedalus Roadmap
 
@@ -25,9 +25,13 @@ jobs:
     steps:
       - name: 未配置 token 时跳过(避免每次建单都红)
         if: env.ADD_TO_PROJECT_TOKEN == ''
-        run: echo "ADD_TO_PROJECT_TOKEN 未配置,跳过自动落板;请用 /board add 手工把该 issue 加进 project #1"
+        # 用 block scalar:行内标量里只要出现"空格 + 井号",YAML 就会把它当注释起点,
+        # 引号随之被截断 —— 脚本变成 unexpected EOF(2026-11-15 实测:sdk 每次建单都红一条)。
+        run: |
+          echo "ADD_TO_PROJECT_TOKEN 未配置,跳过自动落板"
+          echo "请用 board add 手工把该 issue 加进 project 1"
 
-      - name: 落进 Daedalus Roadmap(project #1)
+      - name: 落进 Daedalus Roadmap(project 1)
         if: env.ADD_TO_PROJECT_TOKEN != ''
         uses: actions/add-to-project@f2c1f1fa649a891be84948ea89b5dfba1526ef05 # v2.0.1
         with:
