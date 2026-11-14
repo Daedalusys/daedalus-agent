@@ -876,3 +876,280 @@ func TestLocal_NilBackendWithoutRollbackPointRuns(t *testing.T) {
 		t.Errorf("apply 次数 = %d, want 1", apply.calls)
 	}
 }
+
+// txPathSetBackend 是"一次留一组路径"的后端替身:它同时实现单路径 Backend
+// 与 PathSetBackend,两个分支各自计数,断言时能看出 tx 走了哪条路。
+type txPathSetBackend struct {
+	mu sync.Mutex
+
+	createCalls     int
+	restoreCalls    int
+	createSetCalls  int
+	restoreSetCalls int
+	postCalls       int
+
+	createSetErr  error
+	restoreSetErr error
+
+	lastPaths       []string
+	lastSnapshotDir string
+}
+
+func (m *txPathSetBackend) CreateSnapshot(string, string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.createCalls++
+	return nil
+}
+
+func (m *txPathSetBackend) Restore(string, string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.restoreCalls++
+	return nil
+}
+
+func (m *txPathSetBackend) CreateSnapshotSet(paths []string, snapshotDir string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.createSetCalls++
+	m.lastPaths = append([]string(nil), paths...)
+	m.lastSnapshotDir = snapshotDir
+	return m.createSetErr
+}
+
+func (m *txPathSetBackend) RestoreSet(snapshotPath string, paths []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.restoreSetCalls++
+	m.lastPaths = append([]string(nil), paths...)
+	m.lastSnapshotDir = snapshotPath
+	return m.restoreSetErr
+}
+
+func (m *txPathSetBackend) RecordPostState(snapshotPath string, paths []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.postCalls++
+	m.lastPaths = append([]string(nil), paths...)
+	m.lastSnapshotDir = snapshotPath
+	return nil
+}
+
+// treeIntent 是目录级 file intent:target 是目录根,spec 点名子路径。
+func treeIntent(t *testing.T, id string) *agentv1.ApplyIntentRequest {
+	t.Helper()
+	target := t.TempDir()
+	if err := os.WriteFile(filepath.Join(target, "a.conf"), []byte("v1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return &agentv1.ApplyIntentRequest{
+		IntentId:  id,
+		Kind:      "file",
+		Target:    target,
+		SpecJson:  `{"entries":[{"path":"a.conf","op":"write","content":"v2"}]}`,
+		RiskClass: agentv1.RiskClass_RISK_CLASS_LOW,
+	}
+}
+
+// 目录级 intent 走快照集分支:单路径后端不被调用,路径来自注入的选项。
+func TestTx_SnapshotSetUsedForTree(t *testing.T) {
+	backend := &txPathSetBackend{}
+	apply := &txSpyApply{}
+	intent := treeIntent(t, "intent-tree")
+	wantPaths := []string{filepath.Join(intent.Target, "a.conf")}
+
+	tx := New(backend, apply.Fn, t.TempDir(), new(atomic.Uint64), nil,
+		WithSnapshotPaths(func(*agentv1.ApplyIntentRequest) ([]string, error) { return wantPaths, nil }))
+
+	resp, err := tx.Run(context.Background(), intent)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if resp.Result != agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_SUCCESS {
+		t.Fatalf("Result = %v, want SUCCESS (%s)", resp.Result, resp.GetErrorMessage())
+	}
+	if backend.createSetCalls != 1 {
+		t.Errorf("CreateSnapshotSet calls = %d, want 1", backend.createSetCalls)
+	}
+	if backend.createCalls != 0 {
+		t.Errorf("CreateSnapshot calls = %d, want 0(目录级 intent 不走单路径快照)", backend.createCalls)
+	}
+	if len(backend.lastPaths) != 1 || backend.lastPaths[0] != wantPaths[0] {
+		t.Errorf("快照路径 = %v, want %v", backend.lastPaths, wantPaths)
+	}
+	if want := filepath.Join(tx.dataDir, "snapshots", "intent-tree"); backend.lastSnapshotDir != want {
+		t.Errorf("快照目录 = %q, want %q", backend.lastSnapshotDir, want)
+	}
+}
+
+// 快照失败时一个文件都不能写:内容与 mtime 都不动。
+func TestTx_SnapshotFailureWritesNothing(t *testing.T) {
+	backend := &txPathSetBackend{createSetErr: errors.New("simulated no space left on device")}
+	apply := &txSpyApply{}
+	intent := treeIntent(t, "intent-tree-fail")
+	target := filepath.Join(intent.Target, "a.conf")
+	before, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tx := New(backend, apply.Fn, t.TempDir(), new(atomic.Uint64), nil,
+		WithSnapshotPaths(func(*agentv1.ApplyIntentRequest) ([]string, error) {
+			return []string{target}, nil
+		}))
+
+	resp, err := tx.Run(context.Background(), intent)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if resp.Result == agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_SUCCESS {
+		t.Fatalf("快照失败不该报成功: %s", resp.GetErrorMessage())
+	}
+	if apply.calls != 0 {
+		t.Errorf("apply 被调用 %d 次, want 0(快照失败后不得写文件)", apply.calls)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "v1" {
+		t.Errorf("内容 = %q, want v1(快照失败不该改文件)", got)
+	}
+	after, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Errorf("mtime 变了: %v -> %v", before.ModTime(), after.ModTime())
+	}
+}
+
+// apply 成功后要记下写后状态:还原前的冲突检测靠它。
+func TestTx_PostStateRecordedOnSuccess(t *testing.T) {
+	backend := &txPathSetBackend{}
+	apply := &txSpyApply{}
+	intent := treeIntent(t, "intent-tree-post")
+	wantPaths := []string{filepath.Join(intent.Target, "a.conf")}
+
+	tx := New(backend, apply.Fn, t.TempDir(), new(atomic.Uint64), nil,
+		WithSnapshotPaths(func(*agentv1.ApplyIntentRequest) ([]string, error) { return wantPaths, nil }))
+
+	if _, err := tx.Run(context.Background(), intent); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if backend.postCalls != 1 {
+		t.Errorf("RecordPostState calls = %d, want 1", backend.postCalls)
+	}
+	if len(backend.lastPaths) != 1 || backend.lastPaths[0] != wantPaths[0] {
+		t.Errorf("写后状态路径 = %v, want %v", backend.lastPaths, wantPaths)
+	}
+}
+
+// apply 失败时按快照集还原,不是按单路径还原。
+func TestTx_RestoreSetUsedOnFailure(t *testing.T) {
+	backend := &txPathSetBackend{}
+	apply := &txSpyApply{err: errors.New("apply blew up")}
+	intent := treeIntent(t, "intent-tree-fail")
+	wantPaths := []string{filepath.Join(intent.Target, "a.conf")}
+
+	tx := New(backend, apply.Fn, t.TempDir(), new(atomic.Uint64), nil,
+		WithSnapshotPaths(func(*agentv1.ApplyIntentRequest) ([]string, error) { return wantPaths, nil }))
+
+	resp, err := tx.Run(context.Background(), intent)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if resp.Result != agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_TRANSIENT_FAILURE {
+		t.Errorf("Result = %v, want TRANSIENT_FAILURE(%s)", resp.Result, resp.GetErrorMessage())
+	}
+	if backend.restoreSetCalls != 1 {
+		t.Errorf("RestoreSet calls = %d, want 1", backend.restoreSetCalls)
+	}
+	if backend.restoreCalls != 0 {
+		t.Errorf("Restore calls = %d, want 0(目录级 intent 走集合还原)", backend.restoreCalls)
+	}
+}
+
+// 旧 spec 的单文件路径逐字不变:仍然一次 CreateSnapshot,快照文件仍是
+// <dataDir>/snapshots/<intent_id>.snap。
+func TestTx_DefaultSinglePathUnchanged(t *testing.T) {
+	backend := &txMockBackend{}
+	apply := &txSpyApply{}
+	dataDir := t.TempDir()
+	tx := New(backend, apply.Fn, dataDir, new(atomic.Uint64), nil)
+
+	if _, err := tx.Run(context.Background(), fileIntent(t, "intent-001")); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if backend.createCalls != 1 {
+		t.Errorf("CreateSnapshot calls = %d, want 1", backend.createCalls)
+	}
+	want := filepath.Join(dataDir, "snapshots", "intent-001.snap")
+	if backend.lastSnap != want {
+		t.Errorf("snapshot path = %q, want %q", backend.lastSnap, want)
+	}
+}
+
+// 目录级 intent 没有注入路径列表时 fail-closed:宁可不写,也不能拿
+// "整个目录当一个文件"去快照。
+func TestTx_TreeWithoutPathsFailsClosed(t *testing.T) {
+	backend := &txPathSetBackend{}
+	apply := &txSpyApply{}
+	tx := New(backend, apply.Fn, t.TempDir(), new(atomic.Uint64), nil)
+
+	resp, err := tx.Run(context.Background(), treeIntent(t, "intent-tree-nopaths"))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if resp.Result == agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_SUCCESS {
+		t.Fatalf("没有路径列表时不该成功: %s", resp.GetErrorMessage())
+	}
+	if apply.calls != 0 {
+		t.Errorf("apply 被调用 %d 次, want 0", apply.calls)
+	}
+	if backend.createSetCalls != 0 {
+		t.Errorf("CreateSnapshotSet calls = %d, want 0", backend.createSetCalls)
+	}
+}
+
+// 解析不出快照路径时要留审计痕:tx 的约定是"每个终局都进链",这条新的
+// 早退分支也不能例外。
+func TestLocal_AuditEmitsOnSnapshotPathResolutionFailure(t *testing.T) {
+	dir := t.TempDir()
+	auditLog, err := audit.New(dir)
+	if err != nil {
+		t.Fatalf("audit.New: %v", err)
+	}
+	backend := &txPathSetBackend{}
+	apply := &txSpyApply{}
+	tx := New(backend, apply.Fn, dir, new(atomic.Uint64), auditLog,
+		WithSnapshotPaths(func(*agentv1.ApplyIntentRequest) ([]string, error) {
+			return nil, errors.New("spec has no named paths")
+		}))
+
+	resp, err := tx.Run(context.Background(), treeIntent(t, "intent-nopaths"))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if resp.Result != agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_PERSISTENT_FAILURE {
+		t.Errorf("Result = %v, want PERSISTENT_FAILURE", resp.Result)
+	}
+	if apply.calls != 0 {
+		t.Errorf("apply 被调用 %d 次, want 0", apply.calls)
+	}
+
+	events, _, err := auditLog.Since(0)
+	if err != nil {
+		t.Fatalf("audit.Since: %v", err)
+	}
+	found := false
+	for _, ev := range events {
+		if ev.Tool == "apply_intent.presnapshot_failed" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("链上没有 presnapshot_failed 事件, got %+v", events)
+	}
+}

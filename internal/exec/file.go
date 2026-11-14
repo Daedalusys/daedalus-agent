@@ -2,35 +2,34 @@ package exec
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"syscall"
 
 	agentv1 "github.com/Daedalusys/daedalus-sdk/proto/agent/v1"
+
+	"github.com/Daedalusys/daedalus-agent/internal/filespec"
 )
 
 // file.set 的 kind 字符串。上线的是**资源 kind**(objectmodel.Kind 的
 // "file"),不是 core 风险判定表内部的适配器名。
 const kindFile = "file"
 
-// fileSpec 是 file intent 的 SpecJson schema。MVP 只支持整体覆盖:按行
-// 编辑或追加需要"当前内容是预期的"这一前提,agent 校验不了。
-type fileSpec struct {
-	Content string `json:"content"`
-}
-
 // fileExecutor 实现 file kind。无状态,可复用。
 type fileExecutor struct{}
 
 // Apply 把 file intent 落到宿主文件系统上。
 //
-// 只认普通文件:目录会把无关文件卷进还原范围,符号链接会把读写引到别处。
-// 父目录必须已存在 —— 建目录应是独立 intent,隐式创建会让一次"写文件"
-// 顺手改掉目录树。
+// 两种 spec 形态:
+//
+//   - 旧形态 {"content"}:target 是单个普通文件。只认普通文件 —— 符号链接
+//     会把读写引到别处,目录不是文件;父目录必须已存在,建目录应是独立
+//     intent。
+//   - 目录形态 {"entries"}:target 是目录根,entries 逐条点名子路径。整批
+//     先校验(spec.Validate),任何一条越界/类型不符都整批拒绝 —— 校验在
+//     写第一条之前完成,才谈得上"失败可整批还原"。
 func (fileExecutor) Apply(ctx context.Context, intent *agentv1.ApplyIntentRequest) error {
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return fmt.Errorf("exec: file.set %q cancelled: %w", intent.Target, ctxErr)
@@ -43,13 +42,40 @@ func (fileExecutor) Apply(ctx context.Context, intent *agentv1.ApplyIntentReques
 		return fmt.Errorf("%w: file.set target %q must be an absolute path", ErrPersistent, target)
 	}
 
-	var spec fileSpec
-	dec := json.NewDecoder(strings.NewReader(intent.SpecJson))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&spec); err != nil {
-		return fmt.Errorf("%w: invalid file.set spec_json: %v", ErrPersistent, err)
+	spec, err := filespec.Parse(intent.SpecJson)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrPersistent, err)
 	}
 
+	if spec.IsLegacy() {
+		return writeRegularFile(target, spec.Content)
+	}
+
+	if verr := spec.Validate(target); verr != nil {
+		return fmt.Errorf("%w: %v", ErrPersistent, verr)
+	}
+	for _, entry := range spec.Entries {
+		full := filepath.Join(target, entry.Path)
+		switch entry.Op {
+		case filespec.OpWrite:
+			if werr := writeRegularFile(full, entry.Content); werr != nil {
+				return werr
+			}
+		case filespec.OpRepoint:
+			if rerr := repointSymlink(full, entry.SymlinkTarget); rerr != nil {
+				return rerr
+			}
+		default:
+			// filespec.Parse 已经挡过未知 op;真走到这里说明两处规则走偏了,
+			// fail-closed 总比猜一个动作好。
+			return fmt.Errorf("%w: unsupported entry op %q for %q", ErrPersistent, entry.Op, full)
+		}
+	}
+	return nil
+}
+
+// writeRegularFile 用一个 open + write + chmod 完成覆盖,保留原 mode。
+func writeRegularFile(target, content string) error {
 	mode, err := targetWriteMode(target)
 	if err != nil {
 		return err
@@ -61,7 +87,7 @@ func (fileExecutor) Apply(ctx context.Context, intent *agentv1.ApplyIntentReques
 	if err != nil {
 		return fmt.Errorf("%w: open %q: %v", ErrPersistent, target, err)
 	}
-	if _, werr := f.Write([]byte(spec.Content)); werr != nil {
+	if _, werr := f.Write([]byte(content)); werr != nil {
 		f.Close()
 		return fmt.Errorf("%w: write %q: %v", ErrPersistent, target, werr)
 	}
@@ -73,6 +99,30 @@ func (fileExecutor) Apply(ctx context.Context, intent *agentv1.ApplyIntentReques
 	}
 	if cerr := f.Close(); cerr != nil {
 		return fmt.Errorf("%w: close %q: %v", ErrPersistent, target, cerr)
+	}
+	return nil
+}
+
+// repointSymlink 把软链换到新的目标字符串。临时链接 + rename:先删后建
+// 中间有一段"链接不存在"的窗口,读它的进程会看到另一个状态。
+func repointSymlink(link, target string) error {
+	dir := filepath.Dir(link)
+	tmp, err := os.CreateTemp(dir, ".repoint-*")
+	if err != nil {
+		return fmt.Errorf("%w: prepare repoint of %q: %v", ErrPersistent, link, err)
+	}
+	tmpName := tmp.Name()
+	tmp.Close()
+	// CreateTemp 建出来的是普通文件,rename 之前必须让位给链接。
+	if err := os.Remove(tmpName); err != nil {
+		return fmt.Errorf("%w: prepare repoint of %q: %v", ErrPersistent, link, err)
+	}
+	if err := os.Symlink(target, tmpName); err != nil {
+		return fmt.Errorf("%w: create symlink %q -> %q: %v", ErrPersistent, link, target, err)
+	}
+	if err := os.Rename(tmpName, link); err != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("%w: install symlink %q: %v", ErrPersistent, link, err)
 	}
 	return nil
 }

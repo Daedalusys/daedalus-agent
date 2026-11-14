@@ -30,7 +30,9 @@ import (
 	agentv1 "github.com/Daedalusys/daedalus-sdk/proto/agent/v1"
 
 	"github.com/Daedalusys/daedalus-agent/internal/audit"
+	"github.com/Daedalusys/daedalus-agent/internal/filespec"
 	"github.com/Daedalusys/daedalus-agent/internal/rollback"
+	"github.com/Daedalusys/daedalus-agent/internal/tx"
 )
 
 // knownIntentKinds 是 agent 认识的资源 kind 白名单。用显式列表而不是
@@ -75,7 +77,7 @@ func (s *agentService) ApplyIntent(ctx context.Context, req *agentv1.ApplyIntent
 		return nil, status.Error(codes.InvalidArgument, "ApplyIntent: nil request")
 	}
 
-	point := rollback.PointFor(req.Kind)
+	point := rollback.PointForIntent(req)
 
 	// 1. 表外 kind:既没有回滚点,也没有执行器。放行等于让控制面以为
 	// agent 会做点什么,而它什么都不会做。
@@ -89,10 +91,31 @@ func (s *agentService) ApplyIntent(ctx context.Context, req *agentv1.ApplyIntent
 		return s.refuseIntent(req, "apply_intent.refused", fmt.Sprintf("refused: high-risk intent on a kind without rollback point: kind=%s", req.Kind), nil), nil
 	}
 
-	// 3. 其余放行。只有**存在回滚点**的 intent 才需要后端:file 恒走内建
-	// copy,卷级(v0 无 producer)才看宿主能力。低危 + 无回滚点的 intent 根本
-	// 不建快照,这里若也去选后端,就会把"没有回滚点"错判成"配置错误",把整条
-	// 低危腿拒掉(真机回归:vma/AlmaLinux 9 上低危 package 就是这么被拒的)。
+	// 3. 目录级 file intent:spec 在这里解析一次,把快照路径注入事务。
+	// 校验必须发生在进事务之前 —— 越界或类型不符的 spec 不该先建快照、
+	// 更不该先写文件;失败也就没有"半截快照"要收拾。
+	//
+	// 解析/校验规则只在 internal/filespec 一处,这里不重复判断。
+	var txOpts []tx.Option
+	if point == rollback.PointTree {
+		spec, serr := filespec.Parse(req.SpecJson)
+		if serr != nil {
+			return s.refuseIntent(req, "apply_intent.refused", fmt.Sprintf("refused: invalid file spec_json: %v", serr), nil), nil
+		}
+		if verr := spec.Validate(req.Target); verr != nil {
+			return s.refuseIntent(req, "apply_intent.refused", fmt.Sprintf("refused: directory file spec rejected: %v", verr), nil), nil
+		}
+		paths := spec.SnapshotPaths(req.Target)
+		txOpts = append(txOpts, tx.WithSnapshotPaths(func(*agentv1.ApplyIntentRequest) ([]string, error) {
+			return paths, nil
+		}))
+	}
+
+	// 4. 其余放行。只有**存在回滚点**的 intent 才需要后端:file 恒走内建
+	// copy/tree,卷级(v0 无 producer)才看宿主能力。低危 + 无回滚点的 intent
+	// 根本不建快照,这里若也去选后端,就会把"没有回滚点"错判成"配置错误",
+	// 把整条低危腿拒掉(真机回归:vma/AlmaLinux 9 上低危 package 就是这么
+	// 被拒的)。
 	var backend rollback.Backend
 	if point != rollback.PointNone {
 		var berr error
@@ -107,7 +130,7 @@ func (s *agentService) ApplyIntent(ctx context.Context, req *agentv1.ApplyIntent
 	s.beginIntent(req.IntentId)
 	defer s.endIntent(req.IntentId)
 
-	tx := s.buildTx(backend)
+	tx := s.buildTx(backend, txOpts...)
 	return tx.Run(ctx, req)
 }
 
