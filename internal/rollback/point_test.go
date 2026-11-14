@@ -79,10 +79,10 @@ func TestPointForIntent_NonFileKindsUnchanged(t *testing.T) {
 	}
 }
 
-// spec 解析不了就判不出回滚点:按 None 处理,由执行器以 PERSISTENT 拒绝,
-// 不能看图省事就当成"有回滚点"。
-func TestPointForIntent_InvalidSpecHasNoPoint(t *testing.T) {
-	if got := PointForIntent(&agentv1.ApplyIntentRequest{Kind: "file", SpecJson: `{"contents":"typo"}`}); got != PointNone {
-		t.Errorf("PointForIntent(invalid spec) = %v, want PointNone", got)
+// spec 解析不了时退回单文件回滚点:看不出版本形状就按最保守的
+// 「先快照再写」处理,不能判成「没有回滚点」后裸写。
+func TestPointForIntent_InvalidSpecFallsBackToFilePoint(t *testing.T) {
+	if got := PointForIntent(&agentv1.ApplyIntentRequest{Kind: "file", SpecJson: `{"contents":"typo"}`}); got != PointFile {
+		t.Errorf("PointForIntent(invalid spec) = %v, want PointFile", got)
 	}
 }

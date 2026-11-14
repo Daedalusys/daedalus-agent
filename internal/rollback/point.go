@@ -41,8 +41,9 @@ func PointFor(kind string) Point {
 // PointForIntent 在 PointFor 之上再看 spec 形状:同一个 file kind,旧形态
 // (只有 content)是单文件回滚点,entries 形态是一组路径的目录回滚点。
 //
-// spec 解析不了时返回 PointNone:判不出"这次要动什么"就判不出回滚点。
-// 执行器随后会以 PERSISTENT 拒绝这条 intent,不会真的写宿主。
+// spec 解析不了时退回 kind 给出的单文件点:看不出版本形状,就按最保守的
+// 「先快照再写」处理。真要是目录 spec,单文件快照会在目录上失败,宿主仍然
+// 不被改动 —— 比"判成无回滚点、裸写一把"安全。
 func PointForIntent(intent *agentv1.ApplyIntentRequest) Point {
 	if intent == nil {
 		return PointNone
@@ -53,7 +54,7 @@ func PointForIntent(intent *agentv1.ApplyIntentRequest) Point {
 	}
 	spec, err := filespec.Parse(intent.SpecJson)
 	if err != nil {
-		return PointNone
+		return point
 	}
 	if spec.IsLegacy() {
 		return PointFile
