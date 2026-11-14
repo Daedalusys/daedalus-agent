@@ -178,13 +178,13 @@ func (l *Loader) Load() (*tls.Config, error) {
 //
 // Algorithm:
 //
-//   a. If CertPath is missing → bootstrap: generate CA + server
-//      cert, write all 4 files.
-//   b. If CertPath exists AND cert.NotAfter ≤ now+RotationThreshold
-//      → rotate server cert in place; CA is read from CAPath and
-//      not regenerated.
-//   c. Otherwise → no-op. The on-disk files are returned as-is to
-//      buildTLSConfig.
+//	a. If CertPath is missing → bootstrap: generate CA + server
+//	   cert, write all 4 files.
+//	b. If CertPath exists AND cert.NotAfter ≤ now+RotationThreshold
+//	   → rotate server cert in place; CA is read from CAPath and
+//	   not regenerated.
+//	c. Otherwise → no-op. The on-disk files are returned as-is to
+//	   buildTLSConfig.
 func (l *Loader) ensureCertFiles() error {
 	existing, err := readCertIfExists(l.cfg.CertPath)
 	if err != nil {
