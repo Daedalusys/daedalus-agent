@@ -32,6 +32,7 @@ import (
 	"sync"
 
 	agentv1 "github.com/Daedalusys/daedalus-sdk/proto/agent/v1"
+	"github.com/Daedalusys/daedalus-sdk/objectmodel"
 )
 
 // 错误哨兵。执行器用 %w 包装底层原因,调用方(tx / rpc)用 errors.Is 判定
@@ -177,8 +178,12 @@ func classifyExecError(err error) error {
 // HandleCapable 报告该 kind 是否可能产出回滚句柄。
 //
 // 控制面与审计据此区分「空句柄是异常」与「这个 kind 本来就没有句柄」。
+//
+// 唯一的表在 SDK 的 objectmodel.HasRollbackHandle —— 控制面准入用的是同一张
+// (objectmodel.AdmitsHighRisk)。两边各写一份就会漂移:真机验收撞到过控制面
+// 按 kind==file 判、把 package 高危全挡在门外,而本侧其实收得下。
 func HandleCapable(kind string) bool {
-	return kind == kindPackage || kind == kindService
+	return objectmodel.HasRollbackHandle(objectmodel.Kind(kind))
 }
 
 // classifyable 报告 err 是否已经带上可重试性(或本身就是 ctx 取消,由上层
