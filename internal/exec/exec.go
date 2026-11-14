@@ -119,8 +119,8 @@ func lookup(kind string) (Executor, bool) {
 	return e, ok
 }
 
-// Apply 是 intent 的分派入口,签名与 tx.ApplyFunc 一致,可直接替换
-// applyStub。句柄版见 ApplyWithHandle。
+// Apply 是 intent 的分派入口(只要结局,不要句柄)。句柄版见 ApplyWithHandle
+// —— 生产路径(tx)用的是后者;这个包装留给只需要错误的地方与测试。
 func Apply(ctx context.Context, intent *agentv1.ApplyIntentRequest) error {
 	_, err := ApplyWithHandle(ctx, intent)
 	return err

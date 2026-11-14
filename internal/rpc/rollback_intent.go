@@ -119,12 +119,14 @@ func (s *agentService) rollbackApply(ctx context.Context, req *agentv1.RollbackI
 	if plan.Hash() != req.GetPlanHash() {
 		return s.refuseRollback(req, "refused: plan_hash does not match the steps")
 	}
+	// rm 步的路径归属要用 agent 自己的包文件清单复核;请求里没有这份清单。
+	// 放在 token 校验之前:取清单失败不该把一个有效 token 白白烧掉。
+	if err := s.attachOwnedPaths(ctx, req.GetRollbackHandle(), steps); err != nil {
+		return s.refuseRollback(req, fmt.Sprintf("refused: %v", err))
+	}
 	// token 绑定 plan_hash + intent_id,单次使用。放在哈希校验之后:先确认
 	// 这是同一份计划,再消耗 token。
 	if err := s.rollbackTokens.Verify(req.GetApproveToken(), req.GetPlanHash(), req.GetIntentId(), time.Now()); err != nil {
-		return s.refuseRollback(req, fmt.Sprintf("refused: %v", err))
-	}
-	if err := s.attachOwnedPaths(ctx, req.GetRollbackHandle(), steps); err != nil {
 		return s.refuseRollback(req, fmt.Sprintf("refused: %v", err))
 	}
 
