@@ -79,20 +79,22 @@ func (m *txMockBackend) Restore(snap, target string) error {
 }
 
 // txSpyApply records how the apply step was invoked. `err`
-// controls whether the apply succeeds or fails.
+// controls whether the apply succeeds or fails; `handle` is the
+// rollback handle the fake reports back.
 type txSpyApply struct {
 	mu         sync.Mutex
 	err        error
+	handle     string
 	calls      int
 	lastIntent *agentv1.ApplyIntentRequest
 }
 
-func (s *txSpyApply) Fn(ctx context.Context, intent *agentv1.ApplyIntentRequest) error {
+func (s *txSpyApply) Fn(ctx context.Context, intent *agentv1.ApplyIntentRequest) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls++
 	s.lastIntent = intent
-	return s.err
+	return s.handle, s.err
 }
 
 // sampleIntent is the canonical happy-path intent used by the
@@ -617,10 +619,11 @@ func (txTestExecutor) Apply(_ context.Context, _ *agentv1.ApplyIntentRequest) er
 
 var txTestRegOnce sync.Once
 
-// execApplyForTest 返回真实的 exec.Apply 分派函数(首次调用时注册测试执行器)。
+// execApplyForTest 返回真实的 exec.ApplyWithHandle 分派函数(首次调用时注册
+// 测试执行器)。
 func execApplyForTest() ApplyFunc {
 	txTestRegOnce.Do(func() { exec.Register(txTestKind, txTestExecutor{}) })
-	return exec.Apply
+	return exec.ApplyWithHandle
 }
 
 func execIntent() *agentv1.ApplyIntentRequest {
@@ -1151,5 +1154,94 @@ func TestLocal_AuditEmitsOnSnapshotPathResolutionFailure(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("链上没有 presnapshot_failed 事件, got %+v", events)
+	}
+}
+
+// 成功路径把执行器给的句柄原样带回控制面。
+func TestLocal_SuccessCarriesRollbackHandle(t *testing.T) {
+	apply := &txSpyApply{handle: "dnf-history:42"}
+	tx := New(nil, apply.Fn, t.TempDir(), nil, nil)
+
+	resp, err := tx.Run(context.Background(), &agentv1.ApplyIntentRequest{
+		IntentId: "i-handle", Kind: "package", Target: "nginx",
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if resp.Result != agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_SUCCESS {
+		t.Fatalf("Result = %v, want SUCCESS", resp.Result)
+	}
+	if resp.RollbackHandle != "dnf-history:42" {
+		t.Fatalf("RollbackHandle = %q, want dnf-history:42", resp.RollbackHandle)
+	}
+}
+
+// 空句柄不改变 apply 结局,但链上必须单独留一笔:否则事后分不清
+// 「这个 kind 本来就没有句柄」与「句柄没抓到」。
+func TestLocal_HandleUnavailableIsRecordedOnChain(t *testing.T) {
+	dir := t.TempDir()
+	auditLog, err := audit.New(dir)
+	if err != nil {
+		t.Fatalf("audit.New: %v", err)
+	}
+	apply := &txSpyApply{} // 空句柄:模拟捕获失败
+	tx := New(nil, apply.Fn, dir, nil, auditLog)
+
+	resp, err := tx.Run(context.Background(), &agentv1.ApplyIntentRequest{
+		IntentId: "i-nohandle", Kind: "package", Target: "nginx",
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if resp.Result != agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_SUCCESS {
+		t.Fatalf("Result = %v, want SUCCESS(句柄缺失不改变 apply 结局)", resp.Result)
+	}
+	if resp.RollbackHandle != "" {
+		t.Fatalf("RollbackHandle = %q, want empty", resp.RollbackHandle)
+	}
+
+	events, _, err := auditLog.Since(0)
+	if err != nil {
+		t.Fatalf("audit.Since: %v", err)
+	}
+	var found bool
+	for _, ev := range events {
+		if ev.Tool == "apply_intent.rollback_handle_unavailable" {
+			found = true
+			if ev.Identity != "i-nohandle" {
+				t.Errorf("identity = %q, want i-nohandle", ev.Identity)
+			}
+			if ev.Args["kind"] != "package" {
+				t.Errorf("args[kind] = %q, want package", ev.Args["kind"])
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("链上缺 apply_intent.rollback_handle_unavailable, got %+v", events)
+	}
+}
+
+// file 没有句柄是常态,不该写 rollback_handle_unavailable 噪声。
+func TestLocal_FileKindDoesNotRecordHandleUnavailable(t *testing.T) {
+	dir := t.TempDir()
+	auditLog, err := audit.New(dir)
+	if err != nil {
+		t.Fatalf("audit.New: %v", err)
+	}
+	apply := &txSpyApply{}
+	tx := New(&txMockBackend{}, apply.Fn, dir, nil, auditLog)
+
+	intent := fileIntent(t, "i-file-nohandle")
+	if _, err := tx.Run(context.Background(), intent); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	events, _, err := auditLog.Since(0)
+	if err != nil {
+		t.Fatalf("audit.Since: %v", err)
+	}
+	for _, ev := range events {
+		if ev.Tool == "apply_intent.rollback_handle_unavailable" {
+			t.Errorf("file kind 不该写 rollback_handle_unavailable: %+v", ev)
+		}
 	}
 }

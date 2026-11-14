@@ -12,7 +12,9 @@ import (
 // 控制面只通过 ReportStatus 看链:拒绝事件必须在 wire 上可见,且 payload
 // 能还原 identity/outcome/args,否则"拒绝"对控制面等于没发生。
 func TestReportStatus_SurfacesRefusedApplyIntent(t *testing.T) {
-	rig := startTestServerWithSnapshot(t, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE)
+	// 用假事务(空句柄):高危 package 的结局停在 handler 的"改判拒绝",链上
+	// 只有一条 apply_intent.refused,断言才不会被事务自己的事件搅浑。
+	rig := startTestServerWithTx(t, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE, handleTxFactory(""))
 	defer rig.Cleanup()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -57,7 +59,7 @@ func TestReportStatus_SurfacesRefusedApplyIntent(t *testing.T) {
 	if payload.Identity != "intent-wire-high-risk" {
 		t.Errorf("payload.identity = %q, want intent-wire-high-risk", payload.Identity)
 	}
-	if want := "refused: high-risk intent on a kind without rollback point: kind=package"; payload.Outcome != want {
+	if want := "refused: high-risk intent applied but produced no rollback handle: kind=package target=nginx"; payload.Outcome != want {
 		t.Errorf("payload.outcome = %q, want %q", payload.Outcome, want)
 	}
 	if payload.Args["target"] != "nginx" || payload.Args["kind"] != "package" {

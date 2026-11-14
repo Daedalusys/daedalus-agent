@@ -64,11 +64,12 @@ import (
 )
 
 // ApplyFunc 是事务状态机在 pre-snapshot 与 post-snapshot 之间调用的 apply
-// 步骤。生产实现是 internal/exec 的 Apply:按 intent.Kind 分派到各执行器。
+// 步骤。生产实现是 internal/exec 的 ApplyWithHandle:按 intent.Kind 分派到
+// 各执行器,并回传可持久引用的回滚句柄(没有句柄时为空串)。
 //
 // 实现**必须**尊重 ctx.Done():不观察 ctx 的长 apply 会卡住 gRPC 服务的
 // 优雅退出 —— 见 internal/daemon 的 30s ShutdownTimeout。
-type ApplyFunc func(ctx context.Context, intent *agentv1.ApplyIntentRequest) error
+type ApplyFunc func(ctx context.Context, intent *agentv1.ApplyIntentRequest) (handle string, err error)
 
 // Tx is the per-intent transaction. Construct via New() with
 // a non-nil rollback.Backend (the handler enforces the
@@ -302,7 +303,11 @@ func (t *Local) Run(ctx context.Context, intent *agentv1.ApplyIntentRequest) (*a
 	// 4. Apply。真实执行器(internal/exec)在这里改机器。失败时先看错误
 	// 是可重试还是不可重试,再决定要不要还原、以及上报什么结果码 ——
 	// 控制面据此决定要不要自动重试(TRANSIENT 最多 3 次;PERSISTENT 不重试)。
-	if err := t.apply(ctx, intent); err != nil {
+	//
+	// 句柄只在成功时才有:失败路径上包管理器历史里可能有同名的旧事务,
+	// 抓一个旧 id 交给控制面,回滚时就会去撤一件与本次无关的变更。
+	handle, err := t.apply(ctx, intent)
+	if err != nil {
 		cancelled := errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 		persistent := errors.Is(err, exec.ErrPersistent) || errors.Is(err, exec.ErrUnsupportedKind)
 
@@ -445,10 +450,26 @@ func (t *Local) Run(ctx context.Context, intent *agentv1.ApplyIntentRequest) (*a
 		}); aerr != nil {
 			log.Printf("agent: audit log (success) failed: %v", aerr)
 		}
+		// 变更落地了却没留下可还原锚点:链上必须单独留一笔。否则事后
+		// 分不清「这个 kind 本来就没有句柄」与「句柄没抓到」。
+		if exec.HandleCapable(intent.Kind) && handle == "" {
+			if _, aerr := t.audit.Log(audit.Event{
+				Identity: intent.IntentId,
+				Tool:     "apply_intent.rollback_handle_unavailable",
+				Args: map[string]string{
+					"target": intent.Target,
+					"kind":   intent.Kind,
+				},
+				Outcome: "rollback_handle_unavailable: 变更已落地,但没抓到包管理器/服务管理器的事务标识",
+			}); aerr != nil {
+				log.Printf("agent: audit log (rollback_handle_unavailable) failed: %v", aerr)
+			}
+		}
 	}
 	return &agentv1.ApplyIntentResponse{
-		Result:   agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_SUCCESS,
-		TxId:     txID,
-		AuditSeq: seq,
+		Result:         agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_SUCCESS,
+		TxId:           txID,
+		AuditSeq:       seq,
+		RollbackHandle: handle,
 	}, nil
 }

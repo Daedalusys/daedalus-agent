@@ -446,39 +446,10 @@ func TestHeartbeat_AfterRegister_Acks(t *testing.T) {
 	}
 }
 
-// TestApplyIntent_HighRiskWithoutRollbackPoint_Refused — 准入闸门.
+// 高危 + 无回滚点(file)→ 放行。file 是唯一有回滚点的 kind。
 //
-// 高危 intent 打到没有回滚点的 kind(package / service)上 → 拒绝。拒绝
-// 理由必须说"没有回滚点",而不是"宿主没有快照能力":后者回答的是另一个
-// 问题,照旧用它会把"这台机器没装 btrfs"错当成"这次变更没法还原"。
-//
-// 这里刻意把宿主能力设成 NONE:准入不再看它。
-func TestApplyIntent_HighRiskWithoutRollbackPoint_Refused(t *testing.T) {
-	rig := startTestServerWithSnapshot(t, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE)
-	defer rig.Cleanup()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if _, err := rig.Client.Register(ctx, &agentv1.RegisterRequest{AgentId: "agent-test-1"}); err != nil {
-		t.Fatalf("Register: %v", err)
-	}
-	resp, err := rig.Client.ApplyIntent(ctx, &agentv1.ApplyIntentRequest{
-		IntentId:  "i1",
-		Kind:      "package",
-		Target:    "kernel-core",
-		RiskClass: agentv1.RiskClass_RISK_CLASS_HIGH,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.GetResult() != agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_REFUSED_SNAPSHOT_CAPABILITY_NONE {
-		t.Errorf("结果 = %v, want REFUSED", resp.GetResult())
-	}
-	if !strings.Contains(resp.GetErrorMessage(), "without rollback point") {
-		t.Errorf("文案 = %q, want 含 without rollback point", resp.GetErrorMessage())
-	}
-}
-
+// 高危 package/service 的准入在 internal/rpc/rollback_intent_test.go:它们的
+// 句柄要等 apply 之后才抓得到,所以判定落在事务之后(有句柄放行、空句柄拒绝)。
 // 低危 + 无回滚点 → 放行。低危变更没有还原手段也未必不能做:拒绝与否是
 // 风险问题,不是能力问题。
 func TestApplyIntent_LowRiskWithoutRollbackPoint_Allowed(t *testing.T) {
