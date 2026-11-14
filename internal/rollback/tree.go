@@ -39,6 +39,13 @@ const (
 // 镜像,agent 侧再存一份全文既浪费又不可信;快照只留引用。
 var defaultBaselineRoots = []string{"/usr"}
 
+// 默认保留策略(设计 D8):最近 20 个 intent 的快照,总量不超过 512 MiB。
+// 顺序不能反:先按个数删,再按字节删,否则大快照会把保留名额挤掉。
+const (
+	defaultKeepSnapshotSets = 20
+	defaultSnapshotMaxBytes = 512 << 20
+)
+
 // TreeBackend 是目录级快照后端:内容寻址存对象,manifest 记录每个点名路径
 // 的类型与元数据,还原按 manifest 逐条写回。
 //
@@ -49,6 +56,11 @@ type TreeBackend struct {
 
 	// baselineRoots 可被测试替换;生产前缀见 defaultBaselineRoots。
 	baselineRoots []string
+
+	// keepSets / maxBytes 是建完快照后自动 GC 的策略。留成字段而不是
+	// 直接写死常量:测试要能构造"保留 1 个"的场景。
+	keepSets int
+	maxBytes int64
 }
 
 var _ Backend = (*TreeBackend)(nil)
@@ -59,6 +71,8 @@ func NewTreeBackend(dataDir string) *TreeBackend {
 	return &TreeBackend{
 		dataDir:       dataDir,
 		baselineRoots: append([]string(nil), defaultBaselineRoots...),
+		keepSets:      defaultKeepSnapshotSets,
+		maxBytes:      defaultSnapshotMaxBytes,
 	}
 }
 
@@ -134,7 +148,15 @@ func (t *TreeBackend) CreateSnapshotSet(paths []string, snapshotDir string) erro
 		}
 		m.Entries = append(m.Entries, entry)
 	}
-	return saveManifest(snapshotDir, m)
+	if err := saveManifest(snapshotDir, m); err != nil {
+		return err
+	}
+	// 新快照落好之后顺手 GC。失败只记日志:这次 intent 的快照已经可用,
+	// 清理不掉旧快照不该让本次 intent 失败。
+	if err := t.GC(t.keepSets, t.maxBytes); err != nil {
+		log.Printf("agent: rollback GC after snapshot %q failed: %v", snapshotDir, err)
+	}
+	return nil
 }
 
 // captureEntry 抓一条路径的写前状态。软链只存目标字符串(不跟随);普通

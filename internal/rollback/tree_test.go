@@ -2,6 +2,7 @@ package rollback
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -393,4 +394,95 @@ func setCreatedAt(t *testing.T, snap string, at time.Time) {
 	m := readManifest(t, snap)
 	m.CreatedAt = at.UTC().Format(time.RFC3339Nano)
 	writeManifest(t, snap, m)
+}
+
+// 保留最近 N 个快照:第 21 个进来时最旧的那个被删。
+func TestTree_GCKeepsNewestN(t *testing.T) {
+	dataDir, b := treeFixture(t)
+	root := t.TempDir()
+	base := time.Date(2026, 11, 14, 0, 0, 0, 0, time.UTC)
+
+	const total = 21
+	dirs := make([]string, 0, total)
+	for i := 0; i < total; i++ {
+		p := filepath.Join(root, "f"+string(rune('a'+i))+".conf")
+		writeFile(t, p, "content-"+string(rune('a'+i)), 0o644)
+		dir := treeSnapDir(dataDir, "intent-"+string(rune('a'+i)))
+		if err := b.CreateSnapshotSet([]string{p}, dir); err != nil {
+			t.Fatalf("CreateSnapshotSet(%d): %v", i, err)
+		}
+		setCreatedAt(t, dir, base.Add(time.Duration(i)*time.Minute))
+		dirs = append(dirs, dir)
+	}
+
+	if err := b.GC(20, 1<<30); err != nil {
+		t.Fatalf("GC: %v", err)
+	}
+	if _, err := os.Stat(dirs[0]); !os.IsNotExist(err) {
+		t.Errorf("最旧的快照应被删除, stat err = %v", err)
+	}
+	for _, dir := range dirs[1:] {
+		if _, err := os.Stat(dir); err != nil {
+			t.Errorf("应保留 %q: %v", dir, err)
+		}
+	}
+}
+
+// 总字节上限:超了就按最旧优先删,直到回到上限内。
+func TestTree_GCRespectsByteLimit(t *testing.T) {
+	dataDir, b := treeFixture(t)
+	root := t.TempDir()
+	base := time.Date(2026, 11, 14, 0, 0, 0, 0, time.UTC)
+
+	names := []string{"old", "mid", "new"}
+	sizes := []int{100, 400, 1600}
+	dirs := make([]string, 0, len(names))
+	for i, name := range names {
+		p := filepath.Join(root, name+".conf")
+		writeFile(t, p, strings.Repeat("x", sizes[i]), 0o644)
+		dir := treeSnapDir(dataDir, "intent-"+name)
+		if err := b.CreateSnapshotSet([]string{p}, dir); err != nil {
+			t.Fatalf("CreateSnapshotSet(%s): %v", name, err)
+		}
+		setCreatedAt(t, dir, base.Add(time.Duration(i)*time.Minute))
+		dirs = append(dirs, dir)
+	}
+
+	// 上限恰好只装得下最新那份。
+	maxBytes := dirSize(dirs[2])
+	if err := b.GC(100, maxBytes); err != nil {
+		t.Fatalf("GC: %v", err)
+	}
+	for _, dir := range dirs[:2] {
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Errorf("超出字节上限的旧快照应被删除 %q, stat err = %v", dir, err)
+		}
+	}
+	if _, err := os.Stat(dirs[2]); err != nil {
+		t.Errorf("最新的快照应保留: %v", err)
+	}
+}
+
+// 创建快照后自动按默认策略触发 GC:第 21 个快照进来后旧的被清掉。
+func TestTree_CreateSnapshotSetTriggersGC(t *testing.T) {
+	dataDir, b := treeFixture(t)
+	root := t.TempDir()
+
+	oldest := ""
+	for i := 0; i <= defaultKeepSnapshotSets; i++ {
+		p := filepath.Join(root, fmt.Sprintf("f%d.conf", i))
+		writeFile(t, p, fmt.Sprintf("content-%d", i), 0o644)
+		dir := treeSnapDir(dataDir, fmt.Sprintf("intent-%02d", i))
+		if err := b.CreateSnapshotSet([]string{p}, dir); err != nil {
+			t.Fatalf("CreateSnapshotSet(%d): %v", i, err)
+		}
+		if i == 0 {
+			oldest = dir
+		}
+		// 让 created_at 严格递增:同一毫秒内建立的快照不能靠时钟排序。
+		setCreatedAt(t, dir, time.Date(2026, 11, 14, 0, 0, i, 0, time.UTC))
+	}
+	if _, err := os.Stat(oldest); !os.IsNotExist(err) {
+		t.Errorf("超过保留数后最旧的快照应被自动清理, stat err = %v", err)
+	}
 }
