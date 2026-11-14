@@ -3,7 +3,7 @@ daedalus-agent: heterogeneous Linux endpoint for daedalus fleet control plane (P
 
 ## CI gates
 
-Two jobs **run** on every push / PR (`.github/workflows/ci.yml`):
+Three jobs **run** on every push / PR (`.github/workflows/ci.yml`):
 
 - **Go Test** — `go vet ./...` + `go test -race -count=1 ./...`. The SDK is checked out as a
   sibling directory (`daedalus-sdk/`), which is what `go.mod`'s
@@ -12,19 +12,26 @@ Two jobs **run** on every push / PR (`.github/workflows/ci.yml`):
   inside a systemd container and asserts `systemctl is-active daedalus-agent.service` is
   `active`. This is the gate that closes the class of bug that let agent#2 (ExecStart missing
   the `daemon` sub-command → daemon dies immediately after install) reach `main`.
+- **Package Manager Shapes (debian:13 / ubuntu:26.04 / almalinux:9 / almalinux:10)** — builds the
+  `realmachine`-tagged test binary (`internal/rollback/package_manager_real_test.go`) and runs it
+  inside each distro container: apt images really install `hello` and must yield an `apt-log`
+  handle plus a plan (native undo on apt ≥ 3.2, the degraded plan on Debian 13's 3.0.x), dnf
+  images must yield a `dnf-history` handle from the text fallback and a `dnf history undo <id>`
+  plan. Unit-test fixtures copied from these images cannot prove the shapes still hold on a real
+  host; this job can.
 
-**Neither job blocks a merge, and `main` has no branch protection.** `branches/main/protection`
+**None of the jobs blocks a merge, and `main` has no branch protection.** `branches/main/protection`
 returns `404 Branch not protected`, the repository has no rulesets (`rulesets` → `[]`), and
-`required_status_checks.enforcement_level` is `off`. The two jobs report their result; a red
+`required_status_checks.enforcement_level` is `off`. The jobs report their result; a red
 run does not stop a merge. A gate that only *claims* to block merges is worse than no gate at
 all, because it teaches reviewers to trust a signal nothing enforces.
 
-Turning these two jobs into enforced merge conditions on `main` is a repository-management
+Turning these jobs into enforced merge conditions on `main` is a repository-management
 decision and is **open for the maintainer** — it is **not done in this repository yet**.
 
 The incident that motivates the workflow: the repository had **zero** workflows before it, so
 every change reached `main` unverified (see the PR body of the change that added this file).
-Two jobs exist now, but they are **not required** as merge conditions, so the same class of
+Jobs exist now, but they are **not required** as merge conditions, so the same class of
 incident can still recur.
 
 ## Directory-level `file` intents
@@ -94,9 +101,20 @@ Handles are opaque to the control plane and defined by the agent:
 | Handle | Meaning |
 |---|---|
 | `dnf-history:<id>` | the dnf transaction this apply produced |
-| `apt-history:<id>` | the apt history entry this apply produced |
+| `apt-log:<start-unix>:<pkg>` | the apt transaction this apply produced: its `Start-Date` (unix seconds) plus the package, read from `/var/log/apt/history.log` |
 | `service-state:<base64url JSON>` | the unit's `ActiveState` / `UnitFileState` / `SubState` **before** the apply |
 | *(empty)* | no anchor — e.g. the apply was a no-op, or the capture failed |
+
+apt has no `history` sub-command before 3.2 (Debian 13 / apt 3.0.4 answers `Error: Invalid
+operation history-list`), so the apt handle anchors a **log entry's `Start-Date`**, not a history
+id: on those hosts the id cannot be obtained at all, and a stored log position would silently
+point at another transaction once `history.log` rotates. Capture takes the last entry whose
+`Start-Date` is within 5 s of the apply start and whose change set (`Install:` / `Upgrade:` /
+`Remove:` / `Reinstall:`) names the package; no such entry (or no log) means an empty handle —
+never a guess. `dnf history --json` is likewise a dnf5 feature; on dnf4 it exits 2, so capture
+falls back to `dnf history list` + `dnf history info <id>` and parses the text form. Package-manager
+queries run with `LC_ALL=C`: the parsers match English keys (`Begin time`, `Start time`), and a
+localized host would otherwise translate them and silently disable the fallback.
 
 Capture never changes the apply outcome. A successful apply with an empty handle is still
 `SUCCESS`, and the chain carries `apply_intent.rollback_handle_unavailable` so "this kind has no
@@ -115,7 +133,10 @@ Rollback runs through `RollbackIntent` in two phases:
 Auto vs human review:
 
 - `dnf history undo <id>` and, on apt ≥ 3.2, the native history undo are single-step plans with
-  `auto_ok` — the control plane may APPLY them unattended.
+  `auto_ok` — the control plane may APPLY them unattended. apt's own id is its **log position**,
+  so PLAN re-reads the log, locates the entry by `Start-Date`, then cross-checks the `Start time`
+  that `apt history-info <index>` reports against it. A mismatch (rotated log, index drift) or a
+  failing `history-info` falls back to the degraded plan rather than gambling on the index.
 - Older apt has no native undo: the plan degrades to `apt-get remove`, then an `rm -rf` of the
   paths dpkg recorded as **conffiles** (`dpkg-query -W -f='${Conffiles}'`; `remove` keeps them),
   then a `MANUAL` checklist item for what no dpkg file list can prove (postinst/preinst side
@@ -131,8 +152,8 @@ Auto vs human review:
 package's **conffiles** — matched exactly and cross-checked against `dpkg-query -L` (no prefix or
 directory matching: `-L` lists `/etc`, so prefix matching would allow `/etc/passwd`). Ownership is
 never taken from the request: APPLY steps carry no file list, so the agent re-queries it from the
-handle (`apt history-info` → `dpkg-query -L` + `${Conffiles}`) and refuses the whole plan when the
-records cannot be re-derived. APPLY is refused when the token
+handle (`apt-log` → the log entry's package → `dpkg-query -L` + `${Conffiles}`) and refuses the
+whole plan when the records cannot be re-derived. APPLY is refused when the token
 is missing, expired, already used, bound to another plan or another intent, or when a step
 falls outside the command allowlist.
 The token proves "this APPLY is bound to that plan hash" — it does **not** prove a human read

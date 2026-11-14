@@ -91,13 +91,12 @@ func TestApply_RejectsUnmarkedDestructiveStep(t *testing.T) {
 }
 
 // aptOwnedFake 伪造一台"nginx 已装"的宿主:执行期复核 rm 路径要重查
-// apt 历史(拿包名)、dpkg 的 conffile 记录与文件清单。
+// apt 历史日志(拿包名)、dpkg 的 conffile 记录与文件清单。
 //
 // -L 里带目录(真机形状),所以归属判定必须精确匹配 conffile —— 按目录
 // 前缀放行会让 /etc 下的任何文件都算"包拥有"。
 func aptOwnedFake() *fakeCommands {
 	fc := newFakeCommands()
-	fc.out["apt history-info 7"] = "Commandline: apt-get install nginx\n"
 	fc.out["dpkg-query -L nginx"] = strings.Join([]string{
 		"/.",
 		"/etc",
@@ -112,18 +111,27 @@ func aptOwnedFake() *fakeCommands {
 	return fc
 }
 
+// withAptOwnedHost 装上 apt 的命令回包与历史日志(包名只能从日志重查)。
+func withAptOwnedHost(t *testing.T) *fakeCommands {
+	t.Helper()
+	fc := aptOwnedFake()
+	withFakeCommands(t, fc)
+	withAptLog(t, aptLogNginx)
+	return fc
+}
+
 // 重查到的 conffile + 标了人审 → 放行。
 func TestApply_AllowsPackageOwnedRmAfterReview(t *testing.T) {
 	fr := newFakeRunner()
 	withFakeRun(t, fr)
-	withFakeCommands(t, aptOwnedFake())
+	withAptOwnedHost(t)
 
 	r := NewStepRunner()
 	err := r.Run(context.Background(), []Step{{
 		Kind:        StepFileDelete,
 		Command:     "rm -rf /etc/nginx/nginx.conf",
 		HumanReview: true,
-		Handle:      "apt-history:7",
+		Handle:      aptNginxHandle,
 	}})
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -137,14 +145,14 @@ func TestApply_AllowsPackageOwnedRmAfterReview(t *testing.T) {
 func TestApply_RejectsNonPackageOwnedRm(t *testing.T) {
 	fr := newFakeRunner()
 	withFakeRun(t, fr)
-	withFakeCommands(t, aptOwnedFake())
+	withAptOwnedHost(t)
 
 	r := NewStepRunner()
 	err := r.Run(context.Background(), []Step{{
 		Kind:        StepFileDelete,
 		Command:     "rm -rf /etc/shadow",
 		HumanReview: true,
-		Handle:      "apt-history:7",
+		Handle:      aptNginxHandle,
 	}})
 	if !errors.Is(err, ErrPathNotOwned) {
 		t.Fatalf("got %v, want ErrPathNotOwned", err)
@@ -159,14 +167,14 @@ func TestApply_RejectsNonPackageOwnedRm(t *testing.T) {
 func TestApply_RejectsOwnedButNonConffile(t *testing.T) {
 	fr := newFakeRunner()
 	withFakeRun(t, fr)
-	withFakeCommands(t, aptOwnedFake())
+	withAptOwnedHost(t)
 
 	r := NewStepRunner()
 	err := r.Run(context.Background(), []Step{{
 		Kind:        StepFileDelete,
 		Command:     "rm -rf /usr/sbin/nginx", // 在 -L 里,但不是 conffile
 		HumanReview: true,
-		Handle:      "apt-history:7",
+		Handle:      aptNginxHandle,
 	}})
 	if !errors.Is(err, ErrPathNotOwned) {
 		t.Fatalf("got %v, want ErrPathNotOwned", err)
@@ -181,14 +189,14 @@ func TestApply_RejectsOwnedButNonConffile(t *testing.T) {
 func TestApply_RejectsRmUnderOwnedDirectory(t *testing.T) {
 	fr := newFakeRunner()
 	withFakeRun(t, fr)
-	withFakeCommands(t, aptOwnedFake())
+	withAptOwnedHost(t)
 
 	r := NewStepRunner()
 	err := r.Run(context.Background(), []Step{{
 		Kind:        StepFileDelete,
 		Command:     "rm -rf /etc/passwd", // /etc 在 -L 里,但 /etc/passwd 不是
 		HumanReview: true,
-		Handle:      "apt-history:7",
+		Handle:      aptNginxHandle,
 	}})
 	if !errors.Is(err, ErrPathNotOwned) {
 		t.Fatalf("got %v, want ErrPathNotOwned", err)
@@ -203,14 +211,14 @@ func TestApply_RejectsRmUnderOwnedDirectory(t *testing.T) {
 func TestApply_IgnoresStepDeclaredOwnedPaths(t *testing.T) {
 	fr := newFakeRunner()
 	withFakeRun(t, fr)
-	withFakeCommands(t, aptOwnedFake())
+	withAptOwnedHost(t)
 
 	r := NewStepRunner()
 	err := r.Run(context.Background(), []Step{{
 		Kind:        StepFileDelete,
 		Command:     "rm -rf /etc/shadow",
 		HumanReview: true,
-		Handle:      "apt-history:7",
+		Handle:      aptNginxHandle,
 		OwnedPaths:  []string{"/etc/shadow"}, // 请求方自带清单,不算数
 	}})
 	if !errors.Is(err, ErrPathNotOwned) {
@@ -224,23 +232,21 @@ func TestApply_IgnoresStepDeclaredOwnedPaths(t *testing.T) {
 // 重查失败 → fail-closed:拿不到证明就不执行,不猜、不放行。
 func TestApply_RejectsFileDeleteWhenOwnershipLookupFails(t *testing.T) {
 	for _, key := range []string{
-		"apt history-info 7",
 		"dpkg-query -L nginx",
 		"dpkg-query -W -f=${Conffiles}\\n nginx",
 	} {
 		t.Run(key, func(t *testing.T) {
 			fr := newFakeRunner()
 			withFakeRun(t, fr)
-			fc := aptOwnedFake()
+			fc := withAptOwnedHost(t)
 			fc.err[key] = errors.New("exit status 1")
-			withFakeCommands(t, fc)
 
 			r := NewStepRunner()
 			err := r.Run(context.Background(), []Step{{
 				Kind:        StepFileDelete,
 				Command:     "rm -rf /etc/nginx/nginx.conf",
 				HumanReview: true,
-				Handle:      "apt-history:7",
+				Handle:      aptNginxHandle,
 			}})
 			if !errors.Is(err, ErrOwnershipUnverifiable) {
 				t.Fatalf("got %v, want ErrOwnershipUnverifiable", err)
@@ -250,6 +256,28 @@ func TestApply_RejectsFileDeleteWhenOwnershipLookupFails(t *testing.T) {
 			}
 		})
 	}
+
+	// 历史日志读不了 → 包名查不到 → 同样拒绝。
+	t.Run("apt history log unreadable", func(t *testing.T) {
+		fr := newFakeRunner()
+		withFakeRun(t, fr)
+		withFakeCommands(t, aptOwnedFake())
+		withAptLogError(t, errors.New("no such file"))
+
+		r := NewStepRunner()
+		err := r.Run(context.Background(), []Step{{
+			Kind:        StepFileDelete,
+			Command:     "rm -rf /etc/nginx/nginx.conf",
+			HumanReview: true,
+			Handle:      aptNginxHandle,
+		}})
+		if !errors.Is(err, ErrOwnershipUnverifiable) {
+			t.Fatalf("got %v, want ErrOwnershipUnverifiable", err)
+		}
+		if got := fr.recorded(); len(got) != 0 {
+			t.Fatalf("calls = %v, want none", got)
+		}
+	})
 }
 
 // 句柄不是 apt 类 → 没有可证明的文件清单,拒执行删除步(fail-closed)。
@@ -354,8 +382,8 @@ func TestApply_SkipsManualSteps(t *testing.T) {
 
 	r := NewStepRunner()
 	err := r.Run(context.Background(), []Step{
-		{Kind: StepPackageRemove, Command: "apt-get remove -y nginx", HumanReview: true, Handle: "apt-history:7"},
-		{Kind: StepManual, Rationale: "人工核对 nginx 的残留配置", HumanReview: true, Handle: "apt-history:7"},
+		{Kind: StepPackageRemove, Command: "apt-get remove -y nginx", HumanReview: true, Handle: aptNginxHandle},
+		{Kind: StepManual, Rationale: "人工核对 nginx 的残留配置", HumanReview: true, Handle: aptNginxHandle},
 	})
 	if err != nil {
 		t.Fatalf("Run: %v", err)

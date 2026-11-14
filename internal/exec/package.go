@@ -174,7 +174,7 @@ func (packageExecutor) RollbackHandle(ctx context.Context, intent *agentv1.Apply
 	case "dnf":
 		return captureDnfHandle(ctx, intent.Target, col.since())
 	case "apt":
-		return captureAptHandle(ctx, intent.Target)
+		return captureAptHandle(ctx, intent.Target, col.since())
 	}
 	return "", fmt.Errorf("%w: unsupported host manager %q", ErrPersistent, mgr.name)
 }

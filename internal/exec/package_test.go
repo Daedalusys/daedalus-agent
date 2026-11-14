@@ -13,21 +13,38 @@ import (
 // 查询类命令(dpkg-query / rpm)回报 installed 里的状态,变更类命令
 // (apt-get / dnf)记录 argv 并在成功时翻转状态。
 //
-// verbOut / verbErr 让测试注入管理器输出与退出错误,用来驱动错误分类。
+// verbOut / verbErr 让测试注入管理器输出与退出错误,用来驱动错误分类;
+// replies 按完整 argv 命中,给需要多条不同回包的历史查询用
+// (dnf history list / info 的形状不同)。
 type fakeHost struct {
 	manager   string // "apt" | "dnf"
 	installed map[string]bool
 	calls     [][]string
 	verbOut   string
 	verbErr   error
-	// historyOut / historyErr 是历史查询(dnf history --json / apt
-	// history-list)的回包;回滚句柄的 id 就从这里来。
+	// historyOut / historyErr 是 dnf history --json 的回包;回滚句柄的 id
+	// 就从这里来。
 	historyOut string
 	historyErr error
+	// replies 按 "name arg1 arg2..." 命中,优先于上面的通用回包。
+	replies map[string]fakeReply
+	// aptLog / aptLogErr 是 /var/log/apt/history.log 的内容(apt 句柄的唯一
+	// 锚点来源)。
+	aptLog    string
+	aptLogErr error
+}
+
+// fakeReply 是一条按 argv 命中的回包。
+type fakeReply struct {
+	out string
+	err error
 }
 
 func (h *fakeHost) run(_ context.Context, name string, args ...string) (string, error) {
 	h.calls = append(h.calls, append([]string{name}, args...))
+	if r, ok := h.replies[strings.TrimSpace(name+" "+strings.Join(args, " "))]; ok {
+		return r.out, r.err
+	}
 	last := ""
 	if len(args) > 0 {
 		last = args[len(args)-1]
@@ -44,7 +61,7 @@ func (h *fakeHost) run(_ context.Context, name string, args ...string) (string, 
 		}
 		return "package " + last + " is not installed", errors.New("exit status 1")
 	case "dnf", "apt":
-		// 历史查询(dnf history --json / apt history-list):只读,不改状态。
+		// 历史查询(dnf history --json 及其文本回退):只读,不改状态。
 		return h.historyOut, h.historyErr
 	case "/usr/bin/apt-get", "/usr/bin/dnf":
 		if h.verbErr != nil {
@@ -88,14 +105,20 @@ func (h *fakeHost) lastManagerCall() []string {
 	return nil
 }
 
-// withFakeHost 把 runCmd / fileExists 两个缝换成 h,并在测试结束时还原。
-// 不 t.Parallel:这两个是包级变量。
+// withFakeHost 把 runCmd / fileExists / readFile 三个缝换成 h,并在测试结束
+// 时还原。不 t.Parallel:它们是包级变量。
 func withFakeHost(t *testing.T, h *fakeHost) {
 	t.Helper()
-	prevRun, prevExists := runCmd, fileExists
-	t.Cleanup(func() { runCmd, fileExists = prevRun, prevExists })
+	prevRun, prevExists, prevRead := runCmd, fileExists, readFile
+	t.Cleanup(func() { runCmd, fileExists, readFile = prevRun, prevExists, prevRead })
 	runCmd = h.run
 	fileExists = func(p string) bool { return p == h.managerBin() }
+	readFile = func(string) ([]byte, error) {
+		if h.aptLogErr != nil {
+			return nil, h.aptLogErr
+		}
+		return []byte(h.aptLog), nil
+	}
 }
 
 func pkgIntent(spec, name string) *agentv1.ApplyIntentRequest {
