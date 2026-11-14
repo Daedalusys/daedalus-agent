@@ -217,24 +217,29 @@ func (s *agentService) pendingIntentCount() int {
 // the agent selects via rollback.SelectBackend based on the
 // live detector capability.
 //
-// 回滚点形态由调用方传入(PointFor 已在 handler 里算过),宿主能力才从
-// detector 取:PointFile 恒走 copy,能力只在 PointVolume 时参与选择。
+// 回滚点形态由调用方传入(PointForIntent 已在 handler 里算过),宿主能力才
+// 从 detector 取:PointFile / PointTree 恒走内建后端,能力只在 PointVolume
+// 时参与选择。tree 后端要靠 cfg.DataDir 定位快照集合,所以走带数据目录的
+// SelectBackendFor。
 func (s *agentService) selectedBackend(point rollback.Point) (rollback.Backend, error) {
 	if s.backend != nil {
 		return s.backend, nil
 	}
-	return rollback.SelectBackend(point, s.snapshot.Capability())
+	return rollback.SelectBackendFor(point, s.snapshot.Capability(), s.cfg.DataDir)
 }
 
 // buildTx 构造每次 ApplyIntent 的事务:测试注入的 txFactory 优先,否则走
 // 生产默认(tx.New + internal/exec 分派器)。传入的 backend 与 auditSeq
 // 原样转发给事务。
 //
+// opts 只对生产默认路径生效:txFactory 是测试替身,替身要不要支持目录
+// 快照由测试自己决定。
+//
 // 同时转发进程级哈希链审计日志(与 report_status.go 共用):
 // tx.Local 在每次 ApplyIntent 结局往链上写 success / failure 事件。
-func (s *agentService) buildTx(backend rollback.Backend) tx.Tx {
+func (s *agentService) buildTx(backend rollback.Backend, opts ...tx.Option) tx.Tx {
 	if s.txFactory != nil {
 		return s.txFactory(backend, s.cfg.DataDir, s.auditSeq, s.audit)
 	}
-	return tx.New(backend, exec.Apply, s.cfg.DataDir, s.auditSeq, s.audit)
+	return tx.New(backend, exec.Apply, s.cfg.DataDir, s.auditSeq, s.audit, opts...)
 }
