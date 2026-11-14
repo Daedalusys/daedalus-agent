@@ -9,6 +9,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Daedalusys/daedalus-sdk/pkgquery"
 
@@ -115,7 +116,7 @@ func BuildPlan(ctx context.Context, handle string, allower CommandAllower) (Plan
 	switch kind {
 	case exec.HandleDnfHistory:
 		return buildDnfPlan(handle, id, allower)
-	case exec.HandleAptHistory:
+	case exec.HandleAptLog:
 		return buildAptPlan(ctx, handle, id, allower)
 	case exec.HandleService:
 		return buildServicePlan(handle, id, allower)
@@ -147,21 +148,39 @@ func buildDnfPlan(handle, id string, allower CommandAllower) (Plan, error) {
 	}, nil
 }
 
-// apt 版本不够(没有原生 undo)→ 退化计划:卸载 → 删残留 conffiles → 人工核对。
+// readAptHistoryLog 是读 apt 历史日志的注入缝(生产即 exec.ReadAptHistoryLog)。
+var readAptHistoryLog = exec.ReadAptHistoryLog
+
+// buildAptPlan 按 apt-log 句柄生成计划。
 //
-// 为什么两步而不是直接 purge:purge 是包管理器自己的一次销毁动作,人审时看不到
-// 它到底会删哪些路径。拆成 remove + rm conffiles 之后,删除目标就在计划里
-// 逐条列出,且每条都能被 dpkg 的文件清单证明。
+// 句柄只带 Start-Date 与目标包;计划期重新读日志精确定位条目:找不到、或
+// 包不在该条目的变更集合里,都 fail-closed —— 拿不准是哪次变更就不动手。
 func buildAptPlan(ctx context.Context, handle, id string, allower CommandAllower) (Plan, error) {
-	if _, err := strconv.ParseInt(id, 10, 64); err != nil {
-		return Plan{}, fmt.Errorf("%w: apt history id %q is not a number", ErrPlanUnsupported, id)
+	startUnix, pkg, err := parseAptLogHandleID(id)
+	if err != nil {
+		return Plan{}, err
+	}
+	entries, err := readAptHistoryLog()
+	if err != nil {
+		return Plan{}, fmt.Errorf("%w: %v", ErrPlanUnsupported, err)
+	}
+	idx, entry, ok := findAptLogEntry(entries, startUnix)
+	if !ok {
+		return Plan{}, fmt.Errorf("%w: apt history log has no entry starting at %d", ErrPlanUnsupported, startUnix)
+	}
+	if !aptLogEntryHasPackage(entry, pkg) {
+		return Plan{}, fmt.Errorf("%w: apt history entry at %d does not touch package %q", ErrPlanUnsupported, startUnix, pkg)
 	}
 	native, err := aptSupportsUndo()
 	if err != nil {
 		return Plan{}, err
 	}
-	if native {
-		cmd := aptUndoCommand(id)
+	// 序号只在"日志位置 == apt 的历史编号"时成立(logrotate 后不一定),
+	// 所以必须拿 history-info 的 Start time 交叉核对;核对不上就退回退化
+	// 计划 —— 用错序号会撤销别的事务。
+	if native && aptEntryMatchesHistoryInfo(entry, idx) {
+		undoID := strconv.Itoa(idx)
+		cmd := aptUndoCommand(undoID)
 		if err := allowCommand(allower, cmd); err != nil {
 			return Plan{}, err
 		}
@@ -170,21 +189,22 @@ func buildAptPlan(ctx context.Context, handle, id string, allower CommandAllower
 			Steps: []Step{{
 				Kind:      StepNativeUndo,
 				Command:   cmd,
-				Rationale: "apt 原生撤销历史条目 " + id + ";失败即冲突,不重试",
+				Rationale: "apt 原生撤销历史条目 " + undoID + ";失败即冲突,不重试",
 				Handle:    handle,
 			}},
 			AutoOK: true,
 		}, nil
 	}
 
-	// 老 apt 没有原生 undo:只能卸载,而且卸载不还原旧版本。这条路径必须人审。
-	pkg, err := aptHistoryPackage(id)
-	if err != nil {
-		return Plan{}, err
-	}
-	if err := validatePackageName(pkg); err != nil {
-		return Plan{}, err
-	}
+	return buildAptDegradedPlan(handle, pkg, allower)
+}
+
+// buildAptDegradedPlan 是老 apt 的退化计划:卸载 → 删残留 conffiles → 人工核对。
+//
+// 为什么两步而不是直接 purge:purge 是包管理器自己的一次销毁动作,人审时看不到
+// 它到底会删哪些路径。拆成 remove + rm conffiles 之后,删除目标就在计划里
+// 逐条列出,且每条都能被 dpkg 的文件清单证明。
+func buildAptDegradedPlan(handle, pkg string, allower CommandAllower) (Plan, error) {
 	// 两条只读查询就是"凭什么删"的全部证据:包声明拥有的文件清单 + dpkg 记为
 	// 配置文件的那些路径。任何一条查不到都整份计划失败 —— 只出一半证据的计划
 	// 会让人在"看起来完整"的步骤上点同意。
@@ -482,61 +502,96 @@ func aptSupportsUndo() (bool, error) {
 	return major > 3 || (major == 3 && minor >= 2), nil
 }
 
-// aptHistoryPackage 从 apt 历史里反查这次变更动的是哪个包。
-//
-// 句柄只带历史 id(格式钉死在 apt-history:<id>),包名要在计划期查:老 apt
-// 的退化计划必须点名卸载谁,而"猜一个包"等于删错东西。
-func aptHistoryPackage(id string) (string, error) {
-	out, err := runCommandOutput("apt", "history-info", id)
-	if err != nil {
-		return "", fmt.Errorf("rollback: apt history-info %s: %w", id, err)
+// parseAptLogHandleID 拆 apt-log 句柄的 id:<start-unix>:<pkg>。
+func parseAptLogHandleID(id string) (int64, string, error) {
+	rawStart, pkg, ok := strings.Cut(id, ":")
+	if !ok {
+		return 0, "", fmt.Errorf("%w: apt log handle %q is not <start-unix>:<pkg>", ErrPlanUnsupported, id)
 	}
-	return packageFromAptCommandline(string(out))
+	start, err := strconv.ParseInt(rawStart, 10, 64)
+	if err != nil {
+		return 0, "", fmt.Errorf("%w: apt log start %q is not a unix time", ErrPlanUnsupported, rawStart)
+	}
+	if err := validatePackageName(pkg); err != nil {
+		return 0, "", err
+	}
+	return start, pkg, nil
 }
 
-// aptVerbs 是 apt 历史命令行里的动词,不是包名。
-var aptVerbs = map[string]struct{}{
-	"install": {}, "remove": {}, "purge": {}, "upgrade": {}, "dist-upgrade": {},
-	"full-upgrade": {}, "autoremove": {}, "reinstall": {}, "downgrade": {},
+// findAptLogEntry 按 Start-Date 精确定位日志条目,并给出它在日志里的 0-based
+// 位置(apt ≥ 3.2 的 history-info 编号就是它)。
+//
+// 用 Start-Date 而不是序号:序号会被 logrotate 平移,Start-Date 不会。
+func findAptLogEntry(entries []exec.AptLogEntry, startUnix int64) (int, exec.AptLogEntry, bool) {
+	for i, e := range entries {
+		if e.StartDate.Unix() == startUnix {
+			return i, e, true
+		}
+	}
+	return 0, exec.AptLogEntry{}, false
 }
 
-// packageFromAptCommandline 从 apt history-info 的 "Commandline:" 行取出
-// 唯一的包名。多于一个包时报错:句柄没说是哪一个,猜不得。
-func packageFromAptCommandline(out string) (string, error) {
+// aptLogEntryHasPackage 报告这条日志条目是否动过 pkg。
+func aptLogEntryHasPackage(e exec.AptLogEntry, pkg string) bool {
+	for _, p := range e.Packages {
+		if p == pkg {
+			return true
+		}
+	}
+	return false
+}
+
+// aptEntryMatchesHistoryInfo 用 apt 自己的 history-info 交叉核对日志序号。
+//
+// 第二个返回值来自 history-info 的 "Start time":只有它与日志条目的
+// Start-Date 完全一致,才能确认"日志位置 idx"就是"事务 idx"。
+func aptEntryMatchesHistoryInfo(entry exec.AptLogEntry, idx int) bool {
+	out, err := runCommandOutput("apt", "history-info", strconv.Itoa(idx))
+	if err != nil {
+		return false
+	}
+	start, ok := aptHistoryInfoStart(string(out))
+	return ok && start.Equal(entry.StartDate)
+}
+
+// aptHistoryInfoStart 从 history-info 的输出里取 "Start time"。
+func aptHistoryInfoStart(out string) (time.Time, bool) {
 	for _, line := range strings.Split(out, "\n") {
-		t := strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(line), "-"))
-		rest, ok := strings.CutPrefix(t, "Commandline:")
+		rest, ok := strings.CutPrefix(strings.TrimSpace(line), "Start time:")
 		if !ok {
 			continue
 		}
-		var pkgs []string
-		for _, f := range strings.Fields(rest) {
-			f = strings.TrimSuffix(f, ",")
-			if f == "" || f == "apt" || f == "apt-get" || strings.HasPrefix(f, "-") {
-				continue
-			}
-			if _, isVerb := aptVerbs[f]; isVerb {
-				continue
-			}
-			name := f
-			if i := strings.IndexAny(name, "=:"); i > 0 {
-				name = name[:i]
-			}
-			if name == "" {
-				continue
-			}
-			pkgs = append(pkgs, name)
+		t, err := exec.ParseAptLogTime(rest)
+		if err != nil {
+			return time.Time{}, false
 		}
-		switch len(pkgs) {
-		case 1:
-			return pkgs[0], nil
-		case 0:
-			continue
-		default:
-			return "", fmt.Errorf("%w: apt history entry touches %d packages; cannot pick one", ErrPlanUnsupported, len(pkgs))
-		}
+		return t, true
 	}
-	return "", fmt.Errorf("%w: apt history-info has no usable command line", ErrPlanUnsupported)
+	return time.Time{}, false
+}
+
+// aptHistoryPackage 从句柄取这次变更动的是哪个包。
+//
+// 包名从日志条目复核:句柄里的 pkg 必须真的出现在该条目的变更集合里,否则
+// 句柄与日志对不上(旧机器 / 轮转后重号),不能拿它去卸载 —— "猜一个包"
+// 等于删错东西。
+func aptHistoryPackage(id string) (string, error) {
+	startUnix, pkg, err := parseAptLogHandleID(id)
+	if err != nil {
+		return "", err
+	}
+	entries, err := readAptHistoryLog()
+	if err != nil {
+		return "", fmt.Errorf("rollback: read apt history log: %w", err)
+	}
+	_, entry, ok := findAptLogEntry(entries, startUnix)
+	if !ok {
+		return "", fmt.Errorf("%w: apt history log has no entry starting at %d", ErrPlanUnsupported, startUnix)
+	}
+	if !aptLogEntryHasPackage(entry, pkg) {
+		return "", fmt.Errorf("%w: apt history entry at %d does not touch package %q", ErrPlanUnsupported, startUnix, pkg)
+	}
+	return pkg, nil
 }
 
 // parseAptVersion 从 "apt 2.4.11 (amd64)" 里取 major.minor。

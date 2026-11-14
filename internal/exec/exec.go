@@ -28,6 +28,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 
 	agentv1 "github.com/Daedalusys/daedalus-sdk/proto/agent/v1"
@@ -197,13 +198,37 @@ type cmdRunner func(ctx context.Context, name string, args ...string) (string, e
 
 // runCmd 是 production 实现:exec.CommandContext 保证 ctx 取消时进程被
 // 杀,命令因此天然尊重 ctx.Done()。
-var runCmd cmdRunner = func(ctx context.Context, name string, args ...string) (string, error) {
+var runCmd cmdRunner = runCmdProduction
+
+// runCmdProduction 起一条真实命令并合并输出。
+//
+// 环境里固定 LC_ALL=C:执行器解析的是包管理器的英文键与英文错误字句
+// (dnf 的 "Begin time"、apt 的 "Start time"、错误分类词表),宿主 locale
+// 会把它们翻掉 —— 中文宿主机上 "Begin time" 是 "起始时间",按英文字面
+// 匹配的解析会整条失效。
+func runCmdProduction(ctx context.Context, name string, args ...string) (string, error) {
 	c := exec.CommandContext(ctx, name, args...)
+	c.Env = forceCLocale(os.Environ())
 	var buf bytes.Buffer
 	c.Stdout = &buf
 	c.Stderr = &buf
 	err := c.Run()
 	return buf.String(), err
+}
+
+// forceCLocale 把 LC_ALL=C 放进环境,并删掉继承来的 LC_ALL。
+//
+// 为什么删而不是直接 append:execve 允许重复项,而 getenv 返回**第一个**
+// 匹配项 —— 继承的 LC_ALL 若排在前面,追加的 C 根本不会生效。
+func forceCLocale(env []string) []string {
+	out := make([]string, 0, len(env)+1)
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "LC_ALL=") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return append(out, "LC_ALL=C")
 }
 
 // fileExists 是宿主能力探测的注入缝(os.Stat 语义)。测试替换它来模造

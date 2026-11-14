@@ -2,10 +2,13 @@
 # daedalus-agent CI —— 本仓此前 0 个 workflow。
 #
 # agent#2(install.sh 的 ExecStart 缺 `daemon` 子命令,装机后 daemon 必死)能进 main,
-# 根因就是这里没有任何 CI。本 workflow 补两道路:
-#   go-test     : go vet + go test -race,守住编译与单测;
-#   install-test: 在真 systemd 容器里跑 install.sh,断言 systemctl is-active == active
-#                 —— 正是 agent#2 那条漏网路径(单元写了但 argv 必崩)。
+# 根因就是这里没有任何 CI。本 workflow 补三道路:
+#   go-test                : go vet + go test -race,守住编译与单测;
+#   install-test           : 在真 systemd 容器里跑 install.sh,断言 systemctl is-active == active
+#                            —— 正是 agent#2 那条漏网路径(单元写了但 argv 必崩);
+#   package-manager-shapes : 在真发行版容器里跑包管理器句柄/回滚计划,断言 apt(dnf)
+#                            的真实历史形状能被解析 —— 单测样本抄得再真,也证明不了
+#                            宿主上 still 成立。
 #
 # 布局:主仓检出到 daedalus-agent/ 子目录(SDK 必须检出到平级的 daedalus-sdk/,
 # 否则 go.mod 的 `replace => ../daedalus-sdk` 解析不到)。
@@ -83,3 +86,40 @@ jobs:
       - name: install_test.sh
         working-directory: daedalus-agent
         run: bash scripts/install_test.sh
+
+  package-manager-shapes:
+    name: Package Manager Shapes (${{ matrix.image }})
+    runs-on: ubuntu-24.04
+    strategy:
+      # 一个镜像红了不代表别的镜像也红:四个都跑完再给结论。
+      fail-fast: false
+      matrix:
+        image: [debian:13, ubuntu:26.04, almalinux:9, almalinux:10]
+    steps:
+      - name: Checkout agent
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: daedalus-agent
+      - name: Checkout SDK (sibling)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: Daedalusys/daedalus-sdk
+          path: daedalus-sdk
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.x'
+          # 同 go-test job:PR 可达 → cache: false。
+          cache: false
+          cache-dependency-path: |
+            daedalus-agent/go.sum
+            daedalus-sdk/go.sum
+      - name: Build real-machine test binary
+        working-directory: daedalus-agent
+        # CGO_ENABLED=0:产物要直接进任意发行版容器,静态二进制不赌宿主 libc。
+        run: CGO_ENABLED=0 go test -c -tags=realmachine ./internal/rollback -o /tmp/pm.test
+      - name: Run in ${{ matrix.image }}
+        # 容器里只跑这一个测试:它真装包、真读宿主历史,失败即红。
+        run: docker run --rm -v /tmp/pm.test:/pm.test ${{ matrix.image }} /pm.test -test.v -test.run TestRealPackageManager

@@ -255,7 +255,7 @@ func provableConffilesForHandle(handle string) (map[string]struct{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	if kind != exec.HandleAptHistory {
+	if kind != exec.HandleAptLog {
 		return nil, fmt.Errorf("handle %q has no provable file list", handle)
 	}
 	pkg, err := aptHistoryPackage(id)

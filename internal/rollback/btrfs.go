@@ -39,7 +39,9 @@ package rollback
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
+	"strings"
 )
 
 // execCommand is an alias of exec.Command used by the
@@ -54,7 +56,24 @@ var execCommand = exec.Command
 // keeping the seam here means a future test can if needed
 // without rewriting the backend.
 func newCmd(name string, args ...string) *exec.Cmd {
-	return execCommand(name, args...)
+	c := execCommand(name, args...)
+	// 计划期解析的是英文键(apt history-info 的 "Start time" 等);宿主 locale
+	// 会把这些键翻掉,固定 C locale 才能解析。继承的 LC_ALL 要删掉:getenv
+	// 取第一个匹配项,重复项会让继承值反压。
+	c.Env = forceCLocale(os.Environ())
+	return c
+}
+
+// forceCLocale 返回去掉继承 LC_ALL 后再追加 LC_ALL=C 的环境。
+func forceCLocale(env []string) []string {
+	out := make([]string, 0, len(env)+1)
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "LC_ALL=") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return append(out, "LC_ALL=C")
 }
 
 // BtrfsBackend implements Backend with `btrfs subvolume
