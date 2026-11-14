@@ -146,7 +146,11 @@ func (s *agentService) ApplyIntent(ctx context.Context, req *agentv1.ApplyIntent
 	// 为什么"改判"而不是"提前拒":提前拒会把高危装包全部挡在门外 —— 那正是
 	// 这套回滚句柄要解决的事(高危变更本来就没有可承诺的回滚点)。
 	// 低危不受影响:低危变更做不做是风险问题,不是能力问题。
-	if req.RiskClass == agentv1.RiskClass_RISK_CLASS_HIGH && exec.HandleCapable(req.Kind) && resp.GetRollbackHandle() == "" {
+	//
+	// 只改判 SUCCESS:失败结局(TRANSIENT / PERSISTENT)本来就是失败,把它们
+	// 再改成 REFUSED 会让控制面放弃重试一次可能成功的装包。
+	if resp.GetResult() == agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_SUCCESS &&
+		req.RiskClass == agentv1.RiskClass_RISK_CLASS_HIGH && exec.HandleCapable(req.Kind) && resp.GetRollbackHandle() == "" {
 		return s.refuseIntent(req, "apply_intent.refused",
 			fmt.Sprintf("refused: high-risk intent applied but produced no rollback handle: kind=%s target=%s", req.Kind, req.Target),
 			map[string]string{"reason": "rollback_handle_unavailable"}), nil

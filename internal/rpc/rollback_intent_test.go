@@ -391,3 +391,74 @@ func TestApplyIntent_HighRiskWithoutHandleRefused(t *testing.T) {
 		t.Errorf("文案 = %q, want 含 rollback handle", resp.GetErrorMessage())
 	}
 }
+
+// 高危 package 的失败结局不能被"没有句柄"这一条改写:可重试的失败必须仍是
+// TRANSIENT_FAILURE,否则控制面不会重试一次本来能成功的装包。
+func TestApplyIntent_HighRiskTransientFailureNotRejudged(t *testing.T) {
+	rig := startTestServerWithTx(t, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE,
+		func(rollback.Backend, string, *atomic.Uint64, *audit.Local) tx.Tx {
+			return cannedTx{onRun: func(_ context.Context, req *agentv1.ApplyIntentRequest) (*agentv1.ApplyIntentResponse, error) {
+				return &agentv1.ApplyIntentResponse{
+					Result:       agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_TRANSIENT_FAILURE,
+					ErrorMessage: "package manager lock held",
+				}, nil
+			}}
+		})
+	defer rig.Cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := rig.Client.ApplyIntent(ctx, &agentv1.ApplyIntentRequest{
+		IntentId:  "i-high-transient",
+		Kind:      "package",
+		Target:    "kernel-core",
+		RiskClass: agentv1.RiskClass_RISK_CLASS_HIGH,
+	})
+	if err != nil {
+		t.Fatalf("ApplyIntent: %v", err)
+	}
+	if resp.GetResult() != agentv1.ApplyIntentResult_APPLY_INTENT_RESULT_TRANSIENT_FAILURE {
+		t.Fatalf("result = %v, want TRANSIENT_FAILURE(失败结局不该被改判)", resp.GetResult())
+	}
+}
+
+// 计划里只要有一step要求人审,整份计划就不能标成可自动执行 —— 否则 admin
+// 往自动计划里塞一条人审步骤,控制面会照 auto_ok 无人值守地跑掉。
+func TestRollback_PlanWithHumanReviewIsNotAuto(t *testing.T) {
+	rig := startRollbackRig(t, &fakeRollbackRunner{}, "")
+	defer rig.Cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := rig.Client.RollbackIntent(ctx, &agentv1.RollbackIntentRequest{
+		IntentId:       "i-rb-review",
+		RollbackHandle: "dnf-history:42",
+		Mode:           agentv1.RollbackMode_ROLLBACK_MODE_PLAN,
+		Steps: []*agentv1.RollbackStep{{
+			Kind:                agentv1.RollbackStepKind_ROLLBACK_STEP_KIND_NATIVE_UNDO,
+			Command:             "dnf history undo 42",
+			Rationale:           "admin 改过的步骤,要求人审",
+			HumanReviewRequired: true,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("RollbackIntent(PLAN): %v", err)
+	}
+	if resp.GetResult() != agentv1.RollbackResult_ROLLBACK_RESULT_PLANNED {
+		t.Fatalf("result = %v, want PLANNED (%s)", resp.GetResult(), resp.GetErrorMessage())
+	}
+
+	events, _, err := rig.Audit.Since(0)
+	if err != nil {
+		t.Fatalf("audit.Since: %v", err)
+	}
+	var autoOK string
+	for _, ev := range events {
+		if ev.Tool == "rollback.planned" && ev.Identity == "i-rb-review" {
+			autoOK = ev.Args["auto_ok"]
+		}
+	}
+	if autoOK != "false" {
+		t.Fatalf("链上 auto_ok = %q, want false(含人审步骤的计划不得自动执行)", autoOK)
+	}
+}

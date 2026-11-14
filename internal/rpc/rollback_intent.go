@@ -67,6 +67,11 @@ func (s *agentService) rollbackPlan(ctx context.Context, req *agentv1.RollbackIn
 		}
 		plan.Steps = steps
 	}
+	// 只要有一step要求人审,整份计划就不能标成可自动执行:否则 admin 往
+	// 自动计划里塞一条人审步骤,控制面会照 auto_ok 无人值守地跑掉。
+	if hasHumanReview(plan.Steps) {
+		plan.AutoOK = false
+	}
 
 	planHash := plan.Hash()
 	token, err := s.rollbackTokens.Issue(planHash, req.GetIntentId(), time.Now())
@@ -189,6 +194,16 @@ func (s *agentService) attachOwnedPaths(ctx context.Context, handle string, step
 func hasFileDelete(steps []rollback.Step) bool {
 	for _, s := range steps {
 		if s.Kind == rollback.StepFileDelete {
+			return true
+		}
+	}
+	return false
+}
+
+// hasHumanReview 报告步骤里有没有要求人审的。
+func hasHumanReview(steps []rollback.Step) bool {
+	for _, s := range steps {
+		if s.HumanReview {
 			return true
 		}
 	}
