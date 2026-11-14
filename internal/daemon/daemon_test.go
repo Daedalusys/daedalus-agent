@@ -130,6 +130,20 @@ func TestStart_ContextCancel_StopsDaemon(t *testing.T) {
 	}
 }
 
+// pastDeadlineCtx 返回一个**构造时即已过期**的 context。
+//
+// 为什么不用 WithTimeout(1ms) + Sleep:那个写法把"期限已过"寄托在 runtime
+// 定时器的回调时刻上 —— 墙钟过了 2ms,定时器回调可能还没跑,ctx.Err() 仍然是
+// nil;此时 Stop 若恰好命中 select 的 <-done 分支就返回 nil(daedalus-agent#31:
+// 200 轮里约 1 次命中这个窗口,全量 go test 因此随机红)。
+//
+// context.WithDeadline 对**已经过去的**期限是同步 cancel 的(Err() 立刻返回
+// context.DeadlineExceeded,不等定时器),用它表达"期限已过"没有这个时间窗。
+func pastDeadlineCtx(t *testing.T) (context.Context, context.CancelFunc) {
+	t.Helper()
+	return context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+}
+
 func TestStop_StopContextDeadline_ReturnsError(t *testing.T) {
 	d := daemon.New(newTestConfig(t))
 
@@ -145,9 +159,13 @@ func TestStop_StopContextDeadline_ReturnsError(t *testing.T) {
 		t.Fatal("daemon did not reach StateRunning within 2s")
 	}
 
-	deadlineCtx, cancelDeadline := context.WithTimeout(context.Background(), 1*time.Millisecond)
+	deadlineCtx, cancelDeadline := pastDeadlineCtx(t)
 	defer cancelDeadline()
-	time.Sleep(5 * time.Millisecond) // ensure deadline is already past
+	// 前提自证:构造出的 ctx 必须**此刻**就是过期态。若不是,下面的失败就不是
+	// Stop 的问题,而是前提没立住 —— 直接说出来,别让测试把两件事混为一谈。
+	if !errors.Is(deadlineCtx.Err(), context.DeadlineExceeded) {
+		t.Fatalf("前提不成立:构造出的 ctx 未过期,err = %v", deadlineCtx.Err())
+	}
 
 	if err := d.Stop(deadlineCtx); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Stop with past deadline: err = %v, want DeadlineExceeded", err)
@@ -165,6 +183,15 @@ func TestStop_StopContextDeadline_ReturnsError(t *testing.T) {
 // 同时就绪时随机挑一个,本机慢(关机流程比 select 长)基本复现不出,只有 CI 的
 // 快机器才偶发红 —— 所以这条测试的作用是"在快机器上把随机性压到可察觉"。
 func TestStop_StopContextDeadline_NeverReportsSuccess(t *testing.T) {
+	// 前提自证:pastDeadlineCtx 必须**同步**给出过期态,否则这条测试量的
+	// 就不是"Stop 会不会把超时报成成功",而是"定时器有没有跑到"。
+	if probe, cancelProbe := pastDeadlineCtx(t); true {
+		if !errors.Is(probe.Err(), context.DeadlineExceeded) {
+			cancelProbe()
+			t.Fatalf("前提不成立:pastDeadlineCtx 构造后即非过期,err = %v", probe.Err())
+		}
+		cancelProbe()
+	}
 	for i := 0; i < 200; i++ {
 		d := daemon.New(newTestConfig(t))
 		runCtx, cancelRun := context.WithCancel(context.Background())
@@ -174,8 +201,7 @@ func TestStop_StopContextDeadline_NeverReportsSuccess(t *testing.T) {
 			cancelRun()
 			t.Fatalf("第 %d 轮:daemon 未在 2s 内进入 Running", i)
 		}
-		deadlineCtx, cancelDeadline := context.WithTimeout(context.Background(), time.Millisecond)
-		time.Sleep(2 * time.Millisecond)
+		deadlineCtx, cancelDeadline := pastDeadlineCtx(t)
 		err := d.Stop(deadlineCtx)
 		cancelDeadline()
 		if !errors.Is(err, context.DeadlineExceeded) {
