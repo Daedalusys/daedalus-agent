@@ -1,8 +1,10 @@
 package filespec
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -246,6 +248,133 @@ func TestSpec_SnapshotPathsLegacyIsTarget(t *testing.T) {
 	got := spec.SnapshotPaths("/etc/app.conf")
 	if len(got) != 1 || got[0] != "/etc/app.conf" {
 		t.Errorf("SnapshotPaths = %v, want [/etc/app.conf]", got)
+	}
+}
+
+// 批内两条 entry 落在同一条祖先链上时(比如一边 repoint 目录软链、另一边写
+// 该目录下的文件),文件最终落到旧目录还是新目标取决于 entry 顺序 —— 同一
+// 请求两种结果。必须在快照前整批拒绝,且报错要能指认是哪两条。
+//
+// 判定只看归一化后的 entry 相对路径,不做文件系统查询。
+func TestSpec_RejectsAncestorPathAmbiguity(t *testing.T) {
+	linkToRelease := func(t *testing.T, target string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Join(target, "releases", "1"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(target, "releases", "1"), filepath.Join(target, "current")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mkdir := func(rel string) func(t *testing.T, target string) {
+		return func(t *testing.T, target string) {
+			t.Helper()
+			if err := os.MkdirAll(filepath.Join(target, rel), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	writeFile := func(t *testing.T, target string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(target, "a.conf"), []byte("old"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cases := []struct {
+		name    string
+		setup   func(t *testing.T, target string)
+		entries string
+		wantErr bool
+		// 拒绝时必须被报错指认出来的两个下标与两条原始 path。
+		wantRefs  [2]string
+		wantPaths [2]string
+	}{
+		{
+			name:  "repoint 目录在前、write 其子路径在后",
+			setup: linkToRelease,
+			entries: `{"path":"current","op":"repoint","symlink_target":"releases/2"},` +
+				`{"path":"current/x.conf","op":"write","content":"x"}`,
+			wantErr:   true,
+			wantRefs:  [2]string{"entries[0]", "entries[1]"},
+			wantPaths: [2]string{"current", "current/x.conf"},
+		},
+		{
+			name:  "write 子路径在前、repoint 目录在后",
+			setup: linkToRelease,
+			entries: `{"path":"current/x.conf","op":"write","content":"x"},` +
+				`{"path":"current","op":"repoint","symlink_target":"releases/2"}`,
+			wantErr:   true,
+			wantRefs:  [2]string{"entries[0]", "entries[1]"},
+			wantPaths: [2]string{"current/x.conf", "current"},
+		},
+		{
+			name:  "write 普通文件、又 write 它下面的路径",
+			setup: writeFile,
+			entries: `{"path":"a.conf","op":"write","content":"x"},` +
+				`{"path":"a.conf/sub","op":"write","content":"y"}`,
+			wantErr:   true,
+			wantRefs:  [2]string{"entries[0]", "entries[1]"},
+			wantPaths: [2]string{"a.conf", "a.conf/sub"},
+		},
+		{
+			// 判定用的是归一化后的路径:current/./x.conf 与 current/x.conf 是同一条。
+			name:  "归一化后才是祖先关系也要拒绝",
+			setup: linkToRelease,
+			entries: `{"path":"current","op":"repoint","symlink_target":"releases/2"},` +
+				`{"path":"current/./x.conf","op":"write","content":"x"}`,
+			wantErr:   true,
+			wantRefs:  [2]string{"entries[0]", "entries[1]"},
+			wantPaths: [2]string{"current", "current/./x.conf"},
+		},
+		{
+			name:  "同目录下的兄弟路径不误伤",
+			setup: mkdir("conf.d"),
+			entries: `{"path":"conf.d/a.conf","op":"write","content":"x"},` +
+				`{"path":"conf.d/b.conf","op":"write","content":"y"}`,
+		},
+		{
+			name:  "同目录下不同子目录不误伤",
+			setup: mkdir("conf.d/sub"),
+			entries: `{"path":"conf.d/a.conf","op":"write","content":"x"},` +
+				`{"path":"conf.d/sub/b.conf","op":"write","content":"y"}`,
+		},
+		{
+			name:  "repoint 目录与另一目录下的文件无关",
+			setup: func(t *testing.T, target string) { linkToRelease(t, target); mkdir("other")(t, target) },
+			entries: `{"path":"current","op":"repoint","symlink_target":"releases/2"},` +
+				`{"path":"other/x.conf","op":"write","content":"x"}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			target := t.TempDir()
+			tc.setup(t, target)
+			spec := mustParse(t, `{"entries":[`+tc.entries+`]}`)
+			err := spec.Validate(target)
+			if !tc.wantErr {
+				if err != nil {
+					t.Fatalf("应接受,却被拒绝: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("祖先路径歧义应被拒绝")
+			}
+			msg := err.Error()
+			for _, ref := range tc.wantRefs {
+				if !strings.Contains(msg, ref) {
+					t.Errorf("报错未指认 %s: %s", ref, msg)
+				}
+			}
+			// 两条原始 path 都要出现在报错里,否则用户无从对照自己的输入。
+			for _, p := range tc.wantPaths {
+				if !strings.Contains(msg, fmt.Sprintf("%q", p)) {
+					t.Errorf("报错未包含路径 %q: %s", p, msg)
+				}
+			}
+		})
 	}
 }
 
