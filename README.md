@@ -27,6 +27,61 @@ every change reached `main` unverified (see the PR body of the change that added
 Two jobs exist now, but they are **not required** as merge conditions, so the same class of
 incident can still recur.
 
+## Directory-level `file` intents
+
+A `file` intent whose `spec_json` carries `entries` treats `target` as a **directory root** and
+changes only the sub-paths it names — the rest of the directory is never touched:
+
+```json
+{
+  "entries": [
+    { "path": "conf.d/a.conf", "op": "write",   "content": "..." },
+    { "path": "current",       "op": "repoint", "symlink_target": "../releases/2" }
+  ]
+}
+```
+
+- `path` is relative to `target`. Absolute paths, `..`, a missing parent directory, and a parent
+  that resolves through a symlink to outside `target` are all rejected — the whole batch is
+  rejected before anything is snapshotted or written.
+- `write` replaces the contents of an existing regular file (mode preserved) or creates a new
+  one. It never writes through a symlink: if the final component is a symlink, the intent is
+  rejected.
+- `repoint` changes the symlink itself to point at `symlink_target` (atomic temp-link + rename).
+  It can also create a new link, but refuses to replace a regular file.
+- The same path may not appear twice, and no path may be both `write` and `repoint`.
+- A spec without `entries` keeps the old `{"content": "..."}` meaning: `target` is a single
+  regular file. Old callers see no change.
+
+### Snapshot format
+
+Before the first write, every named path is captured into
+`<data_dir>/snapshots/<intent_id>/`:
+
+```
+<data_dir>/snapshots/<intent_id>/
+    manifest.json     # per-path type, mode, uid/gid, sha256, symlink target, post hashes
+    objects/<sha256>  # content-addressed file bodies, one copy per distinct content
+```
+
+- `/etc/**` and `/var/**` files are stored in full as content objects.
+- `/usr/**` files are recorded as a **baseline reference only** (no local copy): that content
+  comes from the immutable image, and the agent cannot restore it locally. If an apply under
+  `/usr` fails, rollback reports the path instead of pretending to restore it.
+- Symlinks store the link target string, never the content they point at.
+- Diffs are not produced for restoring; there is no diff-driven rollback path.
+
+After a successful apply the manifest records a post-apply hash per path. A later restore
+refuses to overwrite a path whose current hash no longer matches (`rollback: refusing to
+restore ... changed after apply`) instead of clobbering someone else's edit.
+
+### Retention
+
+Every new snapshot set triggers GC: the newest 20 intent snapshots are kept, with a 512 MiB
+total cap (oldest deleted first). Objects referenced by a retained manifest are never deleted;
+only unreferenced objects inside retained sets are swept. GC failures are logged and never fail
+the intent.
+
 ## Known gaps
 
 Open issues in this repository, so "has this been done yet?" is answerable by number:
