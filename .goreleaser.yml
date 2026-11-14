@@ -1,0 +1,52 @@
+# daedalus-agent 的 goreleaser 配置(被 .github/workflows/release.yml 消费)。
+#
+# 产物口径(与 scripts/check-release-assets.sh、靶场取件层共用同一命名):
+#   daedalus-agent_<version>_linux_{amd64,arm64}.tar.gz + SHA256SUMS
+#   <version> 不带前导 v(tag v0.1.0 → 资产名里的 0.1.0)
+#
+# 包内版式(必须 wrap 一层目录):
+#   daedalus-agent_0.1.0_linux_amd64/
+#     bin/daedalus-agent      ← 由 builds[].binary 的 bin/ 前缀决定
+#     scripts/install.sh      ← 由 archives[].files 决定(安装脚本随包走,
+#                                机器上不再散落脚本)
+#   scripts/install.sh:136-148 接受三种版式,release 走第 3 种
+#   (`<anything>/bin/daedalus-agent`);靶场 agent-e2e.sh 用
+#   `find -maxdepth 3 -path '*/scripts/*'` 找安装脚本,多一层目录正好落在深度 3。
+version: 2
+
+project_name: daedalus-agent
+
+builds:
+  - id: daedalus-agent
+    main: ./cmd/daedalus-agent
+    binary: bin/daedalus-agent
+    env: [CGO_ENABLED=0]
+    goos: [linux]
+    goarch: [amd64, arm64]
+    # 版本自证:cmd/daedalus-agent/main.go 的 version/commit/buildDate 三件由 -X
+    # 注入。没注入(本地 go build)时版本串是 0.1.0-dev;注入后是
+    # `<version> commit=<7 位 sha> built=<RFC3339>`,机器上装完能自证是发布版。
+    ldflags:
+      - -s -w
+      - -X main.version={{ .Version }}
+      - -X main.commit={{ .ShortCommit }}
+      - -X main.buildDate={{ .CommitDate }}
+
+archives:
+  - id: default
+    formats: [tar.gz]
+    wrap_in_directory: true
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files: [scripts/install.sh, scripts/postinstall.sh, scripts/uninstall.sh, LICENSE, README.md]
+
+checksum:
+  name_template: SHA256SUMS
+
+# 快照版本 = 正式版本号。--snapshot 在 release.yml 里只用来"上传前跑闸门",
+# 它造的资产名必须与将来真发布的一模一样 —— 否则闸门断言的是一批根本不存在的
+# 名字。goreleaser 默认给快照加 `-SNAPSHOT-<sha>` 后缀,那样 CI 里"用 tag 版本号
+# 精确断言资产名"这条就永远过不了;故这里把快照版本钉成 {{ .Version }}。
+# 注意:快照产物只在 dist/ 里,不上传、也不覆盖已发布资产(重跑守卫见 release.yml)。
+snapshot:
+  version_template: '{{ .Version }}'
