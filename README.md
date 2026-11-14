@@ -116,15 +116,23 @@ Auto vs human review:
 
 - `dnf history undo <id>` and, on apt ≥ 3.2, the native history undo are single-step plans with
   `auto_ok` — the control plane may APPLY them unattended.
-- Older apt has no native undo: the plan degrades to `apt-get remove` plus a `MANUAL` checklist
-  item (conffiles, postinst side effects). Both are `human_review_required`; `MANUAL` steps are
-  never executed by the agent.
+- Older apt has no native undo: the plan degrades to `apt-get remove`, then an `rm -rf` of the
+  paths dpkg recorded as **conffiles** (`dpkg-query -W -f='${Conffiles}'`; `remove` keeps them),
+  then a `MANUAL` checklist item for what no dpkg file list can prove (postinst/preinst side
+  effects: users, groups, services, generated files). Every step is `human_review_required`.
+  The delete step carries both its targets (`Paths`) and the package's full file list
+  (`dpkg-query -L`) so the plan shows *why* those paths are deletable; conffiles that cannot be
+  proven or cannot be expressed as an `rm -rf` argument are left to the human and named in the
+  `MANUAL` step (`MANUAL` steps are never executed by the agent).
 - Service rollback restores the pre-apply unit state (`start`/`stop`, `enable`/`disable`); the
   verb for a dimension that did not change is a no-op.
 
 `rm -rf` is **always** `human_review_required`, only allowed for paths the package owns, and
-only behind a valid token. APPLY is refused when the token is missing, expired, already used,
-bound to another plan or another intent, or when a step falls outside the command allowlist.
+only behind a valid token. Ownership is never taken from the request: APPLY steps carry no
+file list, so the agent re-queries it from the handle (`apt history-info` → `dpkg-query -L`)
+and refuses the whole plan when the list cannot be re-derived. APPLY is refused when the token
+is missing, expired, already used, bound to another plan or another intent, or when a step
+falls outside the command allowlist.
 The token proves "this APPLY is bound to that plan hash" — it does **not** prove a human read
 the plan; the control plane owns that. Tokens die with the process (re-plan after a restart);
 handles do not, because they describe the package manager's state, not the agent's.

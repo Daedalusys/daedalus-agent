@@ -90,18 +90,48 @@ func TestApply_RejectsUnmarkedDestructiveStep(t *testing.T) {
 	}
 }
 
-// 路径不在包拥有清单里 → 拒绝。句柄是包管理器给的,不该能删包以外的文件。
+// aptOwnedFake 伪造一台"nginx 已装"的宿主:执行期复核 rm 路径要重查
+// apt 历史(拿包名)与 dpkg 的文件清单。
+func aptOwnedFake() *fakeCommands {
+	fc := newFakeCommands()
+	fc.out["apt history-info 7"] = "Commandline: apt-get install nginx\n"
+	fc.out["dpkg-query -L nginx"] = "/etc/nginx/nginx.conf\n/var/lib/nginx\n/usr/sbin/nginx\n"
+	return fc
+}
+
+// 重查清单里有这个路径 + 标了人审 → 放行。
+func TestApply_AllowsPackageOwnedRmAfterReview(t *testing.T) {
+	fr := newFakeRunner()
+	withFakeRun(t, fr)
+	withFakeCommands(t, aptOwnedFake())
+
+	r := NewStepRunner()
+	err := r.Run(context.Background(), []Step{{
+		Kind:        StepFileDelete,
+		Command:     "rm -rf /var/lib/nginx",
+		HumanReview: true,
+		Handle:      "apt-history:7",
+	}})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := fr.recorded(); len(got) != 1 || got[0] != "rm -rf /var/lib/nginx" {
+		t.Fatalf("calls = %v, want [rm -rf /var/lib/nginx]", got)
+	}
+}
+
+// 路径不在**重查**到的清单里 → 拒绝。句柄是包管理器给的,不该能删包以外的文件。
 func TestApply_RejectsNonPackageOwnedRm(t *testing.T) {
 	fr := newFakeRunner()
 	withFakeRun(t, fr)
+	withFakeCommands(t, aptOwnedFake())
 
 	r := NewStepRunner()
 	err := r.Run(context.Background(), []Step{{
 		Kind:        StepFileDelete,
 		Command:     "rm -rf /etc/shadow",
 		HumanReview: true,
-		Handle:      "dnf-history:42",
-		OwnedPaths:  []string{"/var/lib/nginx", "/usr/sbin/nginx"},
+		Handle:      "apt-history:7",
 	}})
 	if !errors.Is(err, ErrPathNotOwned) {
 		t.Fatalf("got %v, want ErrPathNotOwned", err)
@@ -111,8 +141,62 @@ func TestApply_RejectsNonPackageOwnedRm(t *testing.T) {
 	}
 }
 
-// 包拥有的路径 + 标了人审 → 放行。
-func TestApply_AllowsPackageOwnedRmAfterReview(t *testing.T) {
+// 步骤自己声明的 OwnedPaths 不参与判定:清单只有一个来源(按句柄重查)。
+// 否则请求方只要声明一句"这些路径归我",就能删任何东西。
+func TestApply_IgnoresStepDeclaredOwnedPaths(t *testing.T) {
+	fr := newFakeRunner()
+	withFakeRun(t, fr)
+	withFakeCommands(t, aptOwnedFake())
+
+	r := NewStepRunner()
+	err := r.Run(context.Background(), []Step{{
+		Kind:        StepFileDelete,
+		Command:     "rm -rf /etc/shadow",
+		HumanReview: true,
+		Handle:      "apt-history:7",
+		OwnedPaths:  []string{"/etc/shadow"}, // 请求方自带清单,不算数
+	}})
+	if !errors.Is(err, ErrPathNotOwned) {
+		t.Fatalf("got %v, want ErrPathNotOwned", err)
+	}
+	if got := fr.recorded(); len(got) != 0 {
+		t.Fatalf("calls = %v, want none", got)
+	}
+}
+
+// 重查失败 → fail-closed:拿不到清单就不执行,不猜、不放行。
+func TestApply_RejectsFileDeleteWhenOwnershipLookupFails(t *testing.T) {
+	for _, key := range []string{
+		"apt history-info 7",
+		"dpkg-query -L nginx",
+	} {
+		t.Run(key, func(t *testing.T) {
+			fr := newFakeRunner()
+			withFakeRun(t, fr)
+			fc := aptOwnedFake()
+			fc.err[key] = errors.New("exit status 1")
+			withFakeCommands(t, fc)
+
+			r := NewStepRunner()
+			err := r.Run(context.Background(), []Step{{
+				Kind:        StepFileDelete,
+				Command:     "rm -rf /var/lib/nginx",
+				HumanReview: true,
+				Handle:      "apt-history:7",
+			}})
+			if !errors.Is(err, ErrOwnershipUnverifiable) {
+				t.Fatalf("got %v, want ErrOwnershipUnverifiable", err)
+			}
+			if got := fr.recorded(); len(got) != 0 {
+				t.Fatalf("calls = %v, want none", got)
+			}
+		})
+	}
+}
+
+// 句柄不是 apt 类 → 没有可证明的文件清单,拒执行删除步(fail-closed)。
+// 即便步骤自带 OwnedPaths 也不行:那等于让调用方自己声明能删什么。
+func TestApply_RejectsFileDeleteForNonAptHandle(t *testing.T) {
 	fr := newFakeRunner()
 	withFakeRun(t, fr)
 
@@ -124,11 +208,11 @@ func TestApply_AllowsPackageOwnedRmAfterReview(t *testing.T) {
 		Handle:      "dnf-history:42",
 		OwnedPaths:  []string{"/var/lib/nginx"},
 	}})
-	if err != nil {
-		t.Fatalf("Run: %v", err)
+	if !errors.Is(err, ErrOwnershipUnverifiable) {
+		t.Fatalf("got %v, want ErrOwnershipUnverifiable", err)
 	}
-	if got := fr.recorded(); len(got) != 1 {
-		t.Fatalf("calls = %v, want 1", got)
+	if got := fr.recorded(); len(got) != 0 {
+		t.Fatalf("calls = %v, want none", got)
 	}
 }
 

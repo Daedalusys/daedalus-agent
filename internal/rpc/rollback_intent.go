@@ -61,7 +61,7 @@ func (s *agentService) rollbackPlan(ctx context.Context, req *agentv1.RollbackIn
 	}
 	// admin 改过的步骤:用与执行阶段同一套判定校验后才进计划。
 	if len(req.GetSteps()) > 0 {
-		steps, verr := s.validatePlanSteps(plan, req.GetSteps())
+		steps, verr := s.validatePlanSteps(req.GetRollbackHandle(), req.GetSteps())
 		if verr != nil {
 			return s.refuseRollback(req, fmt.Sprintf("refused: %v", verr))
 		}
@@ -119,9 +119,10 @@ func (s *agentService) rollbackApply(ctx context.Context, req *agentv1.RollbackI
 	if plan.Hash() != req.GetPlanHash() {
 		return s.refuseRollback(req, "refused: plan_hash does not match the steps")
 	}
-	// rm 步的路径归属要用 agent 自己的包文件清单复核;请求里没有这份清单。
-	// 放在 token 校验之前:取清单失败不该把一个有效 token 白白烧掉。
-	if err := s.attachOwnedPaths(ctx, req.GetRollbackHandle(), steps); err != nil {
+	// rm 步的路径归属要用 agent 按句柄重查的包文件清单复核;请求里没有这份
+	// 清单,也不接受请求方声明。放在 token 校验之前:取清单失败不该把一个
+	// 有效 token 白白烧掉。执行阶段 ValidateStep 会重查一次,绕不过去。
+	if err := rollback.VerifyOwnership(steps); err != nil {
 		return s.refuseRollback(req, fmt.Sprintf("refused: %v", err))
 	}
 	// token 绑定 plan_hash + intent_id,单次使用。放在哈希校验之后:先确认
@@ -156,50 +157,19 @@ func (s *agentService) rollbackApply(ctx context.Context, req *agentv1.RollbackI
 // validatePlanSteps 把 admin 改过的步骤并进计划,并用与执行阶段同一套判定
 // 校验。
 //
-// 包拥有的路径清单来自 **agent 自己生成的基础计划**,不来自请求:请求方
-// 没法通过"声明这些路径归我"把删除范围扩到包以外。
-func (s *agentService) validatePlanSteps(base rollback.Plan, protoSteps []*agentv1.RollbackStep) ([]rollback.Step, error) {
-	steps, err := stepsFromProto(protoSteps, base.Handle)
+// 删除路径的归属不来自请求,也不来自基础计划:ValidateStep 会按句柄重查
+// 包管理器的文件清单。请求方没法通过"声明这些路径归我"把删除范围扩到包以外。
+func (s *agentService) validatePlanSteps(handle string, protoSteps []*agentv1.RollbackStep) ([]rollback.Step, error) {
+	steps, err := stepsFromProto(protoSteps, handle)
 	if err != nil {
 		return nil, err
 	}
-	owned := ownedPaths(base.Steps)
 	for i := range steps {
-		steps[i].OwnedPaths = owned
 		if err := rollback.ValidateStep(steps[i]); err != nil {
 			return nil, fmt.Errorf("step %d: %w", i, err)
 		}
 	}
 	return steps, nil
-}
-
-// attachOwnedPaths 给含 rm 步骤的计划补包文件清单。
-//
-// 只对含 rm 的计划查包管理器:其余计划在 APPLY 时不该被无关查询拖挂。
-// 查不到清单就拒绝 —— rm 的路径没有归属证明,不能执行。
-func (s *agentService) attachOwnedPaths(ctx context.Context, handle string, steps []rollback.Step) error {
-	if !hasFileDelete(steps) {
-		return nil
-	}
-	base, err := rollback.BuildPlan(ctx, handle, rollback.NewCommandAllower())
-	if err != nil {
-		return fmt.Errorf("cannot re-derive the package-owned paths: %v", err)
-	}
-	owned := ownedPaths(base.Steps)
-	for i := range steps {
-		steps[i].OwnedPaths = owned
-	}
-	return nil
-}
-
-// hasFileDelete 报告步骤里有没有文件删除。
-func hasFileDelete(steps []rollback.Step) bool {
-	for _, s := range steps {
-		if s.Kind == rollback.StepFileDelete {
-			return true
-		}
-	}
-	return false
 }
 
 // hasHumanReview 报告步骤里有没有要求人审的。
@@ -210,22 +180,6 @@ func hasHumanReview(steps []rollback.Step) bool {
 		}
 	}
 	return false
-}
-
-// ownedPaths 汇总基础计划里声明的包拥有路径(去重,保持顺序)。
-func ownedPaths(steps []rollback.Step) []string {
-	seen := map[string]struct{}{}
-	var out []string
-	for _, s := range steps {
-		for _, p := range s.OwnedPaths {
-			if _, ok := seen[p]; ok {
-				continue
-			}
-			seen[p] = struct{}{}
-			out = append(out, p)
-		}
-	}
-	return out
 }
 
 // refuseRollback 记录一次回滚拒绝并返回 in-body 的拒绝响应。

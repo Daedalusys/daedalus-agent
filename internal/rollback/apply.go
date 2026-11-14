@@ -21,6 +21,9 @@ var (
 	ErrDestructiveNeedsReview = errors.New("rollback: destructive step must be marked human-review")
 	// ErrPathNotOwned 表示步骤要动的路径不归这个包所有。
 	ErrPathNotOwned = errors.New("rollback: step touches a path the package does not own")
+	// ErrOwnershipUnverifiable 表示这个删除步没法证明路径归属(句柄不指向
+	// 可查询的包、或包管理器清单查不到)。拿不到证明就不删。
+	ErrOwnershipUnverifiable = errors.New("rollback: cannot prove the step's paths are package-owned")
 	// ErrStepFailed 表示某一步执行失败(已执行的步骤不自动回退)。
 	ErrStepFailed = errors.New("rollback: step failed")
 )
@@ -162,6 +165,9 @@ func (r *StepRunner) Run(ctx context.Context, steps []Step) error {
 //
 // 导出它是因为 RPC 层在 PLAN 阶段要校验 admin 改过的步骤:白名单、人审
 // 标记、路径归属必须与执行阶段是同一套判定。
+//
+// 路径归属不看 s.OwnedPaths(它不进 APPLY 请求):rm 步一律按句柄重查包管理
+// 器的文件清单,查不到就拒绝。
 func ValidateStep(s Step) error {
 	if s.Kind == StepManual {
 		// MANUAL 只给文字:带命令就成了绕过白名单的后门。
@@ -186,17 +192,75 @@ func ValidateStep(s Step) error {
 		return fmt.Errorf("%w: %q", ErrDestructiveNeedsReview, s.Command)
 	}
 	if argv[0] == "rm" {
-		// rm 只归 FILE_DELETE 步,且路径必须 ⊆ 计划里声明的包拥有清单。
+		// rm 只归 FILE_DELETE 步,且路径必须 ⊆ **按句柄重查**的包拥有清单:
+		// 清单不上 wire,请求方没法声明"这些路径归我"。
 		if s.Kind != StepFileDelete {
 			return fmt.Errorf("%w: rm step must be kind FILE_DELETE", ErrCommandNotAllowed)
 		}
-		for _, p := range argv[2:] {
-			if !pathOwned(s.OwnedPaths, p) {
-				return fmt.Errorf("%w: %q", ErrPathNotOwned, p)
-			}
+		if err := verifyStepOwnership(s); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// VerifyOwnership 复核计划里所有删除步的路径归属。
+//
+// 导出给 RPC 层在消耗 token 之前先跑一遍:拿不到清单时,一份本来有效的
+// token 不该被白白烧掉。真正的执行判定仍在 ValidateStep(它每步都会重查,
+// 调用方绕不过去)。
+func VerifyOwnership(steps []Step) error {
+	for i, s := range steps {
+		if err := verifyStepOwnership(s); err != nil {
+			return fmt.Errorf("step %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
+// verifyStepOwnership 按句柄重查包的文件清单,复核 rm 要删的路径 ⊆ 清单。
+//
+// 为什么必须重查:APPLY 请求里的步骤只带 kind/命令/说明/人审标记,拥有清单
+// 不上 wire(它进不了 plan_hash)。所以执行期的清单只能从**包管理器自己的
+// 数据库**重新取 —— 句柄是包管理器给的事实,不是请求方能编辑的字段。
+func verifyStepOwnership(s Step) error {
+	argv := strings.Fields(s.Command)
+	if len(argv) < 3 || argv[0] != "rm" {
+		// 白名单会先拒掉非 "rm -rf <路径>..." 的形状;这里只处理有路径可查的。
+		return nil
+	}
+	owned, err := ownedPathsForHandle(s.Handle)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrOwnershipUnverifiable, err)
+	}
+	for _, p := range argv[2:] {
+		if !pathOwned(owned, p) {
+			return fmt.Errorf("%w: %q", ErrPathNotOwned, p)
+		}
+	}
+	return nil
+}
+
+// ownedPathsForHandle 从句柄重查包声明拥有的文件清单。
+//
+// 只有 apt 句柄有这条可证明路径(dpkg-query -L)。别的句柄知道自己撤的是哪
+// 次变更,却说不出"那个包拥有哪些文件" —— 没有清单就不删,fail-closed。
+func ownedPathsForHandle(handle string) ([]string, error) {
+	kind, id, err := exec.ParseHandle(handle)
+	if err != nil {
+		return nil, err
+	}
+	if kind != exec.HandleAptHistory {
+		return nil, fmt.Errorf("handle %q has no provable file list", handle)
+	}
+	pkg, err := aptHistoryPackage(id)
+	if err != nil {
+		return nil, err
+	}
+	if err := validatePackageName(pkg); err != nil {
+		return nil, err
+	}
+	return dpkgOwnedPaths(pkg)
 }
 
 // pathOwned 报告 p 是否落在拥有清单里(或其目录之下)。

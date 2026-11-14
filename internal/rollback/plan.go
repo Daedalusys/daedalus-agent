@@ -51,8 +51,11 @@ type Step struct {
 	Handle string
 	// Paths 是本步命令会触及的路径(StepFileDelete 用)。
 	Paths []string
-	// OwnedPaths 是计划生成时刻包管理器声明的文件清单。删除路径必须 ⊆ 它:
-	// 句柄是包管理器给的,不该有能力删掉包以外的文件。
+	// OwnedPaths 是计划生成时刻包管理器声明的文件清单,写在计划里供人审。
+	//
+	// 执行期**不读它**:APPLY 请求里没有这个字段(它进不了 plan_hash),读它
+	// 等于让请求方自己声明"这些路径归我"。删除路径的归属按 Handle 重查,
+	// 见 VerifyOwnership。
 	OwnedPaths []string
 }
 
@@ -144,7 +147,11 @@ func buildDnfPlan(handle, id string, allower CommandAllower) (Plan, error) {
 	}, nil
 }
 
-// buildAptPlan:apt ≥ 3.2 走原生撤销;更老的 apt 退化成"卸载 + 人工核对"。
+// apt 版本不够(没有原生 undo)→ 退化计划:卸载 → 删残留 conffiles → 人工核对。
+//
+// 为什么两步而不是直接 purge:purge 是包管理器自己的一次销毁动作,人审时看不到
+// 它到底会删哪些路径。拆成 remove + rm conffiles 之后,删除目标就在计划里
+// 逐条列出,且每条都能被 dpkg 的文件清单证明。
 func buildAptPlan(ctx context.Context, handle, id string, allower CommandAllower) (Plan, error) {
 	if _, err := strconv.ParseInt(id, 10, 64); err != nil {
 		return Plan{}, fmt.Errorf("%w: apt history id %q is not a number", ErrPlanUnsupported, id)
@@ -178,28 +185,189 @@ func buildAptPlan(ctx context.Context, handle, id string, allower CommandAllower
 	if err := validatePackageName(pkg); err != nil {
 		return Plan{}, err
 	}
+	// 两条只读查询就是"凭什么删"的全部证据:包声明拥有的文件清单 + dpkg 记为
+	// 配置文件的那些路径。任何一条查不到都整份计划失败 —— 只出一半证据的计划
+	// 会让人在"看起来完整"的步骤上点同意。
+	owned, err := dpkgOwnedPaths(pkg)
+	if err != nil {
+		return Plan{}, fmt.Errorf("%w: %v", ErrPlanUnsupported, err)
+	}
+	conffiles, err := dpkgConffiles(pkg)
+	if err != nil {
+		return Plan{}, fmt.Errorf("%w: %v", ErrPlanUnsupported, err)
+	}
+
 	removeCmd := "apt-get remove -y " + pkg
 	if err := allowCommand(allower, removeCmd); err != nil {
 		return Plan{}, err
 	}
-	return Plan{
-		Handle: handle,
-		Steps: []Step{
-			{
-				Kind:        StepPackageRemove,
-				Command:     removeCmd,
-				Rationale:   "宿主 apt 不支持原生 undo:卸载 " + pkg + " 以撤销本次安装。注意:不会还原被它替换的旧版本",
-				HumanReview: true,
-				Handle:      handle,
-			},
-			{
-				Kind:        StepManual,
-				Rationale:   "人工核对 " + pkg + " 的残留:purge 会删配置文件,postinst 可能改过用户/服务/生成文件;这些都不自动处理",
-				HumanReview: true,
-				Handle:      handle,
-			},
-		},
-	}, nil
+	steps := []Step{{
+		Kind:        StepPackageRemove,
+		Command:     removeCmd,
+		Rationale:   "宿主 apt 不支持原生 undo:卸载 " + pkg + " 以撤销本次安装。注意:不会还原被它替换的旧版本",
+		HumanReview: true,
+		Handle:      handle,
+	}}
+
+	// 只删 conffiles:apt-get remove 已经删掉非配置文件,残留下来的正是它们;
+	// 删别的就是删 dpkg 没声明拥有的东西。
+	deletable, unprovable := provableDeletePaths(conffiles, owned)
+	if len(deletable) > 0 {
+		rmCmd := "rm -rf " + strings.Join(deletable, " ")
+		if err := allowCommand(allower, rmCmd); err != nil {
+			return Plan{}, err
+		}
+		steps = append(steps, Step{
+			Kind:        StepFileDelete,
+			Command:     rmCmd,
+			Rationale:   "删除 " + pkg + " 的残留配置文件:apt-get remove 保留 dpkg 记为 conffile 的路径,回滚要把它们一起删干净",
+			HumanReview: true,
+			Handle:      handle,
+			Paths:       deletable,
+			OwnedPaths:  owned,
+		})
+	}
+
+	manual := "人工核对 " + pkg + " 的残留副作用:postinst/preinst 可能建过用户、组、服务或生成过文件,这些不在 dpkg 的文件清单里,无法证明,仍需人工核对"
+	if len(unprovable) > 0 {
+		manual += ";另有 " + strconv.Itoa(len(unprovable)) + " 个配置文件路径无法证明归属或无法用 argv 安全表达,未自动删除: " + strings.Join(unprovable, ", ")
+	}
+	steps = append(steps, Step{
+		Kind:        StepManual,
+		Rationale:   manual,
+		HumanReview: true,
+		Handle:      handle,
+	})
+
+	return Plan{Handle: handle, Steps: steps}, nil
+}
+
+// dpkgOwnedPaths 查 dpkg 里该包**声明拥有**的完整路径清单。
+//
+// 这是"凭什么删"的唯一证明来源:-L 列的是包自己的文件清单,不是"磁盘上
+// 恰好有这些路径"。查不到就报错,不用空清单冒充"这个包没有文件"。
+func dpkgOwnedPaths(pkg string) ([]string, error) {
+	out, err := runCommandOutput("dpkg-query", "-L", pkg)
+	if err != nil {
+		return nil, fmt.Errorf("dpkg-query -L %s: %w", pkg, err)
+	}
+	return parsePathList(string(out)), nil
+}
+
+// dpkgConffiles 查 dpkg 记为配置文件(conffile)的路径。
+func dpkgConffiles(pkg string) ([]string, error) {
+	out, err := runCommandOutput("dpkg-query", "-W", "-f=${Conffiles}\\n", pkg)
+	if err != nil {
+		return nil, fmt.Errorf("dpkg-query -W conffiles %s: %w", pkg, err)
+	}
+	return parseConffiles(string(out))
+}
+
+// parsePathList 把 dpkg 的逐行清单变成路径切片。
+func parsePathList(out string) []string {
+	var paths []string
+	for _, line := range strings.Split(out, "\n") {
+		t := strings.TrimSpace(line)
+		if t == "" {
+			continue
+		}
+		paths = append(paths, unescapeDpkgPath(t))
+	}
+	return paths
+}
+
+// parseConffiles 解析 dpkg 的 ${Conffiles} 输出。
+//
+// 每行形如 " <路径> [obsolete|remove]":状态词是 dpkg 的记账,不是路径的一
+// 部分;路径里的空白等特殊字符 dpkg 已转义成 \ddd,所以按空白切词是安全的。
+//
+// 切不出"路径 + 至多一个状态词"的行直接报错:拿前缀当路径去 rm,删掉的
+// 可能是别的包的文件 —— 这种不确定性只能交给 fail-closed。
+func parseConffiles(out string) ([]string, error) {
+	var paths []string
+	for _, line := range strings.Split(out, "\n") {
+		t := strings.TrimSpace(line)
+		if t == "" {
+			continue
+		}
+		fields := strings.Fields(t)
+		switch len(fields) {
+		case 1:
+			// 只有路径,没有状态词。
+		case 2:
+			if !isConffileStatus(fields[1]) {
+				return nil, fmt.Errorf("%w: unrecognized conffile line %q", ErrPlanUnsupported, t)
+			}
+		default:
+			return nil, fmt.Errorf("%w: ambiguous conffile line %q", ErrPlanUnsupported, t)
+		}
+		if p := unescapeDpkgPath(fields[0]); p != "" {
+			paths = append(paths, p)
+		}
+	}
+	return paths, nil
+}
+
+// isConffileStatus 报告 dpkg 记在 conffile 路径后的状态词。
+func isConffileStatus(s string) bool {
+	return s == "obsolete" || s == "remove"
+}
+
+// unescapeDpkgPath 还原 dpkg 清单里 \ddd(三位八进制)形式的转义。
+//
+// dpkg 用这套编码把空白、反斜杠等写进逐行清单(\040 是空格,\134 是反斜杠);
+// 不还原的话,删除路径与拥有清单会各自带一身转义,永远对不上,白名单与归属
+// 校验都会误判。
+func unescapeDpkgPath(s string) string {
+	if !strings.Contains(s, `\`) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		if s[i] == '\\' && i+3 < len(s) &&
+			isOctDigit(s[i+1]) && isOctDigit(s[i+2]) && isOctDigit(s[i+3]) {
+			v := int(s[i+1]-'0')*64 + int(s[i+2]-'0')*8 + int(s[i+3]-'0')
+			if v <= 0xFF {
+				b.WriteByte(byte(v))
+				i += 4
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
+}
+
+// isOctDigit 报告 c 是否是八进制数字(dpkg 的 \ddd 转义只认 0-7)。
+func isOctDigit(c byte) bool { return c >= '0' && c <= '7' }
+
+// provableDeletePaths 从 conffiles 里挑出"能证明归属、也能安全写进 rm argv"
+// 的路径。
+//
+// 被挑掉的路径进第二个返回值:它们没法自动删,但必须让人看见,而不是静悄悄
+// 留在磁盘上假装删过了。
+func provableDeletePaths(conffiles, owned []string) (deletable, skipped []string) {
+	seen := make(map[string]struct{}, len(conffiles))
+	for _, p := range conffiles {
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		// rm 白名单只认绝对路径、且路径里不能有空白:表达不了的路径不能硬塞,
+		// 否则整条删除步会被白名单拒掉。
+		if !strings.HasPrefix(p, "/") || strings.ContainsAny(p, " \t\n") {
+			skipped = append(skipped, p)
+			continue
+		}
+		if !pathOwned(owned, p) {
+			skipped = append(skipped, p)
+			continue
+		}
+		deletable = append(deletable, p)
+	}
+	return deletable, skipped
 }
 
 // buildServicePlan:service 的"回滚"就是把单元恢复到 apply 之前的状态。

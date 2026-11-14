@@ -3,6 +3,8 @@ package rollback
 import (
 	"context"
 	"encoding/base64"
+	"errors"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -74,12 +76,30 @@ func TestPlan_DnfHistoryUndo(t *testing.T) {
 	}
 }
 
-// apt 版本不够(没有原生 undo)→ 退化成"卸载 + 人工核对副作用",且必须人审。
-func TestPlan_AptFallbackNeedsReview(t *testing.T) {
+// aptFallbackFake 伪造一台"老 apt(无原生 undo)+ nginx 已装"的宿主。
+// 输出形状按真机:dpkg 的 Conffiles 每行以空格开头,状态词在路径之后。
+func aptFallbackFake() *fakeCommands {
 	fc := newFakeCommands()
 	fc.out["apt-get --version"] = "apt 2.4.11 (amd64)\n"
-	fc.out["apt history-info 7"] = "Commandline: install nginx\n"
-	withFakeCommands(t, fc)
+	fc.out["apt history-info 7"] = "Commandline: apt-get install nginx\n"
+	fc.out["dpkg-query -L nginx"] = strings.Join([]string{
+		"/etc/nginx",
+		"/etc/nginx/nginx.conf",
+		"/etc/nginx/sites-available",
+		"/etc/nginx/sites-available/default",
+		"/usr/sbin/nginx",
+	}, "\n") + "\n"
+	fc.out["dpkg-query -W -f=${Conffiles}\\n nginx"] =
+		" /etc/nginx/nginx.conf\n /etc/nginx/sites-available/default obsolete\n"
+	return fc
+}
+
+// apt 版本不够(没有原生 undo)→ 退化计划:卸载 → 删残留 conffiles → 人工核对。
+//
+// 删除步不是"顺手删点什么":它的路径来自 dpkg 的 conffile 记录,且必须落在
+// dpkg-query -L 声明的清单内 —— 计划自己就把"凭什么删这些"写在了一起。
+func TestPlan_AptFallbackNeedsReview(t *testing.T) {
+	withFakeCommands(t, aptFallbackFake())
 
 	p, err := BuildPlan(context.Background(), "apt-history:7", allowAll{})
 	if err != nil {
@@ -88,34 +108,196 @@ func TestPlan_AptFallbackNeedsReview(t *testing.T) {
 	if p.AutoOK {
 		t.Error("apt 退化路径不该自动执行")
 	}
-	if len(p.Steps) == 0 {
-		t.Fatal("steps 为空")
+	wantKinds := []StepKind{StepPackageRemove, StepFileDelete, StepManual}
+	if len(p.Steps) != len(wantKinds) {
+		t.Fatalf("steps = %d, want %d(卸载 → 删 conffiles → 人工核对):%+v",
+			len(p.Steps), len(wantKinds), p.Steps)
 	}
-	step := p.Steps[0]
-	if step.Kind != StepPackageRemove {
-		t.Errorf("Kind = %v, want StepPackageRemove", step.Kind)
-	}
-	if !step.HumanReview {
-		t.Error("apt 退化路径必须人审")
-	}
-	if !strings.Contains(step.Command, "nginx") {
-		t.Errorf("Command = %q, want 含包名 nginx", step.Command)
-	}
-	// 副作用(配置残留/postinst)只能给人看的说明步,不带命令。
-	var manual bool
-	for _, s := range p.Steps {
-		if s.Kind == StepManual {
-			manual = true
-			if s.Command != "" {
-				t.Errorf("MANUAL 步不该带命令, got %q", s.Command)
-			}
-			if !s.HumanReview {
-				t.Error("MANUAL 步必须人审")
-			}
+	for i, want := range wantKinds {
+		if p.Steps[i].Kind != want {
+			t.Fatalf("step %d Kind = %v, want %v", i, p.Steps[i].Kind, want)
 		}
 	}
-	if !manual {
-		t.Error("apt 退化路径必须带一条 MANUAL 步说明副作用")
+
+	remove := p.Steps[0]
+	if remove.Command != "apt-get remove -y nginx" {
+		t.Errorf("remove.Command = %q, want %q", remove.Command, "apt-get remove -y nginx")
+	}
+	if !remove.HumanReview {
+		t.Error("apt 退化路径必须人审")
+	}
+
+	// 只删 conffiles:apt-get remove 已经删掉非配置文件,残留的正是它们。
+	del := p.Steps[1]
+	wantPaths := []string{"/etc/nginx/nginx.conf", "/etc/nginx/sites-available/default"}
+	if !slices.Equal(del.Paths, wantPaths) {
+		t.Errorf("delete.Paths = %v, want %v", del.Paths, wantPaths)
+	}
+	if want := "rm -rf /etc/nginx/nginx.conf /etc/nginx/sites-available/default"; del.Command != want {
+		t.Errorf("delete.Command = %q, want %q", del.Command, want)
+	}
+	if !del.HumanReview {
+		t.Error("rm -rf 永远人审,没有例外")
+	}
+	// 计划里要内联 dpkg 声明的完整清单,而不是只有删除目标。
+	for _, want := range []string{"/etc/nginx/nginx.conf", "/usr/sbin/nginx"} {
+		if !slices.Contains(del.OwnedPaths, want) {
+			t.Errorf("delete.OwnedPaths 缺 %q: %v", want, del.OwnedPaths)
+		}
+	}
+
+	// postinst/preinst 的副作用不在 dpkg 清单里,只能给人看。
+	manual := p.Steps[2]
+	if manual.Command != "" {
+		t.Errorf("MANUAL 步不该带命令, got %q", manual.Command)
+	}
+	if !manual.HumanReview {
+		t.Error("MANUAL 步必须人审")
+	}
+	if !strings.Contains(manual.Rationale, "postinst") || !strings.Contains(manual.Rationale, "无法证明") {
+		t.Errorf("MANUAL 说明 = %q, want 点明 postinst 副作用无法证明", manual.Rationale)
+	}
+}
+
+// 计划里的每一步都要能过执行期的校验:两边用的是同一份 dpkg 清单。
+func TestPlan_AptFallbackStepsPassValidation(t *testing.T) {
+	withFakeCommands(t, aptFallbackFake())
+
+	p, err := BuildPlan(context.Background(), "apt-history:7", allowAll{})
+	if err != nil {
+		t.Fatalf("BuildPlan: %v", err)
+	}
+	for i, s := range p.Steps {
+		if err := ValidateStep(s); err != nil {
+			t.Fatalf("ValidateStep(step %d %v) = %v, want nil", i, s.Kind, err)
+		}
+	}
+}
+
+// dpkg 把清单里的特殊字符写成 \ddd(十进制):解析时必须还原,否则删除路径
+// 与拥有清单对不上。
+func TestPlan_AptFallbackUnescapesConffiles(t *testing.T) {
+	fc := aptFallbackFake()
+	// \134 是反斜杠;它没有空白,rm 的 argv 形状仍能表达。
+	fc.out["dpkg-query -W -f=${Conffiles}\\n nginx"] = " /etc/nginx/a\\134b.conf\n"
+	fc.out["dpkg-query -L nginx"] = "/etc/nginx/a\\134b.conf\n"
+	withFakeCommands(t, fc)
+
+	p, err := BuildPlan(context.Background(), "apt-history:7", allowAll{})
+	if err != nil {
+		t.Fatalf("BuildPlan: %v", err)
+	}
+	if len(p.Steps) != 3 {
+		t.Fatalf("steps = %d, want 3:%+v", len(p.Steps), p.Steps)
+	}
+	del := p.Steps[1]
+	want := "/etc/nginx/a\\b.conf"
+	if !slices.Equal(del.Paths, []string{want}) {
+		t.Errorf("delete.Paths = %v, want [%q]", del.Paths, want)
+	}
+	if del.Command != "rm -rf "+want {
+		t.Errorf("delete.Command = %q, want %q", del.Command, "rm -rf "+want)
+	}
+	if !slices.Contains(del.OwnedPaths, want) {
+		t.Errorf("delete.OwnedPaths = %v, want 含还原后的 %q", del.OwnedPaths, want)
+	}
+}
+
+// \040 是空格:路径本身解析得出来,但 rm 的 argv 形状表达不了带空白的路径
+// (白名单要求路径里没有空白)。这种情况留给人,不塞进删除步。
+func TestPlan_AptFallbackSkipsUnsafeConffilePath(t *testing.T) {
+	fc := aptFallbackFake()
+	fc.out["dpkg-query -W -f=${Conffiles}\\n nginx"] = " /etc/nginx/a\\040b.conf\n"
+	fc.out["dpkg-query -L nginx"] = "/etc/nginx/a\\040b.conf\n"
+	withFakeCommands(t, fc)
+
+	p, err := BuildPlan(context.Background(), "apt-history:7", allowAll{})
+	if err != nil {
+		t.Fatalf("BuildPlan: %v", err)
+	}
+	wantKinds := []StepKind{StepPackageRemove, StepManual}
+	if len(p.Steps) != len(wantKinds) {
+		t.Fatalf("steps = %d, want %d(没有可安全删除的 conffile):%+v", len(p.Steps), len(wantKinds), p.Steps)
+	}
+	for i, want := range wantKinds {
+		if p.Steps[i].Kind != want {
+			t.Fatalf("step %d Kind = %v, want %v", i, p.Steps[i].Kind, want)
+		}
+	}
+	if !strings.Contains(p.Steps[1].Rationale, "/etc/nginx/a b.conf") {
+		t.Errorf("MANUAL 说明 = %q, want 点名没能自动删除的路径", p.Steps[1].Rationale)
+	}
+}
+
+// 空 conffiles 是正常情况(包没有配置文件):只卸载,不产生删除步。
+func TestPlan_AptFallbackEmptyConffiles(t *testing.T) {
+	fc := aptFallbackFake()
+	fc.out["dpkg-query -W -f=${Conffiles}\\n nginx"] = "\n"
+	withFakeCommands(t, fc)
+
+	p, err := BuildPlan(context.Background(), "apt-history:7", allowAll{})
+	if err != nil {
+		t.Fatalf("BuildPlan: %v", err)
+	}
+	if len(p.Steps) != 2 {
+		t.Fatalf("steps = %d, want 2(卸载 + 人工核对):%+v", len(p.Steps), p.Steps)
+	}
+	for _, s := range p.Steps {
+		if s.Kind == StepFileDelete {
+			t.Fatalf("没有 conffiles 时不该生成删除步: %+v", s)
+		}
+	}
+}
+
+// 拿不到包管理器事实 → 计划期失败,不产生半截计划。
+func TestPlan_AptFallbackFailsWhenDpkgQueryFails(t *testing.T) {
+	for _, key := range []string{
+		"dpkg-query -L nginx",
+		"dpkg-query -W -f=${Conffiles}\\n nginx",
+	} {
+		t.Run(key, func(t *testing.T) {
+			fc := aptFallbackFake()
+			fc.err[key] = errors.New("exit status 1")
+			withFakeCommands(t, fc)
+
+			p, err := BuildPlan(context.Background(), "apt-history:7", allowAll{})
+			if err == nil {
+				t.Fatalf("BuildPlan(%q 失败) = nil error, want fail-closed", key)
+			}
+			if len(p.Steps) != 0 {
+				t.Fatalf("失败时返回了半截计划: %+v", p.Steps)
+			}
+		})
+	}
+}
+
+// 拆不清路径与状态词的行不能被"猜着"处理:猜错就是把别人的文件写进删除目标。
+func TestPlan_AptFallbackRejectsAmbiguousConffileLine(t *testing.T) {
+	for _, line := range []string{
+		" /etc/nginx/a.conf bogus-status\n",   // 不认识的状态词
+		" /etc/nginx/a.conf obsolete extra\n", // 超过"路径 + 状态词"两段
+	} {
+		t.Run(strings.TrimSpace(line), func(t *testing.T) {
+			fc := aptFallbackFake()
+			fc.out["dpkg-query -W -f=${Conffiles}\\n nginx"] = line
+			withFakeCommands(t, fc)
+
+			if _, err := BuildPlan(context.Background(), "apt-history:7", allowAll{}); err == nil {
+				t.Fatalf("BuildPlan 对无法解析的 conffile 行 %q 返回 nil error, want fail-closed", line)
+			}
+		})
+	}
+}
+
+// dpkg 的 Conffiles 每行是 " <路径> [状态词]":前导空格与状态词都不是路径。
+func TestParseConffiles_StripsLeadingSpaceAndStatus(t *testing.T) {
+	got, err := parseConffiles(" /etc/a.conf\n /etc/b.conf obsolete\n /etc/c.conf remove\n")
+	if err != nil {
+		t.Fatalf("parseConffiles: %v", err)
+	}
+	want := []string{"/etc/a.conf", "/etc/b.conf", "/etc/c.conf"}
+	if !slices.Equal(got, want) {
+		t.Errorf("parseConffiles = %v, want %v", got, want)
 	}
 }
 
