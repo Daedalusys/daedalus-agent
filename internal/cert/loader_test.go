@@ -2,10 +2,10 @@
 //
 // Tests cover three scenarios:
 //
-//   1. Bootstrap: no cert files exist → loader generates self-managed CA +
-//      server cert and persists them with 0600 on private keys.
-//   2. Steady-state: valid cert exists → loader returns it as-is, no rotation.
-//   3. Rotation trigger: cert is within its rotation window → loader renews.
+//  1. Bootstrap: no cert files exist → loader generates self-managed CA +
+//     server cert and persists them with 0600 on private keys.
+//  2. Steady-state: valid cert exists → loader returns it as-is, no rotation.
+//  3. Rotation trigger: cert is within its rotation window → loader renews.
 //
 // RF4 (brief: "cert 过期场景, daemon 应返回明确错误而非静默失败") is
 // covered by internal/rpc/server_test.go's TestServer_ExpiredCertReturnsClearError.

@@ -31,8 +31,8 @@ import (
 	"strings"
 	"sync"
 
-	agentv1 "github.com/Daedalusys/daedalus-sdk/proto/agent/v1"
 	"github.com/Daedalusys/daedalus-sdk/objectmodel"
+	agentv1 "github.com/Daedalusys/daedalus-sdk/proto/agent/v1"
 )
 
 // 错误哨兵。执行器用 %w 包装底层原因,调用方(tx / rpc)用 errors.Is 判定
