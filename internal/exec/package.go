@@ -44,38 +44,43 @@ func detectHostManager() (hostManager, error) {
 
 // packageSpec 是 package.set 的 SpecJson schema。Version 是控制面 spec 里
 // 已有的键(常带版本诉求),显式声明以免被 DisallowUnknownFields 连坐拒掉。
+//
+// 口径 C:Version 不是安装指令 —— 它不换源、不降级、不改 apt/dnf 的安装
+// 参数;它只是"我要的那个版本"的声明,apply 之后拿实际版本对一下(见
+// verifyPackageVersion)。
 type packageSpec struct {
 	DesiredState string `json:"desired_state"`
 	Version      string `json:"version"`
 }
 
-// packageDesiredState 解析并校验 desired_state。
+// parsePackageSpec 解析并校验 spec_json,同时给出 desired_state 与声明版本。
 //
-// 未声明时按 present 处理:v1 的冻结三值里 present 是 package 意图的自然
-// 默认("把这个包装上"),而控制面 Plan 层的 Intent.Target 已带包名、
+// 未声明 desired_state 时按 present 处理:v1 的冻结三值里 present 是 package
+// 意图的自然默认("把这个包装上"),而控制面 Plan 层的 Intent.Target 已带包名、
 // Spec 可只给 version。显式写了表外值则拒绝 —— 那才是"无法判定"。
 //
 // 未知键一律拒:拼错的 desired_stat 若被忽略,会静默落进上面的 present
 // 默认 —— 一个本意"卸载"的意图被翻成"安装",且没有任何报错。这是全部分支
 // 里唯一朝更危险方向默认的一条,必须堵死。
-func packageDesiredState(specJSON string) (string, error) {
+func parsePackageSpec(specJSON string) (packageSpec, error) {
 	raw := strings.TrimSpace(specJSON)
 	if raw == "" || raw == "null" {
-		return statePresent, nil
+		return packageSpec{DesiredState: statePresent}, nil
 	}
 	var spec packageSpec
 	dec := json.NewDecoder(strings.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&spec); err != nil {
-		return "", fmt.Errorf("%w: invalid package.set spec_json: %v", ErrPersistent, err)
+		return packageSpec{}, fmt.Errorf("%w: invalid package.set spec_json: %v", ErrPersistent, err)
 	}
 	switch spec.DesiredState {
 	case "":
-		return statePresent, nil
+		spec.DesiredState = statePresent
 	case statePresent, stateAbsent, stateLatest:
-		return spec.DesiredState, nil
+	default:
+		return packageSpec{}, fmt.Errorf("%w: unknown desired_state %q (v1 supports present|absent|latest)", ErrPersistent, spec.DesiredState)
 	}
-	return "", fmt.Errorf("%w: unknown desired_state %q (v1 supports present|absent|latest)", ErrPersistent, spec.DesiredState)
+	return spec, nil
 }
 
 // sanitizePackageName 是包名门的唯一出口。字符集走 SDK 的
@@ -104,12 +109,16 @@ type packageExecutor struct{}
 //
 // 幂等:先观测当前是否已装,已到位即 no-op。这样同一 intent 重复投递
 // (控制面无重试上限的边界)不会叠加副作用。
+//
+// 版本声明(口径 C)在 apply 之后核对,no-op 路径同样核对:同一 intent
+// 重复投递因此结论恒定 —— 不会第一次报版本不符、第二次因为"已装"就翻成
+// 成功。
 func (packageExecutor) Apply(ctx context.Context, intent *agentv1.ApplyIntentRequest) error {
 	name := intent.Target
 	if err := sanitizePackageName(name); err != nil {
 		return fmt.Errorf("%w: %v", ErrPersistent, err)
 	}
-	state, err := packageDesiredState(intent.SpecJson)
+	spec, err := parsePackageSpec(intent.SpecJson)
 	if err != nil {
 		return err
 	}
@@ -124,12 +133,11 @@ func (packageExecutor) Apply(ctx context.Context, intent *agentv1.ApplyIntentReq
 	}
 
 	var verb string
-	switch state {
+	switch spec.DesiredState {
 	case statePresent:
-		if installed {
-			return nil
+		if !installed {
+			verb = "install"
 		}
-		verb = "install"
 	case stateLatest:
 		// 已装则升级,未装则装到最新(apt 的 install 本身就取最新;
 		// dnf 的 upgrade 对未装包会报错,故分流)。
@@ -144,17 +152,22 @@ func (packageExecutor) Apply(ctx context.Context, intent *agentv1.ApplyIntentReq
 		}
 		verb = "remove"
 	default:
-		// 防御性兜底:packageDesiredState 已拒过表外值,这里不可达。
-		return fmt.Errorf("%w: unknown desired_state %q", ErrPersistent, state)
+		// 防御性兜底:parsePackageSpec 已拒过表外值,这里不可达。
+		return fmt.Errorf("%w: unknown desired_state %q", ErrPersistent, spec.DesiredState)
 	}
 
-	if err := runPkgVerb(ctx, mgr, verb, name); err != nil {
-		return err
+	if verb != "" {
+		if err := runPkgVerb(ctx, mgr, verb, name); err != nil {
+			return err
+		}
+		if col := collectorFrom(ctx); col != nil {
+			col.markChanged()
+		}
 	}
-	if col := collectorFrom(ctx); col != nil {
-		col.markChanged()
-	}
-	return nil
+
+	// apply 已经落盘(或本次无需变更):此时才谈得上"实际版本是多少"。
+	// 校验失败不回滚、不降级 —— 回滚由人按控制面提示执行。
+	return verifyPackageVersion(ctx, mgr, name, spec.DesiredState, spec.Version)
 }
 
 // RollbackHandle 找本次 apply 在包管理器里留下的事务 id。
@@ -211,6 +224,100 @@ func pkgInstalled(ctx context.Context, mgr hostManager, name string) (bool, erro
 		return strings.TrimSpace(out) != "", nil
 	}
 	return false, fmt.Errorf("%w: unsupported host manager %q", ErrPersistent, mgr.name)
+}
+
+// pkgInstalledVersion 取已装包的实际版本。
+//
+// 命令形状刻意用查询工具的原生形态(与 pkgInstalled 同一个 runCmd 缝):
+//
+//   - apt:dpkg-query -W -f=${Version} <pkg> —— 只要版本字段本身,
+//     不要整段 Status,免得多一层解析;
+//   - dnf:rpm -q --qf %{VERSION}-%{RELEASE} <pkg> —— 与 dpkg 的
+//     "上游版本-修订号"形状对齐,便于同一条截断规则处理。
+//
+// 查询失败一律 ErrPersistent:查不到实际版本时既不能说相符,也不能说
+// 不符 —— 唯一诚实的做法是把"我不知道"报成不可重试的失败,让人来看。
+// 包在 apply 之后突然"未安装"同属此类(并发卸载的竞态),同样如实上抛。
+func pkgInstalledVersion(ctx context.Context, mgr hostManager, name string) (string, error) {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return "", fmt.Errorf("exec: package.set %q cancelled: %w", name, ctxErr)
+	}
+
+	var out string
+	var err error
+	switch mgr.name {
+	case "apt":
+		out, err = runCmd(ctx, "dpkg-query", "-W", "-f=${Version}", name)
+	case "dnf":
+		out, err = runCmd(ctx, "rpm", "-q", "--qf", "%{VERSION}-%{RELEASE}", name)
+	default:
+		return "", fmt.Errorf("%w: unsupported host manager %q", ErrPersistent, mgr.name)
+	}
+	if err != nil {
+		low := strings.ToLower(out)
+		if strings.Contains(low, "no packages found") || strings.Contains(low, "is not installed") || strings.Contains(low, "not installed") {
+			return "", fmt.Errorf("%w: version check for %q: package is not installed after apply", ErrPersistent, name)
+		}
+		return "", fmt.Errorf("%w: version check for %q: cannot determine installed version: %s (%v)", ErrPersistent, name, firstLine(out), err)
+	}
+
+	version := strings.TrimSpace(out)
+	if version == "" {
+		return "", fmt.Errorf("%w: version check for %q: cannot determine installed version: empty output", ErrPersistent, name)
+	}
+	return version, nil
+}
+
+// versionTrunk 把包管理器报出的实际版本裁成可比的"主干"。
+//
+// 为什么这样裁:
+//
+//   - 先去掉 epoch(第一个 ':' 之前的部分)。epoch 是包管理器内部的排序权重
+//     (典型如 1:2.4.0),不是版本语义的一部分;把 1:2.4.0 当成"版本号"
+//     去和 2.4.0 比,只会得到假的不符。
+//   - 再在第一个 '-' / '+' / '~' 处截断。其后的部分是发行版/构建方的
+//     修订信息:apt 的 -2ubuntu7.19、-9+deb12u10,rpm 的 -1.el9;它们
+//     跨发行版不可比,拼进比较里会让"同一上游版本"在 Debian 与 Ubuntu
+//     上得出不同结论。
+//   - 截断后逐字相等才算相符:不做 >/>= 的"够新即可"判断 —— 口径 C 只
+//     回答"装的是不是声明的那个版本",替用户判断"够不够新"会再次把
+//     装错版本报成成功。也不做跨发行版归一:归一规则一旦猜错,结论就反了。
+func versionTrunk(actual string) string {
+	if i := strings.IndexByte(actual, ':'); i >= 0 {
+		actual = actual[i+1:]
+	}
+	if i := strings.IndexAny(actual, "-+~"); i >= 0 {
+		actual = actual[:i]
+	}
+	return strings.TrimSpace(actual)
+}
+
+// verifyPackageVersion 在 apply 之后核对实际版本(口径 C)。
+//
+// 口径 C 的边界:
+//
+//   - version 不是安装指令:不换源、不降级、不改 apt/dnf 的安装参数。
+//   - version 为空/缺失 → 不校验,行为与历史完全一致。
+//   - desired_state=absent → 不校验:包本来就不该留在宿主上,谈不上"装的是
+//     哪个版本"。
+//   - present/latest → 只要包确已安装就校验,包括本次 no-op 的情形。这样
+//     同一 intent 重复投递结论恒定,不会第一次失败、第二次成功。
+//   - 不符不回滚、不降级、不自动重试:报 ErrPersistent,由人按控制面提示
+//     决定回滚或换源。
+func verifyPackageVersion(ctx context.Context, mgr hostManager, name, state, declared string) error {
+	declared = strings.TrimSpace(declared)
+	if declared == "" || state == stateAbsent {
+		return nil
+	}
+
+	actual, err := pkgInstalledVersion(ctx, mgr, name)
+	if err != nil {
+		return err
+	}
+	if versionTrunk(actual) == declared {
+		return nil
+	}
+	return fmt.Errorf("%w: version mismatch: declared=%s actual=%s", ErrPersistent, declared, actual)
 }
 
 // runPkgVerb 发一条变更命令。argv 用宿主管理器的原生形态:
