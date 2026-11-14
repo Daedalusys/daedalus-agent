@@ -276,3 +276,48 @@ func TestLVMSnapshotRequiresDevicePath(t *testing.T) {
 		t.Errorf("lvcreate invoked %d times, want 0", called)
 	}
 }
+
+// 目录级 file intent 走内建 tree 后端,与宿主能力无关(与 PointFile 同一条
+// 理由:内建后端不依赖宿主有没有快照机制)。
+func TestSelectBackend_PointTree(t *testing.T) {
+	b, err := SelectBackend(PointTree, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE)
+	if err != nil {
+		t.Fatalf("SelectBackend(PointTree): %v", err)
+	}
+	if _, ok := b.(*TreeBackend); !ok {
+		t.Errorf("后端类型 = %T, want *TreeBackend", b)
+	}
+	if _, ok := b.(PathSetBackend); !ok {
+		t.Errorf("tree 后端必须实现 PathSetBackend, got %T", b)
+	}
+}
+
+// SelectBackend 拿不到 dataDir;生产必须用 SelectBackendFor 把数据目录带进来,
+// 否则 GC 找不到快照集合(CreateSnapshotSet 会 fail-closed)。
+func TestSelectBackendFor_PointTreeCarriesDataDir(t *testing.T) {
+	b, err := SelectBackendFor(PointTree, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE, "/var/lib/daedalus-agent")
+	if err != nil {
+		t.Fatalf("SelectBackendFor(PointTree): %v", err)
+	}
+	tb, ok := b.(*TreeBackend)
+	if !ok {
+		t.Fatalf("后端类型 = %T, want *TreeBackend", b)
+	}
+	if tb.dataDir != "/var/lib/daedalus-agent" {
+		t.Errorf("dataDir = %q, want /var/lib/daedalus-agent", tb.dataDir)
+	}
+}
+
+// SelectBackendFor 对其他点的行为与 SelectBackend 一致。
+func TestSelectBackendFor_NonTreeDelegates(t *testing.T) {
+	b, err := SelectBackendFor(PointFile, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE, "/var/lib/x")
+	if err != nil {
+		t.Fatalf("SelectBackendFor(PointFile): %v", err)
+	}
+	if _, ok := b.(*CopyBackend); !ok {
+		t.Errorf("后端类型 = %T, want *CopyBackend", b)
+	}
+	if _, err := SelectBackendFor(PointNone, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE, "/var/lib/x"); err == nil {
+		t.Fatal("PointNone 仍应拒绝")
+	}
+}

@@ -91,21 +91,44 @@ type Backend interface {
 	Restore(snapshotPath, targetPath string) error
 }
 
+// PathSetBackend 能一次留一组路径的副本。它是 Backend 之外的可选能力:
+// 单路径后端(CopyBackend)不实现它,tx 因此可以按类型断言选分支,而不是
+// 给现有接口硬塞一个用不上的方法。
+type PathSetBackend interface {
+	Backend
+	CreateSnapshotSet(paths []string, snapshotPath string) error
+	RestoreSet(snapshotPath string, paths []string) error
+}
+
+var _ PathSetBackend = (*TreeBackend)(nil)
+
 // SelectBackend 把「回滚点形态 + 宿主能力」映射到具体的回滚后端。
 //
 // 两个输入的分工:
 //
-//   - Point 决定"这次变更有没有还原手段"。PointFile 恒走内建的 copy 后端,
-//     与宿主能力无关 —— 把文件路径喂给 lvcreate 会被 lvm.go 的 /dev/ 守卫
-//     拒绝,进而让 LVM 宿主上的所有 file intent 直接坏掉。
+//   - Point 决定"这次变更有没有还原手段"。PointFile / PointTree 恒走内建
+//     后端,与宿主能力无关 —— 把文件路径喂给 lvcreate 会被 lvm.go 的
+//     /dev/ 守卫拒绝,进而让 LVM 宿主上的所有 file intent 直接坏掉。
 //   - capability 只在 PointVolume 时有发言权:它回答"用哪种宿主手段还原"。
 //
 // PointNone 一律拒绝;PointVolume 上不认识的能力也拒绝,不猜:猜错会拿
 // 错的后端去动宿主。rsync 只能复制文件,覆盖不了卷级状态,因此也不接受。
+//
+// tree 后端需要数据目录来定位快照集合;这里没有 dataDir 可传,生产路径必须
+// 用 SelectBackendFor。本函数对 PointTree 仍返回一个 dataDir 为空的
+// TreeBackend,它在真正建快照时会 fail-closed,而不是悄悄写到相对路径。
 func SelectBackend(point Point, capability agentv1.SnapshotCapability) (Backend, error) {
+	return SelectBackendFor(point, capability, "")
+}
+
+// SelectBackendFor 是 SelectBackend 的带数据目录版本:生产路径用这个,
+// 让 tree 后端知道 GC 该扫哪里。
+func SelectBackendFor(point Point, capability agentv1.SnapshotCapability, dataDir string) (Backend, error) {
 	switch point {
 	case PointFile:
 		return &CopyBackend{}, nil
+	case PointTree:
+		return NewTreeBackend(dataDir), nil
 	case PointVolume:
 		switch capability {
 		case agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_LVM_SNAP:
