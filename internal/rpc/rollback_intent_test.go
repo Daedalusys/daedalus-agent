@@ -4,6 +4,7 @@ package rpc_test
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -460,5 +461,49 @@ func TestRollback_PlanWithHumanReviewIsNotAuto(t *testing.T) {
 	}
 	if autoOK != "false" {
 		t.Fatalf("链上 auto_ok = %q, want false(含人审步骤的计划不得自动执行)", autoOK)
+	}
+}
+
+// 执行中途失败 → FAILED(不是 APPLIED、也不是 REFUSED),且链上留 rollback.failed。
+// 「退出码非 0 就是失败」在 rollback 包由 TestApply_StopsOnFirstFailure 钉住,
+// 这里钉 wire 侧的结局映射。
+func TestRollback_NativeUndoFailure(t *testing.T) {
+	runner := &fakeRollbackRunner{err: fmt.Errorf("%w: step 0 (dnf history undo 42): exit status 1", rollback.ErrStepFailed)}
+	rig := startRollbackRig(t, runner, "")
+	defer rig.Cleanup()
+
+	plan := planDnf(t, rig, "i-rb-fail")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := rig.Client.RollbackIntent(ctx, &agentv1.RollbackIntentRequest{
+		IntentId:       "i-rb-fail",
+		RollbackHandle: "dnf-history:42",
+		Mode:           agentv1.RollbackMode_ROLLBACK_MODE_APPLY,
+		Steps:          plan.GetSteps(),
+		PlanHash:       plan.GetPlanHash(),
+		ApproveToken:   plan.GetApproveToken(),
+	})
+	if err != nil {
+		t.Fatalf("RollbackIntent(APPLY): %v", err)
+	}
+	if resp.GetResult() != agentv1.RollbackResult_ROLLBACK_RESULT_FAILED {
+		t.Fatalf("result = %v, want FAILED", resp.GetResult())
+	}
+	if !strings.Contains(resp.GetErrorMessage(), "exit status 1") {
+		t.Errorf("error_message = %q, want 含底层退出信息(不吞输出)", resp.GetErrorMessage())
+	}
+
+	events, _, err := rig.Audit.Since(0)
+	if err != nil {
+		t.Fatalf("audit.Since: %v", err)
+	}
+	var failed bool
+	for _, ev := range events {
+		if ev.Tool == "rollback.failed" && ev.Identity == "i-rb-fail" {
+			failed = true
+		}
+	}
+	if !failed {
+		t.Fatalf("链上缺 rollback.failed, got %+v", events)
 	}
 }
