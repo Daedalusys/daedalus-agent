@@ -155,7 +155,8 @@ func (s Spec) Validate(target string) error {
 	}
 
 	seen := make(map[string]Op, len(s.Entries))
-	for _, entry := range s.Entries {
+	checked := make([]checkedEntry, 0, len(s.Entries))
+	for i, entry := range s.Entries {
 		clean, err := validatePathShape(targetClean, entry.Path)
 		if err != nil {
 			return err
@@ -164,16 +165,54 @@ func (s Spec) Validate(target string) error {
 			return fmt.Errorf("path %q appears more than once (ops %s and %s); refusing ambiguous spec", entry.Path, prev, entry.Op)
 		}
 		seen[clean] = entry.Op
+		checked = append(checked, checkedEntry{index: i, clean: clean, entry: entry})
+	}
 
-		full := filepath.Join(targetClean, clean)
+	// 祖先关系必须在这里、碰文件系统之前判定,而且只看 entry 点名的相对路径:
+	// 一批里既要改目录本身(repoint 软链)、又要写该目录之下的文件时,文件落到
+	// 旧目录还是新目标取决于 entry 顺序,同一请求两种结果。同一个 A 若被写成了
+	// 普通文件,写 A 之下的子路径也不可能同时成立。fail-closed,不按顺序碰运气。
+	for i := 0; i < len(checked); i++ {
+		for j := i + 1; j < len(checked); j++ {
+			a, b := checked[i], checked[j]
+			if isAncestorDir(a.clean, b.clean) {
+				return ancestorError(a, b)
+			}
+			if isAncestorDir(b.clean, a.clean) {
+				return ancestorError(b, a)
+			}
+		}
+	}
+
+	for _, c := range checked {
+		full := filepath.Join(targetClean, c.clean)
 		if err := validateParent(targetReal, full); err != nil {
 			return err
 		}
-		if err := validateFinal(full, entry); err != nil {
+		if err := validateFinal(full, c.entry); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// checkedEntry 记住 entry 在 spec 里的原始下标,报错要能用用户看到的序号定位。
+type checkedEntry struct {
+	index int
+	clean string
+	entry Entry
+}
+
+// isAncestorDir 判断 a 是否是 b 的祖先目录。纯字符串比较:分隔符必须带上,
+// 否则 conf.d 会被当成 conf.d.bak 的祖先。
+func isAncestorDir(a, b string) bool {
+	return strings.HasPrefix(b, a+string(os.PathSeparator))
+}
+
+// ancestorError 指认两条 entry 的原始 path 与下标,让用户能直接回查输入。
+func ancestorError(ancestor, descendant checkedEntry) error {
+	return fmt.Errorf("entries[%d] path %q is an ancestor directory of entries[%d] path %q; refusing ambiguous batch",
+		ancestor.index, ancestor.entry.Path, descendant.index, descendant.entry.Path)
 }
 
 // validatePathShape 挡住形状层面的越界:绝对路径、空路径、清理后仍是
