@@ -1,0 +1,138 @@
+---
+# daedalus-agent 的 tag 驱动发布流水线。
+#
+# 目的:机器/靶场只从 GitHub Release 装 agent,退役"在开发机上手工 go build +
+# tar + scp 到各台机器"的老路(脚本散落各机、版本无法自证)。
+#
+# 链路(顺序即步骤顺序,闸门必须在**上传之前**):
+#   tag v* → go test → 重跑守卫 → goreleaser check
+#          → goreleaser --snapshot(只造 dist/,不上传)
+#          → scripts/check-release-assets.sh(资产齐不齐、包内版式对不对)
+#          → goreleaser release(真发布:资产 + SHA256SUMS)
+#          → actions/attest(SLSA provenance,消费方 gh attestation verify 校验)
+#
+# 为什么闸门必须在上传前:release 资产按本仓口径**不可重发**(重跑会覆盖已发布
+# 资产,attestation 与新文件摘要失配),坏包一旦上传就只能改版本号重来。
+#
+# 配置见仓根 .goreleaser.yml(交叉编译 linux/amd64+arm64、wrap 一层目录、
+# 包里带 bin/daedalus-agent 与 scripts/install.sh、校验和名 SHA256SUMS)。
+name: daedalus-agent Release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+# contents: goreleaser 创建 GitHub release 并上传资产。
+# id-token: attestation 用 OIDC token 换 Sigstore 签名身份。
+# attestations: attestation 写入本仓 attestation 存储。
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    name: Release (goreleaser, linux amd64+arm64)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout agent
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # 不把 GITHUB_TOKEN 持久化进 .git/config:goreleaser 从环境变量取
+          # token,不读 .git/config 的 http.extraheader。
+          persist-credentials: false
+          # goreleaser 需要完整 git 历史(算 .Version/.ShortCommit/.CommitDate 与 changelog)。
+          fetch-depth: 0
+          # 检出到子目录:go.mod 里 replace github.com/Daedalusys/daedalus-sdk => ../daedalus-sdk,
+          # SDK 必须落在平级位置,否则 go build 直接解析不到。
+          path: daedalus-agent
+
+      - name: Checkout SDK (sibling; go.mod 的 replace => ../daedalus-sdk)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: Daedalusys/daedalus-sdk
+          path: daedalus-sdk
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.x'
+          # 本 workflow 只由 tag push / dispatch 触发,不接受 PR —— 缓存条目不会
+          # 被 PR 分支写入,故保留 cache(发布腿提速)。
+          cache: true
+          cache-dependency-path: |
+            daedalus-agent/go.sum
+            daedalus-sdk/go.sum
+
+      - name: 触发守卫(只接受 tag)
+        # workflow_dispatch 可以被任意分支触发;goreleaser 用 git tag 定版本,
+        # 在分支上跑会得到 0.0.0 之类的假版本。宁可直接拒,也不产出不可信的 release。
+        run: |
+          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
+            echo "release 只能由 tag 触发(当前 ref=${GITHUB_REF},类型=${GITHUB_REF_TYPE});请在 tag 上 dispatch。" >&2
+            exit 1
+          fi
+
+      - name: Go Test
+        # 发布前守门:全量单测必须绿才出包。
+        working-directory: daedalus-agent
+        run: go test ./...
+
+      - name: 重跑守卫(同 tag 不可重发)
+        # 同 tag 重跑会覆盖已发布的资产,而 attestation 是按上一轮的文件摘要签的
+        # —— 两者对不上,消费方 verify 会失败。要重发请改版本号后重新打 tag。
+        working-directory: daedalus-agent
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release ${GITHUB_REF_NAME} 已存在:同 tag 不可重发(资产会被覆盖且 attestation 失配),请改版本号。" >&2
+            exit 1
+          fi
+
+      - name: goreleaser check
+        # 配置解析/废弃键检查:配置写错要在造包之前就红,别等半个 release 跑完。
+        uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
+        with:
+          distribution: goreleaser
+          version: 'v2.20.2'
+          workdir: daedalus-agent
+          args: check
+
+      - name: 造包(snapshot;只写 dist/,不上传)
+        # --snapshot 不发布:产物只落 dist/。.goreleaser.yml 把快照版本钉成
+        # {{ .Version }},所以这里造的资产名与下一轮真发布完全同名 —— 闸门断言的
+        # 就是将来真要上传的那批名字。
+        uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
+        with:
+          distribution: goreleaser
+          version: 'v2.20.2'
+          workdir: daedalus-agent
+          args: release --snapshot --clean
+
+      - name: 资产闸门(上传前)
+        # 两件 tarball(linux_amd64 / linux_arm64)+ SHA256SUMS 必须齐;每个包里必须
+        # 同时有 bin/daedalus-agent 与 scripts/install.sh。版本号用 tag 去 v 的精确值
+        # (v0.1.0 → 0.1.0),精确版本只认完全同名的资产,快照形态不得冒充(见脚本注释)。
+        working-directory: daedalus-agent
+        run: bash scripts/check-release-assets.sh dist "${GITHUB_REF_NAME#v}"
+
+      - name: 真发布(goreleaser;建 release + 上传资产与 SHA256SUMS)
+        # --clean 清掉快照的 dist/,用同一 tag 重新造包再上传:闸门已经用同名产物
+        # 验过版式,这里不会出现"名字对了但版式变了"的漂移。
+        uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
+        with:
+          distribution: goreleaser
+          version: 'v2.20.2'
+          workdir: daedalus-agent
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Attest 发布资产 provenance
+        # SLSA v1.0 Build L2:attestation 以文件摘要为 subject,故放在发布之后不影响
+        # 与已上传资产的对应。消费方校验:gh attestation verify <tarball> --repo <owner>/<repo>
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: daedalus-agent/dist/*.tar.gz

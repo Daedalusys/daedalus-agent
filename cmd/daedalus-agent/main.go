@@ -29,9 +29,35 @@ import (
 	"github.com/Daedalusys/daedalus-agent/internal/snapshot"
 )
 
-// version is overridden at build time via -ldflags "-X main.version=…".
-// Default value is the in-tree development version.
-var version = "0.1.0-dev"
+// 版本自证:三个变量都由构建期 -ldflags "-X main.<name>=…" 注入,
+// 默认值是开发态语义(没有注入 = 本机构建,不是发布产物)。
+//
+//	version   : tag 去掉前导 v(如 0.1.0);dev 构建固定为 0.1.0-dev
+//	commit    : 构建所用的短 SHA;为空表示未注入(dev 构建)
+//	buildDate : 提交时间(RFC3339);goreleaser 的 .CommitDate 注入
+var (
+	version   = "0.1.0-dev"
+	commit    = ""
+	buildDate = ""
+)
+
+// versionString 是版本信息的唯一出口:startup 日志 / status / version 三处
+// 共用它,避免某处漏改导致同一个二进制自报两个版本。
+//
+// 契约:
+//   - dev 构建(commit 为空):原样返回 version,不追加空字段;
+//   - 发布构建:返回 "0.1.0 commit=abc1234 built=2026-11-15T04:00:00Z";
+//   - buildDate 缺失时只拼 commit,不打印 "built=" 空尾巴。
+func versionString() string {
+	if commit == "" {
+		return version
+	}
+	s := version + " commit=" + commit
+	if buildDate != "" {
+		s += " built=" + buildDate
+	}
+	return s
+}
 
 // ShutdownTimeout bounds the signal-triggered graceful shutdown. It is
 // larger than daemon.ShutdownTimeout so signal handling has headroom
@@ -192,7 +218,7 @@ func runDaemonStart(cmd *cobra.Command, cfgPath string) error {
 	}
 
 	log.Printf("daedalus-agent %s starting (agent_id=%s, control_plane=%s)",
-		version, cfg.AgentID, cfg.ControlPlaneAddr)
+		versionString(), cfg.AgentID, cfg.ControlPlaneAddr)
 
 	if err := d.Start(ctx); err != nil {
 		return fmt.Errorf("daemon: %w", err)
@@ -279,7 +305,7 @@ func newDaemonStatusCmd(cfgPath *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			fmt.Printf("daedalus-agent %s\n", version)
+			fmt.Printf("daedalus-agent %s\n", versionString())
 			fmt.Printf("  agent_id:           %s\n", cfg.AgentID)
 			fmt.Printf("  control_plane_addr: %s\n", cfg.ControlPlaneAddr)
 			fmt.Printf("  data_dir:           %s\n", cfg.DataDir)
@@ -300,7 +326,7 @@ func newVersionCmd() *cobra.Command {
 		Use:   "version",
 		Short: "Print version and exit",
 		Run: func(_ *cobra.Command, _ []string) {
-			fmt.Printf("daedalus-agent %s\n", version)
+			fmt.Printf("daedalus-agent %s\n", versionString())
 		},
 	}
 }
