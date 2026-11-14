@@ -148,7 +148,35 @@ func (packageExecutor) Apply(ctx context.Context, intent *agentv1.ApplyIntentReq
 		return fmt.Errorf("%w: unknown desired_state %q", ErrPersistent, state)
 	}
 
-	return runPkgVerb(ctx, mgr, verb, name)
+	if err := runPkgVerb(ctx, mgr, verb, name); err != nil {
+		return err
+	}
+	if col := collectorFrom(ctx); col != nil {
+		col.markChanged()
+	}
+	return nil
+}
+
+// RollbackHandle 找本次 apply 在包管理器里留下的事务 id。
+//
+// 只在**本次真的改了宿主**时才找:no-op 的 apply 没有事务,给句柄等于让
+// 控制面日后去回滚一次从未发生的变更(典型后果是把本来就在跑的包卸掉)。
+func (packageExecutor) RollbackHandle(ctx context.Context, intent *agentv1.ApplyIntentRequest) (string, error) {
+	col := collectorFrom(ctx)
+	if col == nil || !col.wasChanged() {
+		return "", nil
+	}
+	mgr, err := detectHostManager()
+	if err != nil {
+		return "", err
+	}
+	switch mgr.name {
+	case "dnf":
+		return captureDnfHandle(ctx, intent.Target, col.since())
+	case "apt":
+		return captureAptHandle(ctx, intent.Target)
+	}
+	return "", fmt.Errorf("%w: unsupported host manager %q", ErrPersistent, mgr.name)
 }
 
 // pkgInstalled 观测包是否已装。apt 用 dpkg-query(退出码 1 表示未装),

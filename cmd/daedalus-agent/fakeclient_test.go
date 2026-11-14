@@ -80,6 +80,7 @@ type fakeAgentClient struct {
 	reportFn    func(context.Context, *agentv1.ReportStatusRequest, ...grpc.CallOption) (*agentv1.ReportStatusResponse, error)
 	heartbeatFn func(context.Context, *agentv1.HeartbeatRequest, ...grpc.CallOption) (*agentv1.HeartbeatResponse, error)
 	snapshotFn  func(context.Context, *agentv1.SnapshotRequestRequest, ...grpc.CallOption) (*agentv1.SnapshotResponse, error)
+	rollbackFn  func(context.Context, *agentv1.RollbackIntentRequest, ...grpc.CallOption) (*agentv1.RollbackIntentResponse, error)
 }
 
 func (f *fakeAgentClient) Register(ctx context.Context, in *agentv1.RegisterRequest, opts ...grpc.CallOption) (*agentv1.RegisterResponse, error) {
@@ -115,6 +116,13 @@ func (f *fakeAgentClient) ReportStatus(ctx context.Context, in *agentv1.ReportSt
 		return nil, status.Error(codes.Unimplemented, "stub 未设置")
 	}
 	return f.reportFn(ctx, in, opts...)
+}
+
+func (f *fakeAgentClient) RollbackIntent(ctx context.Context, in *agentv1.RollbackIntentRequest, opts ...grpc.CallOption) (*agentv1.RollbackIntentResponse, error) {
+	if f.rollbackFn == nil {
+		return nil, status.Error(codes.Unimplemented, "stub 未设置")
+	}
+	return f.rollbackFn(ctx, in, opts...)
 }
 
 // dialRecorder 记录 dialClient 被调用时收到的配置与调用次数。

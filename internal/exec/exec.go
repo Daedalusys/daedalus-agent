@@ -25,6 +25,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"sync"
@@ -50,6 +51,17 @@ var (
 // 同一 intent 重复投递(控制面无重试上限的边界)不得产生副作用叠加。
 type Executor interface {
 	Apply(ctx context.Context, intent *agentv1.ApplyIntentRequest) error
+}
+
+// HandleProvider 是可选接口:执行器实现它,即可在 apply 之后回传回滚句柄。
+//
+// 可选而非必备:file 的回滚点是内建 copy,不产句柄;没实现的 kind 一律
+// 空句柄,控制面对高危变更据此拒绝(fail-closed)。
+//
+// 实现可能在 Apply 期间就把素材攒好了(service 的前置状态只能在 apply 前
+// 读),ApplyWithHandle 用同一个 ctx 把素材递过来。
+type HandleProvider interface {
+	RollbackHandle(ctx context.Context, intent *agentv1.ApplyIntentRequest) (string, error)
 }
 
 // ApplyFunc 与 tx.ApplyFunc 同签名,便于直接作为 tx.New 的 apply 步骤传入。
@@ -108,28 +120,64 @@ func lookup(kind string) (Executor, bool) {
 }
 
 // Apply 是 intent 的分派入口,签名与 tx.ApplyFunc 一致,可直接替换
-// applyStub。nil intent 视为不可判定 → 拒绝(fail-closed)。
+// applyStub。句柄版见 ApplyWithHandle。
 func Apply(ctx context.Context, intent *agentv1.ApplyIntentRequest) error {
+	_, err := ApplyWithHandle(ctx, intent)
+	return err
+}
+
+// ApplyWithHandle 是 Apply 的加长版:除了 apply 的结局,还回传可持久引用的
+// 回滚句柄。
+//
+// 句柄捕获失败**不改变 apply 的结局**:变更已经落在宿主上了,把它报成失败
+// 只会让控制面去重试一个已经生效的变更。失败时返回空句柄 + nil,由上层按
+// "没有回滚锚点"处理(写链 + 高危拒绝)。
+func ApplyWithHandle(ctx context.Context, intent *agentv1.ApplyIntentRequest) (string, error) {
 	if intent == nil {
-		return fmt.Errorf("%w: nil intent", ErrUnsupportedKind)
+		return "", fmt.Errorf("%w: nil intent", ErrUnsupportedKind)
 	}
 	registerOnce.Do(registerAll)
 	e, ok := lookup(intent.Kind)
 	if !ok {
 		// 不猜:控制面发了本 agent 不认识的 kind,重试也不会变好。
-		return fmt.Errorf("%w: %q", ErrUnsupportedKind, intent.Kind)
+		return "", fmt.Errorf("%w: %q", ErrUnsupportedKind, intent.Kind)
 	}
-	err := e.Apply(ctx, intent)
-	if err == nil {
-		return nil
+
+	// 收集器必须在 Apply 之前挂上:service 的前置状态只能在那时读到。
+	ctx = withCollector(ctx, newHandleCollector())
+
+	if err := e.Apply(ctx, intent); err != nil {
+		return "", classifyExecError(err)
 	}
+
+	hp, ok := e.(HandleProvider)
+	if !ok {
+		return "", nil
+	}
+	handle, err := hp.RollbackHandle(ctx, intent)
+	if err != nil {
+		log.Printf("agent: exec: rollback handle unavailable: kind=%q target=%q err=%v",
+			intent.Kind, intent.Target, err)
+		return "", nil
+	}
+	return handle, nil
+}
+
+// classifyExecError 给执行器错误兜底分类。执行器契约:失败必须可分类,否则
+// 控制面不知道要不要重试。漏裹哨兵的实现一律按不可重试处理 —— 这里在
+// **分派边界**兜底,免得依赖上层(如 tx)的默认分流恰好选对方向。
+func classifyExecError(err error) error {
 	if classifyable(err) {
 		return err
 	}
-	// 执行器契约:失败必须可分类,否则控制面不知道要不要重试。这里在
-	// **分派边界**兜底 —— 漏裹哨兵的实现一律按不可重试处理,免得依赖
-	// 上层(如 tx)的默认分流恰好选对方向。
 	return fmt.Errorf("%w: executor returned an unclassified error: %v", ErrPersistent, err)
+}
+
+// HandleCapable 报告该 kind 是否可能产出回滚句柄。
+//
+// 控制面与审计据此区分「空句柄是异常」与「这个 kind 本来就没有句柄」。
+func HandleCapable(kind string) bool {
+	return kind == kindPackage || kind == kindService
 }
 
 // classifyable 报告 err 是否已经带上可重试性(或本身就是 ctx 取消,由上层

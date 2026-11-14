@@ -20,6 +20,10 @@ type fakeHost struct {
 	calls     [][]string
 	verbOut   string
 	verbErr   error
+	// historyOut / historyErr 是历史查询(dnf history --json / apt
+	// history-list)的回包;回滚句柄的 id 就从这里来。
+	historyOut string
+	historyErr error
 }
 
 func (h *fakeHost) run(_ context.Context, name string, args ...string) (string, error) {
@@ -39,6 +43,9 @@ func (h *fakeHost) run(_ context.Context, name string, args ...string) (string, 
 			return last + "-1.24.0-1", nil
 		}
 		return "package " + last + " is not installed", errors.New("exit status 1")
+	case "dnf", "apt":
+		// 历史查询(dnf history --json / apt history-list):只读,不改状态。
+		return h.historyOut, h.historyErr
 	case "/usr/bin/apt-get", "/usr/bin/dnf":
 		if h.verbErr != nil {
 			return h.verbOut, h.verbErr
@@ -67,6 +74,18 @@ func (h *fakeHost) managerBin() string {
 		return "/usr/bin/apt-get"
 	}
 	return "/usr/bin/dnf"
+}
+
+// lastManagerCall 返回最后一次调用包管理器**变更动词**的 argv。
+//
+// 不能用"最后一次调用":句柄捕获会在变更之后追加一次历史查询,那不是变更。
+func (h *fakeHost) lastManagerCall() []string {
+	for i := len(h.calls) - 1; i >= 0; i-- {
+		if h.calls[i][0] == h.managerBin() {
+			return h.calls[i]
+		}
+	}
+	return nil
 }
 
 // withFakeHost 把 runCmd / fileExists 两个缝换成 h,并在测试结束时还原。
@@ -100,7 +119,7 @@ func TestPackage_PresentCallsHostManager(t *testing.T) {
 			if err := Apply(context.Background(), pkgIntent(`{"desired_state":"present"}`, "nginx")); err != nil {
 				t.Fatalf("Apply: unexpected err: %v", err)
 			}
-			got := h.calls[len(h.calls)-1]
+			got := h.lastManagerCall()
 			if strings.Join(got, " ") != strings.Join(tc.want, " ") {
 				t.Errorf("argv = %v, got %v, want %v", got, got, tc.want)
 			}
@@ -125,7 +144,7 @@ func TestPackage_AbsentCallsRemove(t *testing.T) {
 			if err := Apply(context.Background(), pkgIntent(`{"desired_state":"absent"}`, "nginx")); err != nil {
 				t.Fatalf("Apply: unexpected err: %v", err)
 			}
-			got := h.calls[len(h.calls)-1]
+			got := h.lastManagerCall()
 			if strings.Join(got, " ") != strings.Join(tc.want, " ") {
 				t.Errorf("argv = %v, got %v, want %v", got, got, tc.want)
 			}
@@ -221,7 +240,7 @@ func TestPackage_MissingDesiredStateDefaultsToPresent(t *testing.T) {
 	if err := Apply(context.Background(), pkgIntent(`{"version":"1.24.0"}`, "nginx")); err != nil {
 		t.Fatalf("Apply: unexpected err: %v", err)
 	}
-	got := h.calls[len(h.calls)-1]
+	got := h.lastManagerCall()
 	want := []string{"/usr/bin/dnf", "install", "-y", "nginx"}
 	if strings.Join(got, " ") != strings.Join(want, " ") {
 		t.Errorf("argv = %v, got %v, want %v", got, got, want)

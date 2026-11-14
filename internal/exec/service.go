@@ -65,6 +65,7 @@ type unitState struct {
 	LoadState     string
 	ActiveState   string
 	UnitFileState string
+	SubState      string
 }
 
 // serviceExecutor 实现 service.set。无状态,可复用。
@@ -112,7 +113,31 @@ func (serviceExecutor) Apply(ctx context.Context, intent *agentv1.ApplyIntentReq
 			return nil
 		}
 	}
-	return runSystemctl(ctx, serviceVerbs[state], unit)
+	if err := runSystemctl(ctx, serviceVerbs[state], unit); err != nil {
+		return err
+	}
+	// 只有真动过单元才留句柄:no-op 的"回滚"会把本来就在跑的服务停掉。
+	// 这里用的 st 是上面观测到的**前置**状态,不是变更后的结果。
+	if col := collectorFrom(ctx); col != nil {
+		col.setService(encodeServiceState(unit, serviceState{
+			ActiveState:   st.ActiveState,
+			UnitFileState: st.UnitFileState,
+			SubState:      st.SubState,
+		}))
+	}
+	return nil
+}
+
+// RollbackHandle 回传 service 的前置状态句柄。
+//
+// 前置状态在 Apply 期间(变更之前)就抓好了,这里只是把它交出去:apply 之后
+// 再观测一次读到的是变更结果,拿它算反向动词只会原地打转。
+func (serviceExecutor) RollbackHandle(ctx context.Context, _ *agentv1.ApplyIntentRequest) (string, error) {
+	col := collectorFrom(ctx)
+	if col == nil {
+		return "", nil
+	}
+	return col.serviceHandle(), nil
 }
 
 // showUnitState 一次读全单元的三个属性。拿不到 LoadState 视为无法观测
@@ -121,7 +146,7 @@ func showUnitState(ctx context.Context, unit string) (unitState, error) {
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return unitState{}, fmt.Errorf("exec: service.set %q cancelled: %w", unit, ctxErr)
 	}
-	out, err := runCmd(ctx, "systemctl", "show", "--property=LoadState,ActiveState,UnitFileState", unit)
+	out, err := runCmd(ctx, "systemctl", "show", "--property=LoadState,ActiveState,UnitFileState,SubState", unit)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return unitState{}, fmt.Errorf("exec: service.set %q cancelled: %w", unit, ctxErr)
@@ -142,6 +167,8 @@ func showUnitState(ctx context.Context, unit string) (unitState, error) {
 			st.ActiveState = val
 		case "UnitFileState":
 			st.UnitFileState = val
+		case "SubState":
+			st.SubState = val
 		}
 	}
 	if st.LoadState == "" {
