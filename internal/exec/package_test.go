@@ -32,6 +32,12 @@ type fakeHost struct {
 	// 锚点来源)。
 	aptLog    string
 	aptLogErr error
+	// versions 是已装包的实际版本(dpkg-query / rpm 的版本查询回包)。
+	// 未登记的已装包回一个默认版本,让"未声明版本"的旧用例不必改写。
+	versions map[string]string
+	// versionOut / versionErr 让测试注入"版本查询本身失败"。
+	versionOut string
+	versionErr error
 }
 
 // fakeReply 是一条按 argv 命中的回包。
@@ -48,6 +54,20 @@ func (h *fakeHost) run(_ context.Context, name string, args ...string) (string, 
 	last := ""
 	if len(args) > 0 {
 		last = args[len(args)-1]
+	}
+	// 版本查询(dpkg-query -f=${Version} / rpm --qf)与"是否已装"的查询
+	// 走不同的 argv,必须分开回包:否则实际版本会被回成状态串。
+	if isVersionArgv(name, args) {
+		if h.versionErr != nil {
+			return h.versionOut, h.versionErr
+		}
+		if !h.installed[last] {
+			return "package " + last + " is not installed", errors.New("exit status 1")
+		}
+		if v, ok := h.versions[last]; ok {
+			return v, nil
+		}
+		return "1.24.0-1", nil
 	}
 	switch name {
 	case "dpkg-query":
@@ -91,6 +111,31 @@ func (h *fakeHost) managerBin() string {
 		return "/usr/bin/apt-get"
 	}
 	return "/usr/bin/dnf"
+}
+
+// isVersionArgv 判定一次外部命令是不是"取实际版本"的查询。
+//
+// 形状与生产实现一一对应:apt 用 dpkg-query -W -f=${Version},
+// dnf 用 rpm -q --qf %{VERSION}-%{RELEASE}。
+func isVersionArgv(name string, args []string) bool {
+	switch name {
+	case "dpkg-query":
+		return len(args) == 3 && args[0] == "-W" && args[1] == "-f=${Version}"
+	case "rpm":
+		return len(args) == 4 && args[0] == "-q" && args[1] == "--qf" && args[2] == "%{VERSION}-%{RELEASE}"
+	}
+	return false
+}
+
+// versionQueryCount 数"取实际版本"的查询次数。
+func (h *fakeHost) versionQueryCount() int {
+	n := 0
+	for _, c := range h.calls {
+		if isVersionArgv(c[0], c[1:]) {
+			n++
+		}
+	}
+	return n
 }
 
 // lastManagerCall 返回最后一次调用包管理器**变更动词**的 argv。
@@ -334,6 +379,154 @@ func TestPackage_CancelledContextAborts(t *testing.T) {
 	for _, c := range h.calls {
 		if c[0] == "/usr/bin/apt-get" {
 			t.Errorf("mutating call %v must not happen after cancellation", c)
+		}
+	}
+}
+
+// 口径 C:实际版本的主干与声明版本相符 → apply 成功。
+// 发行版后缀(-2ubuntu7.19 / -1.el9)必须被裁掉后再逐字比较。
+func TestPackage_DeclaredVersionMatchesTrunk(t *testing.T) {
+	cases := []struct {
+		manager string
+		actual  string
+	}{
+		{"apt", "1.24.0-2ubuntu7.19"},
+		{"dnf", "1.24.0-1.el9"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.manager, func(t *testing.T) {
+			h := &fakeHost{
+				manager:   tc.manager,
+				installed: map[string]bool{},
+				versions:  map[string]string{"nginx": tc.actual},
+			}
+			withFakeHost(t, h)
+
+			if err := Apply(context.Background(), pkgIntent(`{"desired_state":"present","version":"1.24.0"}`, "nginx")); err != nil {
+				t.Fatalf("Apply: unexpected err: %v", err)
+			}
+			if n := h.versionQueryCount(); n != 1 {
+				t.Errorf("version queries = %d, want 1 (apply 之后必须核对实际版本)", n)
+			}
+		})
+	}
+}
+
+// 口径 C:主干不符 → ErrPersistent,且错误文案同时带上声明值与实际值。
+// 不许把"装错了版本"报成成功,也不许自动降级/回滚。
+func TestPackage_DeclaredVersionMismatchIsPersistent(t *testing.T) {
+	h := &fakeHost{
+		manager:   "apt",
+		installed: map[string]bool{},
+		versions:  map[string]string{"nginx": "1.22.1-9+deb12u10"},
+	}
+	withFakeHost(t, h)
+
+	err := Apply(context.Background(), pkgIntent(`{"desired_state":"present","version":"1.24.0"}`, "nginx"))
+	if !errors.Is(err, ErrPersistent) {
+		t.Fatalf("got %v, want ErrPersistent", err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "declared=1.24.0") {
+		t.Errorf("err = %q, want it to contain declared=1.24.0", msg)
+	}
+	if !strings.Contains(msg, "actual=1.22.1-9+deb12u10") {
+		t.Errorf("err = %q, want it to contain actual=1.22.1-9+deb12u10", msg)
+	}
+}
+
+// 未声明 version → 不校验:行为与历史完全一致,连版本查询都不发。
+func TestPackage_MissingVersionSkipsCheck(t *testing.T) {
+	h := &fakeHost{
+		manager:   "apt",
+		installed: map[string]bool{},
+		versions:  map[string]string{"nginx": "1.22.1-9+deb12u10"},
+	}
+	withFakeHost(t, h)
+
+	if err := Apply(context.Background(), pkgIntent(`{"desired_state":"present"}`, "nginx")); err != nil {
+		t.Fatalf("Apply: unexpected err: %v", err)
+	}
+	if n := h.versionQueryCount(); n != 0 {
+		t.Errorf("version queries = %d, want 0 (未声明版本不得校验)", n)
+	}
+}
+
+// desired_state=absent → 不校验版本(包本来就不该留在宿主上)。
+func TestPackage_AbsentSkipsVersionCheck(t *testing.T) {
+	h := &fakeHost{
+		manager:   "apt",
+		installed: map[string]bool{"nginx": true},
+		versions:  map[string]string{"nginx": "1.22.1-9+deb12u10"},
+	}
+	withFakeHost(t, h)
+
+	if err := Apply(context.Background(), pkgIntent(`{"desired_state":"absent","version":"1.24.0"}`, "nginx")); err != nil {
+		t.Fatalf("Apply: unexpected err: %v", err)
+	}
+	if n := h.versionQueryCount(); n != 0 {
+		t.Errorf("version queries = %d, want 0 (absent 不校验版本)", n)
+	}
+}
+
+// 版本查询本身失败(非"未安装")→ ErrPersistent,如实说查不到实际版本;
+// 既不许当成相符,也不许当成不符。
+func TestPackage_VersionQueryFailureIsPersistent(t *testing.T) {
+	h := &fakeHost{
+		manager:    "apt",
+		installed:  map[string]bool{},
+		versionOut: "dpkg-query: error: unable to read status info\n",
+		versionErr: errors.New("exit status 2"),
+	}
+	withFakeHost(t, h)
+
+	err := Apply(context.Background(), pkgIntent(`{"desired_state":"present","version":"1.24.0"}`, "nginx"))
+	if !errors.Is(err, ErrPersistent) {
+		t.Fatalf("got %v, want ErrPersistent", err)
+	}
+	if !strings.Contains(err.Error(), "version check") {
+		t.Errorf("err = %q, want it to say the version lookup failed", err.Error())
+	}
+}
+
+// 幂等:同一个不符的 intent 重复投递,必须给出同一个结论 ——
+// 第二次因为"已装"走 no-op,也不能把失败翻成成功。
+func TestPackage_VersionMismatchIsStableAcrossRetries(t *testing.T) {
+	h := &fakeHost{
+		manager:   "dnf",
+		installed: map[string]bool{},
+		versions:  map[string]string{"nginx": "1.20.1-1.el9"},
+	}
+	withFakeHost(t, h)
+
+	intent := pkgIntent(`{"desired_state":"present","version":"1.24.0"}`, "nginx")
+	for i := 0; i < 2; i++ {
+		err := Apply(context.Background(), intent)
+		if !errors.Is(err, ErrPersistent) {
+			t.Fatalf("Apply #%d: got %v, want ErrPersistent", i+1, err)
+		}
+		if !strings.Contains(err.Error(), "version mismatch") {
+			t.Errorf("Apply #%d: err = %q, want version mismatch", i+1, err.Error())
+		}
+	}
+}
+
+// 主干裁剪规则本身:去 epoch,再在第一个 '-' / '+' / '~' 处截断。
+// 这几条是口径 C 的比较基础,错了会让"同一上游版本"在别的发行版上误判。
+func TestVersionTrunk(t *testing.T) {
+	cases := []struct {
+		actual string
+		want   string
+	}{
+		{"1.24.0", "1.24.0"},
+		{"1.24.0-2ubuntu7.19", "1.24.0"},
+		{"1.22.1-9+deb12u10", "1.22.1"},
+		{"1:2.4.0-1.el9", "2.4.0"},
+		{"2.4.0~rc1-1", "2.4.0"},
+	}
+	for _, tc := range cases {
+		if got := versionTrunk(tc.actual); got != tc.want {
+			t.Errorf("versionTrunk(%q) = %q, want %q", tc.actual, got, tc.want)
 		}
 	}
 }
