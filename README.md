@@ -82,6 +82,56 @@ total cap (oldest deleted first). Objects referenced by a retained manifest are 
 only unreferenced objects inside retained sets are swept. GC failures are logged and never fail
 the intent.
 
+## Rollback (package / service)
+
+`package` and `service` intents have no file-level snapshot: the change is host state
+(package database, unit state), and a file copy cannot undo it. What the agent promises
+instead is a **rollback handle**: the manifest-side identifier of what it just did, returned in
+`ApplyIntentResponse.rollback_handle` and stored by the control plane.
+
+Handles are opaque to the control plane and defined by the agent:
+
+| Handle | Meaning |
+|---|---|
+| `dnf-history:<id>` | the dnf transaction this apply produced |
+| `apt-history:<id>` | the apt history entry this apply produced |
+| `service-state:<base64url JSON>` | the unit's `ActiveState` / `UnitFileState` / `SubState` **before** the apply |
+| *(empty)* | no anchor — e.g. the apply was a no-op, or the capture failed |
+
+Capture never changes the apply outcome. A successful apply with an empty handle is still
+`SUCCESS`, and the chain carries `apply_intent.rollback_handle_unavailable` so "this kind has no
+handle" and "the handle was not captured" stay distinguishable. For `RISK_CLASS_HIGH`
+`package`/`service` intents the agent re-judges the result after the apply: no handle →
+`REFUSED` (low risk is unaffected — whether to do it is a risk question, not a capability one).
+
+Rollback runs through `RollbackIntent` in two phases:
+
+1. **PLAN** returns the immutable plan (`steps`), a `plan_hash` and a single-use
+   `approve_token` (TTL 15 min). It executes **no** command — only read-only queries.
+2. **APPLY** takes `plan_hash` + `approve_token` + the same `steps`. The agent recomputes the
+   hash from the request (so a plan cannot be silently swapped), verifies the token, then runs
+   the steps. Changing a command means asking for a new PLAN.
+
+Auto vs human review:
+
+- `dnf history undo <id>` and, on apt ≥ 3.2, the native history undo are single-step plans with
+  `auto_ok` — the control plane may APPLY them unattended.
+- Older apt has no native undo: the plan degrades to `apt-get remove` plus a `MANUAL` checklist
+  item (conffiles, postinst side effects). Both are `human_review_required`; `MANUAL` steps are
+  never executed by the agent.
+- Service rollback restores the pre-apply unit state (`start`/`stop`, `enable`/`disable`); the
+  verb for a dimension that did not change is a no-op.
+
+`rm -rf` is **always** `human_review_required`, only allowed for paths the package owns, and
+only behind a valid token. APPLY is refused when the token is missing, expired, already used,
+bound to another plan or another intent, or when a step falls outside the command allowlist.
+The token proves "this APPLY is bound to that plan hash" — it does **not** prove a human read
+the plan; the control plane owns that. Tokens die with the process (re-plan after a restart);
+handles do not, because they describe the package manager's state, not the agent's.
+
+Every outcome lands in the same JSONL hash chain: `rollback.planned`, `rollback.applied`,
+`rollback.refused`, `rollback.failed`.
+
 ## Known gaps
 
 Open issues in this repository, so "has this been done yet?" is answerable by number:
