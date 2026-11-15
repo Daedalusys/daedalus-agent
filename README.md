@@ -1,6 +1,64 @@
 # daedalus-agent
 daedalus-agent: heterogeneous Linux endpoint for daedalus fleet control plane (P0.5 entry ticket; replaced by daedalus-atomic on migration per spec G7)
 
+## Release
+
+Releases are tag-driven. Pushing an annotated `v*` tag runs `.github/workflows/release.yml`,
+which tests, builds with goreleaser, gates the freshly built assets
+(`scripts/check-release-assets.sh`), publishes, and attests them. Three steps:
+
+```bash
+git tag -a v0.1.0 -m "daedalus-agent v0.1.0" && git push origin v0.1.0
+gh run list --repo Daedalusys/daedalus-agent --workflow release.yml --limit 1   # wait for success
+gh release view v0.1.0 --repo Daedalusys/daedalus-agent --json assets -q '.assets[].name'
+gh attestation verify daedalus-agent_0.1.0_linux_amd64.tar.gz --repo Daedalusys/daedalus-agent
+```
+
+Every release carries exactly three assets — `daedalus-agent_<version>_linux_amd64.tar.gz`,
+`daedalus-agent_<version>_linux_arm64.tar.gz`, `SHA256SUMS` — and each tarball contains
+`<pkg>/{bin/daedalus-agent,scripts/{install,postinstall,uninstall}.sh,LICENSE,README.md}`.
+`<version>` has no `v`; the tag does. A tag is not re-releasable: the workflow refuses to run
+when that release already exists (a rebuild would replace attested bytes), so cut a new version.
+
+Building a `dist/` tarball by hand (`go build` + `tar`) is **deprecated**. Such a binary reports
+`0.1.0-dev` with no `commit=`, so nothing downstream — human or script — can tell it apart from a
+dev build.
+
+## Install on a machine (from a release)
+
+The only supported install path is a release asset. Nothing is shipped to a host by hand.
+
+```bash
+gh release download v0.1.0 --repo Daedalusys/daedalus-agent -D /tmp/agent-rel \
+  --pattern 'daedalus-agent_0.1.0_linux_amd64.tar.gz' --pattern SHA256SUMS
+(cd /tmp/agent-rel && sha256sum -c --strict SHA256SUMS)
+tar -xzf /tmp/agent-rel/daedalus-agent_0.1.0_linux_amd64.tar.gz -C /tmp/agent-rel
+sudo bash /tmp/agent-rel/daedalus-agent_0.1.0_linux_amd64/scripts/install.sh \
+  /tmp/agent-rel/daedalus-agent_0.1.0_linux_amd64.tar.gz
+/opt/daedalus-agent/bin/daedalus-agent version   # → daedalus-agent 0.1.0 commit=<sha> built=<RFC3339>
+```
+
+**Pass the tarball path explicitly.** Called with no argument, `install.sh` falls back to a
+`${SCRIPT_DIR}/../dist/daedalus-agent-*.tar.gz` glob — **hyphen** — while release assets use
+**underscores** (`daedalus-agent_0.1.0_linux_amd64.tar.gz`). Under a release layout that fallback
+matches nothing and the install dies with `no tarball supplied and none found in
+dist/daedalus-agent-*.tar.gz`.
+
+No `gh` on the target machine? Same tarball, plain URL (this repo is public):
+
+```bash
+base=https://github.com/Daedalusys/daedalus-agent/releases/download/v0.1.0
+curl -fLO "$base/daedalus-agent_0.1.0_linux_amd64.tar.gz"
+curl -fLO "$base/SHA256SUMS"
+sha256sum -c --strict SHA256SUMS
+tar -xzf daedalus-agent_0.1.0_linux_amd64.tar.gz
+sudo bash daedalus-agent_0.1.0_linux_amd64/scripts/install.sh daedalus-agent_0.1.0_linux_amd64.tar.gz
+```
+
+Then assert the install: `/opt/daedalus-agent/bin/daedalus-agent version` must print
+`<version> commit=`, not `0.1.0-dev`. The fleet test driver does exactly this per host in
+`daedalus-core/tests/fleet/lib/agent-release.sh` (`assert_agent_version`).
+
 ## CI gates
 
 Three jobs **run** on every push / PR (`.github/workflows/ci.yml`):
