@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 
 	"github.com/Daedalusys/daedalus-sdk/pkgquery"
@@ -154,6 +155,37 @@ func (packageExecutor) Apply(ctx context.Context, intent *agentv1.ApplyIntentReq
 	default:
 		// 防御性兜底:parsePackageSpec 已拒过表外值,这里不可达。
 		return fmt.Errorf("%w: unknown desired_state %q", ErrPersistent, spec.DesiredState)
+	}
+
+	// 落点体检:低危包若会落到要害路径(/boot、内核模块、固件、init),
+	// 装之前就拒绝 —— 而不是等它把内核/固件装上去、失败再被自动重试。
+	//
+	// 生效条件(两条都必须满足):
+	//   - desired_state != absent:卸载不新增文件,查落点没有意义。
+	//   - intent 未被判 high:已判 high 的走控制面高危通道(有回滚点才放行),
+	//     这里再拒一次就与控制面准入冲突 —— atomic 节点上"有回滚点、人已
+	//     批过"的合法高危变更不能被二次拒绝。
+	if spec.DesiredState != stateAbsent && intent.RiskClass != agentv1.RiskClass_RISK_CLASS_HIGH {
+		lr, err := landingPaths(ctx, mgr, name, installed)
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return fmt.Errorf("exec: package.set %q landing check cancelled: %w", name, ctxErr)
+			}
+			// 判不出落点 → 拒绝(fail-closed):猜测比拒绝危险得多。
+			return fmt.Errorf("%w: refused: cannot determine landing paths for package %s (%v); refusing rather than guessing", ErrPersistent, name, err)
+		}
+		switch {
+		case lr.skipped != "":
+			// 工具缺失是**宿主环境**问题(dnf download 来自 dnf-plugins-core):
+			// 跳过体检并留痕,既不拒绝也不静默 —— 否则整个发行版都装不了包。
+			log.Printf("agent: exec: package.set %q 落点体检未执行: %s", name, lr.skipped)
+		case len(lr.paths) == 0:
+			return fmt.Errorf("%w: refused: cannot determine landing paths for package %s (empty file list); refusing rather than guessing", ErrPersistent, name)
+		default:
+			if hit, ok := criticalLandingHit(lr.paths); ok {
+				return fmt.Errorf("%w: refused: package %s lands on critical path %s (high-risk by landing points; control plane classified it low)", ErrPersistent, name, hit)
+			}
+		}
 	}
 
 	if verb != "" {
