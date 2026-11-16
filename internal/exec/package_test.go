@@ -3,6 +3,8 @@ package exec
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -27,7 +29,15 @@ type fakeHost struct {
 	historyOut string
 	historyErr error
 	// replies 按 "name arg1 arg2..." 命中,优先于上面的通用回包。
+	// 命中顺序:完整 argv 精确匹配 → "name arg1" 前缀匹配(用于工作目录
+	// 里带随机临时路径的命令,如 dpkg-deb -c /tmp/xxx/a.deb)→ 通用回包。
 	replies map[string]fakeReply
+	// dirCalls 记录经 runCmdInDir 发的命令(带工作目录):落点体检的下载
+	// 必须发生在临时目录里,断言就靠它。
+	dirCalls []dirCall
+	// lastDownloadPkg 是最近一次模拟下载的包名,供 dpkg-deb -c / rpm -qlp
+	// 的默认回包拼一份无害清单。
+	lastDownloadPkg string
 	// aptLog / aptLogErr 是 /var/log/apt/history.log 的内容(apt 句柄的唯一
 	// 锚点来源)。
 	aptLog    string
@@ -46,14 +56,48 @@ type fakeReply struct {
 	err error
 }
 
+// dirCall 是一条经 runCmdInDir 发出的命令。
+type dirCall struct {
+	dir  string
+	name string
+	args []string
+}
+
+// reply 按 argv 找一条回包:先精确命中完整 argv,再退到"命令名 + 首个参数"
+// (下载/装包命令的参数里可能带随机临时路径,测试无法预先拼出完整 argv)。
+func (h *fakeHost) reply(name string, args []string) (fakeReply, bool) {
+	if r, ok := h.replies[strings.TrimSpace(name+" "+strings.Join(args, " "))]; ok {
+		return r, true
+	}
+	if len(args) > 0 {
+		if r, ok := h.replies[name+" "+args[0]]; ok {
+			return r, true
+		}
+	}
+	return fakeReply{}, false
+}
+
 func (h *fakeHost) run(_ context.Context, name string, args ...string) (string, error) {
 	h.calls = append(h.calls, append([]string{name}, args...))
-	if r, ok := h.replies[strings.TrimSpace(name+" "+strings.Join(args, " "))]; ok {
+	if r, ok := h.reply(name, args); ok {
 		return r.out, r.err
 	}
 	last := ""
 	if len(args) > 0 {
 		last = args[len(args)-1]
+	}
+	// 落点体检的清单类查询:默认回一份无害清单(/usr/sbin/<name>),免得
+	// 每个既有用例都要写一条 replies。要害路径的判断由新用例用 replies 覆盖。
+	switch {
+	case name == "dpkg-query" && len(args) == 2 && args[0] == "-L":
+		return "./\n/usr/sbin/" + last + "\n", nil
+	case name == "rpm" && len(args) == 2 && args[0] == "-ql":
+		return "/usr/sbin/" + last + "\n", nil
+	case name == "dpkg-deb" && len(args) == 2 && args[0] == "-c":
+		return "drwxr-xr-x root/root 0 2024-01-01 00:00 ./\n" +
+			"-rwxr-xr-x root/root 0 2024-01-01 00:00 ./usr/sbin/" + h.downloadedPkg() + "\n", nil
+	case name == "rpm" && len(args) == 2 && args[0] == "-qlp":
+		return "/usr/sbin/" + h.downloadedPkg() + "\n", nil
 	}
 	// 版本查询(dpkg-query -f=${Version} / rpm --qf)与"是否已装"的查询
 	// 走不同的 argv,必须分开回包:否则实际版本会被回成状态串。
@@ -113,6 +157,15 @@ func (h *fakeHost) managerBin() string {
 	return "/usr/bin/dnf"
 }
 
+// downloadedPkg 返回最近一次模拟下载的包名;没发生过下载时给一个固定的
+// 无害名字(清单本身是不是要害由用例决定,这里只要不命中要害)。
+func (h *fakeHost) downloadedPkg() string {
+	if h.lastDownloadPkg != "" {
+		return h.lastDownloadPkg
+	}
+	return "placeholder"
+}
+
 // isVersionArgv 判定一次外部命令是不是"取实际版本"的查询。
 //
 // 形状与生产实现一一对应:apt 用 dpkg-query -W -f=${Version},
@@ -150,13 +203,35 @@ func (h *fakeHost) lastManagerCall() []string {
 	return nil
 }
 
-// withFakeHost 把 runCmd / fileExists / readFile 三个缝换成 h,并在测试结束
-// 时还原。不 t.Parallel:它们是包级变量。
+// withFakeHost 把 runCmd / runCmdInDir / fileExists / readFile 四个缝换成 h,
+// 并在测试结束时还原。不 t.Parallel:它们是包级变量。
 func withFakeHost(t *testing.T, h *fakeHost) {
 	t.Helper()
-	prevRun, prevExists, prevRead := runCmd, fileExists, readFile
-	t.Cleanup(func() { runCmd, fileExists, readFile = prevRun, prevExists, prevRead })
+	prevRun, prevRunInDir, prevExists, prevRead := runCmd, runCmdInDir, fileExists, readFile
+	t.Cleanup(func() { runCmd, runCmdInDir, fileExists, readFile = prevRun, prevRunInDir, prevExists, prevRead })
 	runCmd = h.run
+	runCmdInDir = func(ctx context.Context, dir, name string, args ...string) (string, error) {
+		h.dirCalls = append(h.dirCalls, dirCall{dir: dir, name: name, args: append([]string{}, args...)})
+		out, err := h.run(ctx, name, args...)
+		if err != nil {
+			return out, err
+		}
+		// 模拟宿主把包下载进工作目录:成功就放一个占位包文件,供后续
+		// dpkg-deb -c / rpm -qlp 列出内容。失败时不落文件 —— 那是
+		// "工具在,但这次查不到"的形状。
+		if len(args) > 0 && args[0] == "download" {
+			pkg := args[len(args)-1]
+			h.lastDownloadPkg = pkg
+			ext := ".deb"
+			if strings.HasSuffix(name, "dnf") {
+				ext = ".rpm"
+			}
+			if werr := os.WriteFile(filepath.Join(dir, pkg+ext), []byte("fake-package"), 0o644); werr != nil {
+				return "", werr
+			}
+		}
+		return out, nil
+	}
 	fileExists = func(p string) bool { return p == h.managerBin() }
 	readFile = func(string) ([]byte, error) {
 		if h.aptLogErr != nil {

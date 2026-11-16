@@ -221,6 +221,30 @@ func runCmdProduction(ctx context.Context, name string, args ...string) (string,
 	return buf.String(), err
 }
 
+// cmdRunnerInDir 是"在指定工作目录里跑命令"的注入缝。与 cmdRunner 同形,
+// 只多一个工作目录参数。
+type cmdRunnerInDir func(ctx context.Context, dir, name string, args ...string) (string, error)
+
+// runCmdInDir 是 production 实现:与 runCmd 同形(合并 stdout+stderr、固定
+// LC_ALL=C、exec.CommandContext 尊重 ctx 取消),只是把工作目录钉在 dir 上。
+//
+// 为什么要单开一条缝:apt-get download 会把包文件下载到**当前工作目录**,
+// 落点体检必须把它关进临时目录里 —— 不然包文件会掉在 agent 的工作目录上。
+// 复用 runCmd 就没法指定这个目录。
+var runCmdInDir cmdRunnerInDir = runCmdInDirProduction
+
+// runCmdInDirProduction 在 dir 下起一条真实命令并合并输出。
+func runCmdInDirProduction(ctx context.Context, dir, name string, args ...string) (string, error) {
+	c := exec.CommandContext(ctx, name, args...)
+	c.Dir = dir
+	c.Env = forceCLocale(os.Environ())
+	var buf bytes.Buffer
+	c.Stdout = &buf
+	c.Stderr = &buf
+	err := c.Run()
+	return buf.String(), err
+}
+
 // forceCLocale 把 LC_ALL=C 放进环境,并删掉继承来的 LC_ALL。
 //
 // 为什么删而不是直接 append:execve 允许重复项,而 getenv 返回**第一个**
