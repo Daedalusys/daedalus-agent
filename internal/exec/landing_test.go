@@ -238,6 +238,44 @@ func TestRunCmdInDirProduction_RunsInDir(t *testing.T) {
 	}
 }
 
+// dpkg-deb -c 的符号链接行形如 "<路径> -> <目标>":最后一列是**目标**,不是落点。
+// 取最后一列会同时犯两种错 —— 漏判(./boot/x -> ../usr/lib/x 把链接自己的位置丢了)
+// 与误判(./usr/bin/foo -> /boot/vmlinuz 把目标当成落点)。链接自己的位置才是落点。
+func TestNormalizeDebContents_SymlinkUsesOwnPath(t *testing.T) {
+	out := strings.Join([]string{
+		"drwxr-xr-x root/root 0 2024-01-01 00:00 ./",
+		"lrwxrwxrwx root/root 0 2024-01-01 00:00 ./boot/grub2 -> ../usr/lib/grub2",
+		"lrwxrwxrwx root/root 0 2024-01-01 00:00 ./usr/bin/foo -> /boot/vmlinuz",
+		"-rw-r--r-- root/root 12 2024-01-01 00:00 ./usr/share/doc/foo/README",
+	}, "\n")
+
+	got := normalizeDebContents(out)
+	joined := strings.Join(got, "|")
+	for _, want := range []string{"/boot/grub2", "/usr/bin/foo", "/usr/share/doc/foo/README"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("paths = %v, want 含 %s", got, want)
+		}
+	}
+	for _, unwanted := range []string{"../usr/lib/grub2", "/boot/vmlinuz"} {
+		if strings.Contains(joined, unwanted) {
+			t.Errorf("paths = %v, want 不含 %s(那不是落点)", got, unwanted)
+		}
+	}
+	if hit, ok := criticalLandingHit(got); !ok || hit != "/boot/grub2" {
+		t.Errorf("criticalLandingHit = (%q,%v), want (/boot/grub2,true)", hit, ok)
+	}
+}
+
+// dpkg-deb -c 的路径列可能含空格(包可以装带空格的文件名)。取列必须从第 6 列
+// 拼到底,不能只取某一列。
+func TestNormalizeDebContents_PathWithSpace(t *testing.T) {
+	out := "-rw-r--r-- root/root 12 2024-01-01 00:00 ./usr/share/doc/my pkg/README\n"
+	got := normalizeDebContents(out)
+	if len(got) != 1 || got[0] != "/usr/share/doc/my pkg/README" {
+		t.Fatalf("paths = %v, want [/usr/share/doc/my pkg/README]", got)
+	}
+}
+
 // 要害路径判定:命中 /boot、内核模块、固件、init;普通 unit 文件与
 // 普通路径**不**命中(误报会把常规安装全灭)。
 func TestCriticalLandingHit(t *testing.T) {

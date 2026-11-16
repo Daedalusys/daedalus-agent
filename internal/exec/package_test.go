@@ -668,6 +668,32 @@ func TestPackage_LowRiskCriticalLandingRefused(t *testing.T) {
 	}
 }
 
+// 已装 + present = 已到位(no-op):不做落点体检、也不发变更命令。
+//
+// Apply 的既有不变式是"已到位即 no-op"。落点体检拦的是**会往磁盘放文件**的
+// 变更(install / upgrade);no-op 什么都没放,把它判成失败等于打掉幂等语义:
+// 声明式收敛("这 200 台都要有 X")在 X 已装的机器上会集体报 persistent_failure,
+// 整批 dirty —— 而这批机器其实一台都不需要动。
+func TestPackage_PresentAlreadyInstalledSkipsLandingCheck(t *testing.T) {
+	h := &fakeHost{manager: "apt", installed: map[string]bool{"grub2-efi-x64": true}}
+	h.replies = map[string]fakeReply{
+		"dpkg-query -L grub2-efi-x64": {out: "/boot/efi/EFI/redhat/grubx64.efi\n"},
+	}
+	withFakeHost(t, h)
+
+	if err := Apply(context.Background(), pkgIntent(`{"desired_state":"present"}`, "grub2-efi-x64")); err != nil {
+		t.Fatalf("已到位不该报错: %v", err)
+	}
+	for _, c := range h.calls {
+		if len(c) > 1 && (c[1] == "-L" || c[1] == "-ql" || c[1] == "download") {
+			t.Errorf("no-op 不该查落点: %v", c)
+		}
+		if mutatingCall(c) {
+			t.Errorf("no-op 不该发变更命令: %v", c)
+		}
+	}
+}
+
 // 已判 high 的 intent → 不做落点体检(直接装)。
 //
 // 理由:atomic 节点上"有回滚点、人已批过"的高危变更是合法的;在这里二次

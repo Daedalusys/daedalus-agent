@@ -184,25 +184,40 @@ func normalizePathList(out string) []string {
 
 // normalizeDebContents 解析 dpkg-deb -c 的输出。
 //
-// 每行形如 "drwxr-xr-x root/root 0 2024-01-01 00:00 ./usr/sbin/" —— 路径在
-// **最后一列**,且带前导 "./"。取最后一列并把 "./" 换成 "/"。
+// 普通行形如 "drwxr-xr-x root/root 0 2024-01-01 00:00 ./usr/sbin/" —— 路径从
+// **第 6 列**开始(按空格拼到底,文件名可以带空格),且带前导 "./"。
+// 符号链接行多一段 "-> <目标>":目标是别人家的位置,不是本包的落点,必须切掉。
 func normalizeDebContents(out string) []string {
 	var raw []string
 	for _, line := range strings.Split(out, "\n") {
-		fields := strings.Fields(line)
-		if len(fields) == 0 {
-			continue
-		}
-		p := fields[len(fields)-1]
-		if strings.HasPrefix(p, "./") {
-			p = "/" + strings.TrimPrefix(p, "./")
-		}
-		if !strings.HasPrefix(p, "/") {
+		p, ok := debEntryPath(line)
+		if !ok {
 			continue
 		}
 		raw = append(raw, p)
 	}
 	return normalizePathList(strings.Join(raw, "\n"))
+}
+
+// debEntryPath 从一行 dpkg-deb -c 里取出该条目的落点路径。
+//
+// 两种行都要能吃:普通文件/目录(最后一列就是路径)与符号链接(最后一个
+// 路径样式的列是目标)。分不清的目标宁可切掉 —— 把链接目标当落点会误拒,
+// 把链接自己的位置丢掉会漏判。
+func debEntryPath(line string) (string, bool) {
+	if i := strings.LastIndex(line, " -> "); i >= 0 {
+		line = line[:i]
+	}
+	fields := strings.Fields(line)
+	// 前五列是权限、属主、大小、日期、时间。
+	if len(fields) < 6 {
+		return "", false
+	}
+	p := strings.Join(fields[5:], " ")
+	if !strings.HasPrefix(p, "./") {
+		return "", false
+	}
+	return "/" + strings.TrimPrefix(p, "./"), true
 }
 
 // criticalLandingPrefixes / criticalLandingExact 是要害路径集(包级常量,

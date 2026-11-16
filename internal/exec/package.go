@@ -160,12 +160,15 @@ func (packageExecutor) Apply(ctx context.Context, intent *agentv1.ApplyIntentReq
 	// 落点体检:低危包若会落到要害路径(/boot、内核模块、固件、init),
 	// 装之前就拒绝 —— 而不是等它把内核/固件装上去、失败再被自动重试。
 	//
-	// 生效条件(两条都必须满足):
-	//   - desired_state != absent:卸载不新增文件,查落点没有意义。
+	// 生效条件(三条都必须满足):
+	//   - 这次真会往磁盘放文件(install / upgrade)。已到位(present + 已装 →
+	//     verb 为空)是 no-op:什么都没放,判成失败会打掉"已到位即 no-op"的
+	//     幂等语义;remove 只删不加,同理不查。
+	//   - desired_state != absent:与上一条同向,显式写出来免得改 verb 时漏掉。
 	//   - intent 未被判 high:已判 high 的走控制面高危通道(有回滚点才放行),
 	//     这里再拒一次就与控制面准入冲突 —— atomic 节点上"有回滚点、人已
 	//     批过"的合法高危变更不能被二次拒绝。
-	if spec.DesiredState != stateAbsent && intent.RiskClass != agentv1.RiskClass_RISK_CLASS_HIGH {
+	if verb != "" && spec.DesiredState != stateAbsent && intent.RiskClass != agentv1.RiskClass_RISK_CLASS_HIGH {
 		lr, err := landingPaths(ctx, mgr, name, installed)
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
