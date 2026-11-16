@@ -3,6 +3,8 @@ package exec
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -27,7 +29,15 @@ type fakeHost struct {
 	historyOut string
 	historyErr error
 	// replies 按 "name arg1 arg2..." 命中,优先于上面的通用回包。
+	// 命中顺序:完整 argv 精确匹配 → "name arg1" 前缀匹配(用于工作目录
+	// 里带随机临时路径的命令,如 dpkg-deb -c /tmp/xxx/a.deb)→ 通用回包。
 	replies map[string]fakeReply
+	// dirCalls 记录经 runCmdInDir 发的命令(带工作目录):落点体检的下载
+	// 必须发生在临时目录里,断言就靠它。
+	dirCalls []dirCall
+	// lastDownloadPkg 是最近一次模拟下载的包名,供 dpkg-deb -c / rpm -qlp
+	// 的默认回包拼一份无害清单。
+	lastDownloadPkg string
 	// aptLog / aptLogErr 是 /var/log/apt/history.log 的内容(apt 句柄的唯一
 	// 锚点来源)。
 	aptLog    string
@@ -46,14 +56,48 @@ type fakeReply struct {
 	err error
 }
 
+// dirCall 是一条经 runCmdInDir 发出的命令。
+type dirCall struct {
+	dir  string
+	name string
+	args []string
+}
+
+// reply 按 argv 找一条回包:先精确命中完整 argv,再退到"命令名 + 首个参数"
+// (下载/装包命令的参数里可能带随机临时路径,测试无法预先拼出完整 argv)。
+func (h *fakeHost) reply(name string, args []string) (fakeReply, bool) {
+	if r, ok := h.replies[strings.TrimSpace(name+" "+strings.Join(args, " "))]; ok {
+		return r, true
+	}
+	if len(args) > 0 {
+		if r, ok := h.replies[name+" "+args[0]]; ok {
+			return r, true
+		}
+	}
+	return fakeReply{}, false
+}
+
 func (h *fakeHost) run(_ context.Context, name string, args ...string) (string, error) {
 	h.calls = append(h.calls, append([]string{name}, args...))
-	if r, ok := h.replies[strings.TrimSpace(name+" "+strings.Join(args, " "))]; ok {
+	if r, ok := h.reply(name, args); ok {
 		return r.out, r.err
 	}
 	last := ""
 	if len(args) > 0 {
 		last = args[len(args)-1]
+	}
+	// 落点体检的清单类查询:默认回一份无害清单(/usr/sbin/<name>),免得
+	// 每个既有用例都要写一条 replies。要害路径的判断由新用例用 replies 覆盖。
+	switch {
+	case name == "dpkg-query" && len(args) == 2 && args[0] == "-L":
+		return "./\n/usr/sbin/" + last + "\n", nil
+	case name == "rpm" && len(args) == 2 && args[0] == "-ql":
+		return "/usr/sbin/" + last + "\n", nil
+	case name == "dpkg-deb" && len(args) == 2 && args[0] == "-c":
+		return "drwxr-xr-x root/root 0 2024-01-01 00:00 ./\n" +
+			"-rwxr-xr-x root/root 0 2024-01-01 00:00 ./usr/sbin/" + h.downloadedPkg() + "\n", nil
+	case name == "rpm" && len(args) == 2 && args[0] == "-qlp":
+		return "/usr/sbin/" + h.downloadedPkg() + "\n", nil
 	}
 	// 版本查询(dpkg-query -f=${Version} / rpm --qf)与"是否已装"的查询
 	// 走不同的 argv,必须分开回包:否则实际版本会被回成状态串。
@@ -84,15 +128,21 @@ func (h *fakeHost) run(_ context.Context, name string, args ...string) (string, 
 		// 历史查询(dnf history --json 及其文本回退):只读,不改状态。
 		return h.historyOut, h.historyErr
 	case "/usr/bin/apt-get", "/usr/bin/dnf":
-		if h.verbErr != nil {
-			return h.verbOut, h.verbErr
-		}
 		verb := ""
 		for _, a := range args {
 			if !strings.HasPrefix(a, "-") {
 				verb = a
 				break
 			}
+		}
+		// verbOut / verbErr 描述的是**变更**动词的失败(装/升/卸)。download
+		// 是落点体检自己的只读动作,不该被"安装失败"的注入连坐 —— 否则
+		// 既有用例测的就不再是变更失败,而是落点体检失败。
+		if verb == "download" {
+			return "", nil
+		}
+		if h.verbErr != nil {
+			return h.verbOut, h.verbErr
 		}
 		switch verb {
 		case "install", "upgrade":
@@ -111,6 +161,15 @@ func (h *fakeHost) managerBin() string {
 		return "/usr/bin/apt-get"
 	}
 	return "/usr/bin/dnf"
+}
+
+// downloadedPkg 返回最近一次模拟下载的包名;没发生过下载时给一个固定的
+// 无害名字(清单本身是不是要害由用例决定,这里只要不命中要害)。
+func (h *fakeHost) downloadedPkg() string {
+	if h.lastDownloadPkg != "" {
+		return h.lastDownloadPkg
+	}
+	return "placeholder"
 }
 
 // isVersionArgv 判定一次外部命令是不是"取实际版本"的查询。
@@ -150,13 +209,35 @@ func (h *fakeHost) lastManagerCall() []string {
 	return nil
 }
 
-// withFakeHost 把 runCmd / fileExists / readFile 三个缝换成 h,并在测试结束
-// 时还原。不 t.Parallel:它们是包级变量。
+// withFakeHost 把 runCmd / runCmdInDir / fileExists / readFile 四个缝换成 h,
+// 并在测试结束时还原。不 t.Parallel:它们是包级变量。
 func withFakeHost(t *testing.T, h *fakeHost) {
 	t.Helper()
-	prevRun, prevExists, prevRead := runCmd, fileExists, readFile
-	t.Cleanup(func() { runCmd, fileExists, readFile = prevRun, prevExists, prevRead })
+	prevRun, prevRunInDir, prevExists, prevRead := runCmd, runCmdInDir, fileExists, readFile
+	t.Cleanup(func() { runCmd, runCmdInDir, fileExists, readFile = prevRun, prevRunInDir, prevExists, prevRead })
 	runCmd = h.run
+	runCmdInDir = func(ctx context.Context, dir, name string, args ...string) (string, error) {
+		h.dirCalls = append(h.dirCalls, dirCall{dir: dir, name: name, args: append([]string{}, args...)})
+		out, err := h.run(ctx, name, args...)
+		if err != nil {
+			return out, err
+		}
+		// 模拟宿主把包下载进工作目录:成功就放一个占位包文件,供后续
+		// dpkg-deb -c / rpm -qlp 列出内容。失败时不落文件 —— 那是
+		// "工具在,但这次查不到"的形状。
+		if len(args) > 0 && args[0] == "download" {
+			pkg := args[len(args)-1]
+			h.lastDownloadPkg = pkg
+			ext := ".deb"
+			if strings.HasSuffix(name, "dnf") {
+				ext = ".rpm"
+			}
+			if werr := os.WriteFile(filepath.Join(dir, pkg+ext), []byte("fake-package"), 0o644); werr != nil {
+				return "", werr
+			}
+		}
+		return out, nil
+	}
 	fileExists = func(p string) bool { return p == h.managerBin() }
 	readFile = func(string) ([]byte, error) {
 		if h.aptLogErr != nil {
@@ -166,8 +247,17 @@ func withFakeHost(t *testing.T, h *fakeHost) {
 	}
 }
 
+// pkgIntent 造一条 package intent。RiskClass 显式给 LOW:落点体检只对
+// **未被判 high** 的 intent 生效,不给就是 UNSPECIFIED —— 语义含混,而
+// 且会让"高危跳过体检"的用例失去对照。
 func pkgIntent(spec, name string) *agentv1.ApplyIntentRequest {
-	return &agentv1.ApplyIntentRequest{IntentId: "i-1", Kind: kindPackage, Target: name, SpecJson: spec}
+	return &agentv1.ApplyIntentRequest{
+		IntentId:  "i-1",
+		Kind:      kindPackage,
+		Target:    name,
+		SpecJson:  spec,
+		RiskClass: agentv1.RiskClass_RISK_CLASS_LOW,
+	}
 }
 
 // 装了就要调宿主的包管理器;argv 必须是该管理器的原生装包形态。
@@ -288,14 +378,16 @@ func TestPackage_IsIdempotent(t *testing.T) {
 		t.Fatalf("second Apply: unexpected err: %v", err)
 	}
 
-	var installs int
+	// 只数**变更**调用:落点体检的 download 不算变更,第二次 apply 也不该再下载
+	// (已装 → 本地清单)。
+	var changes int
 	for _, c := range h.calls {
-		if c[0] == "/usr/bin/apt-get" {
-			installs++
+		if c[0] == "/usr/bin/apt-get" && mutatingCall(c) {
+			changes++
 		}
 	}
-	if installs != 1 {
-		t.Errorf("apt-get invocations = %d, want 1 (second apply must be a no-op)", installs)
+	if changes != 1 {
+		t.Errorf("apt-get 变更调用 = %d, want 1 (second apply must be a no-op)", changes)
 	}
 }
 
@@ -528,5 +620,195 @@ func TestVersionTrunk(t *testing.T) {
 		if got := versionTrunk(tc.actual); got != tc.want {
 			t.Errorf("versionTrunk(%q) = %q, want %q", tc.actual, got, tc.want)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 落点体检(高危判定的权威兜底):低危包若会落到要害路径,装之前就拒绝。
+// ---------------------------------------------------------------------------
+
+// mutatingCall 报告一条命令是不是包管理器的**变更**动词。
+//
+// 不能用"调用过包管理器"来断言:落点体检自己也要调它(download),那不是变更。
+func mutatingCall(c []string) bool {
+	for _, a := range c[1:] {
+		switch a {
+		case "install", "upgrade", "remove":
+			return true
+		}
+	}
+	return false
+}
+
+// 低危包落到 /boot → 拒绝(ErrPersistent),且**不许**发出任何变更命令。
+//
+// 拒绝必须是不可重试的:高危变更失败后自动重试,正是这套兜底要防的事。
+func TestPackage_LowRiskCriticalLandingRefused(t *testing.T) {
+	h := &fakeHost{manager: "apt", installed: map[string]bool{"grub2-efi-x64": true}}
+	h.replies = map[string]fakeReply{
+		"dpkg-query -L grub2-efi-x64": {out: "/boot/efi/EFI/redhat/grubx64.efi\n/usr/sbin/grub2-mkimage\n"},
+	}
+	withFakeHost(t, h)
+
+	err := Apply(context.Background(), pkgIntent(`{"desired_state":"latest"}`, "grub2-efi-x64"))
+	if !errors.Is(err, ErrPersistent) {
+		t.Fatalf("got %v, want ErrPersistent", err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "critical path") {
+		t.Errorf("err = %q, want 它点名 critical path", msg)
+	}
+	if !strings.Contains(msg, "/boot/efi/EFI/redhat/grubx64.efi") {
+		t.Errorf("err = %q, want 它点名命中的路径", msg)
+	}
+	for _, c := range h.calls {
+		if mutatingCall(c) {
+			t.Errorf("变更命令 %v 不该发生(高危包必须装不下去)", c)
+		}
+	}
+}
+
+// 已装 + present = 已到位(no-op):不做落点体检、也不发变更命令。
+//
+// Apply 的既有不变式是"已到位即 no-op"。落点体检拦的是**会往磁盘放文件**的
+// 变更(install / upgrade);no-op 什么都没放,把它判成失败等于打掉幂等语义:
+// 声明式收敛("这 200 台都要有 X")在 X 已装的机器上会集体报 persistent_failure,
+// 整批 dirty —— 而这批机器其实一台都不需要动。
+func TestPackage_PresentAlreadyInstalledSkipsLandingCheck(t *testing.T) {
+	h := &fakeHost{manager: "apt", installed: map[string]bool{"grub2-efi-x64": true}}
+	h.replies = map[string]fakeReply{
+		"dpkg-query -L grub2-efi-x64": {out: "/boot/efi/EFI/redhat/grubx64.efi\n"},
+	}
+	withFakeHost(t, h)
+
+	if err := Apply(context.Background(), pkgIntent(`{"desired_state":"present"}`, "grub2-efi-x64")); err != nil {
+		t.Fatalf("已到位不该报错: %v", err)
+	}
+	for _, c := range h.calls {
+		if len(c) > 1 && (c[1] == "-L" || c[1] == "-ql" || c[1] == "download") {
+			t.Errorf("no-op 不该查落点: %v", c)
+		}
+		if mutatingCall(c) {
+			t.Errorf("no-op 不该发变更命令: %v", c)
+		}
+	}
+}
+
+// 已判 high 的 intent → 不做落点体检(直接装)。
+//
+// 理由:atomic 节点上"有回滚点、人已批过"的高危变更是合法的;在这里二次
+// 拒绝就与控制面准入冲突了。
+func TestPackage_HighRiskSkipsLandingCheck(t *testing.T) {
+	h := &fakeHost{manager: "apt", installed: map[string]bool{}}
+	withFakeHost(t, h)
+
+	intent := pkgIntent(`{"desired_state":"present"}`, "grub2-efi-x64")
+	intent.RiskClass = agentv1.RiskClass_RISK_CLASS_HIGH
+	if err := Apply(context.Background(), intent); err != nil {
+		t.Fatalf("Apply: unexpected err: %v", err)
+	}
+	for _, c := range h.calls {
+		if len(c) > 1 && (c[1] == "download" || c[1] == "-L" || c[1] == "-ql") {
+			t.Errorf("高危 intent 不该查落点: %v", c)
+		}
+	}
+	if len(h.dirCalls) != 0 {
+		t.Errorf("高危 intent 不该下载: %+v", h.dirCalls)
+	}
+	if got := h.lastManagerCall(); strings.Join(got, " ") != "/usr/bin/apt-get install -y grub2-efi-x64" {
+		t.Errorf("argv = %v, want 正常安装", got)
+	}
+}
+
+// 工具在、但这次查不到落点 → 拒绝(fail-closed):判不出 ≠ 安全。
+func TestPackage_UnknownLandingRefused(t *testing.T) {
+	h := &fakeHost{manager: "apt", installed: map[string]bool{}}
+	h.replies = map[string]fakeReply{
+		"/usr/bin/apt-get download": {out: "E: Unable to locate package grub2-efi-x64\n", err: errors.New("exit status 100")},
+	}
+	withFakeHost(t, h)
+
+	err := Apply(context.Background(), pkgIntent(`{"desired_state":"present"}`, "grub2-efi-x64"))
+	if !errors.Is(err, ErrPersistent) {
+		t.Fatalf("got %v, want ErrPersistent", err)
+	}
+	if !strings.Contains(err.Error(), "cannot determine landing paths") {
+		t.Errorf("err = %q, want 它说清是判不出落点", err.Error())
+	}
+	for _, c := range h.calls {
+		if mutatingCall(c) {
+			t.Errorf("变更命令 %v 不该发生(判不出落点就不许装)", c)
+		}
+	}
+}
+
+// 工具缺失(dnf download 没装)→ **不拒绝**:跳过体检,继续装。
+//
+// 这是宿主环境问题,不是这次变更的问题;混为一谈会得到"要么整个发行版
+// 不能装包,要么危险包照装"。
+func TestPackage_ToolMissingProceeds(t *testing.T) {
+	h := &fakeHost{manager: "dnf", installed: map[string]bool{}}
+	h.replies = map[string]fakeReply{
+		"/usr/bin/dnf download": {out: "Error: No such command: download\n", err: errors.New("exit status 1")},
+	}
+	withFakeHost(t, h)
+
+	if err := Apply(context.Background(), pkgIntent(`{"desired_state":"present"}`, "nginx")); err != nil {
+		t.Fatalf("工具缺失不该拒绝: %v", err)
+	}
+	if got := h.lastManagerCall(); strings.Join(got, " ") != "/usr/bin/dnf install -y nginx" {
+		t.Errorf("argv = %v, want 正常安装", got)
+	}
+}
+
+// desired_state=absent → 不查落点:卸载不新增文件,查落点没有意义。
+func TestPackage_AbsentSkipsLandingCheck(t *testing.T) {
+	h := &fakeHost{manager: "dnf", installed: map[string]bool{"nginx": true}}
+	withFakeHost(t, h)
+
+	if err := Apply(context.Background(), pkgIntent(`{"desired_state":"absent"}`, "nginx")); err != nil {
+		t.Fatalf("Apply: unexpected err: %v", err)
+	}
+	for _, c := range h.calls {
+		if len(c) > 1 && (c[1] == "download" || c[1] == "-L" || c[1] == "-ql") {
+			t.Errorf("absent 不该查落点: %v", c)
+		}
+	}
+	if got := h.lastManagerCall(); strings.Join(got, " ") != "/usr/bin/dnf remove -y nginx" {
+		t.Errorf("argv = %v, want 卸载", got)
+	}
+}
+
+// 升级路径(已装 + latest)→ 只走本地清单,**绝不联网**。
+//
+// 升级时仓库不可达是常事;若走去下载,合法的升级会被判成"判不出落点"
+// 而拒绝。
+func TestPackage_UpgradeUsesLocalListOnly(t *testing.T) {
+	h := &fakeHost{manager: "dnf", installed: map[string]bool{"nginx": true}}
+	h.replies = map[string]fakeReply{
+		"rpm -ql nginx": {out: "/usr/sbin/nginx\n"},
+	}
+	withFakeHost(t, h)
+
+	if err := Apply(context.Background(), pkgIntent(`{"desired_state":"latest"}`, "nginx")); err != nil {
+		t.Fatalf("Apply: unexpected err: %v", err)
+	}
+	var sawQl bool
+	for _, c := range h.calls {
+		if c[0] == "rpm" && len(c) > 1 && c[1] == "-ql" {
+			sawQl = true
+		}
+		if len(c) > 1 && c[1] == "download" {
+			t.Errorf("已装包不许走网络: %v", c)
+		}
+	}
+	if !sawQl {
+		t.Errorf("没有查本地清单(rpm -ql)")
+	}
+	if len(h.dirCalls) != 0 {
+		t.Errorf("已装包不该下载: %+v", h.dirCalls)
+	}
+	if got := h.lastManagerCall(); strings.Join(got, " ") != "/usr/bin/dnf upgrade -y nginx" {
+		t.Errorf("argv = %v, want 升级", got)
 	}
 }
