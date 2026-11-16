@@ -237,3 +237,62 @@ func TestRunCmdInDirProduction_RunsInDir(t *testing.T) {
 		t.Errorf("pwd = %q, want %q", got, want)
 	}
 }
+
+// 要害路径判定:命中 /boot、内核模块、固件、init;普通 unit 文件与
+// 普通路径**不**命中(误报会把常规安装全灭)。
+func TestCriticalLandingHit(t *testing.T) {
+	cases := []struct {
+		name, path string
+		want       bool
+	}{
+		{"内核", "/boot/vmlinuz-6.8.0-49-generic", true},
+		{"引导器", "/boot/efi/EFI/redhat/grubx64.efi", true},
+		{"/boot 本身", "/boot", true},
+		{"内核模块", "/usr/lib/modules/6.8.0-49-generic/kernel/fs/ext4/ext4.ko", true},
+		{"内核模块(lib)", "/lib/modules/6.8.0-49-generic/vmlinuz", true},
+		{"固件", "/usr/lib/firmware/iwlwifi-9000-pu-b0-jf-b0-46.ucode", true},
+		{"init", "/usr/lib/systemd/systemd", true},
+		{"init(lib)", "/lib/systemd/systemd", true},
+		// 负例:路径分量边界与误报
+		{"边界-bootleg", "/bootleg/x", false},
+		{"边界-modulesX", "/lib/modulesX/foo", false},
+		{"边界-firmwareX", "/usr/lib/firmwareX/foo", false},
+		{"普通 unit", "/usr/lib/systemd/system/nginx.service", false},
+		{"普通路径", "/usr/sbin/nginx", false},
+		{"init 的邻居", "/usr/lib/systemd/systemd-journald", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			hit, ok := criticalLandingHit([]string{tc.path})
+			if ok != tc.want {
+				t.Fatalf("criticalLandingHit(%q) = (%q, %v), want ok=%v", tc.path, hit, ok, tc.want)
+			}
+			if ok && hit != tc.path {
+				t.Errorf("hit = %q, want %q", hit, tc.path)
+			}
+		})
+	}
+}
+
+// 多个路径时返回**第一个**命中的(文案与审计要用它)。
+func TestCriticalLandingHit_ReturnsFirstHit(t *testing.T) {
+	hit, ok := criticalLandingHit([]string{
+		"/usr/sbin/nginx",
+		"/etc/nginx/nginx.conf",
+		"/boot/vmlinuz-6.8.0-49-generic",
+		"/lib/modules/6.8.0-49-generic/vmlinuz",
+	})
+	if !ok {
+		t.Fatalf("criticalLandingHit: 应当命中")
+	}
+	if hit != "/boot/vmlinuz-6.8.0-49-generic" {
+		t.Errorf("hit = %q, want %q", hit, "/boot/vmlinuz-6.8.0-49-generic")
+	}
+}
+
+// 空清单不命中(不是"命中",也不是错误)。
+func TestCriticalLandingHit_EmptyIsNoHit(t *testing.T) {
+	if hit, ok := criticalLandingHit(nil); ok {
+		t.Errorf("hit = %q, ok = true, want 不命中", hit)
+	}
+}

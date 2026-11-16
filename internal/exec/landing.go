@@ -205,6 +205,48 @@ func normalizeDebContents(out string) []string {
 	return normalizePathList(strings.Join(raw, "\n"))
 }
 
+// criticalLandingPrefixes / criticalLandingExact 是要害路径集(包级常量,
+// 不进 policy.toml:agent 侧根本不读 policy.toml,而那一节的
+// high_risk_path_prefixes 是 file.set 的**目标路径**,与包的落点不是一回事)。
+//
+// 集合刻意窄:多收一条就会把常规安装全灭(典型反例:/usr/lib/systemd/system
+// 里全是普通 unit 文件,收进来 nginx 这类包会被判高危)。
+var (
+	// 前缀项按**路径分量**匹配:/boot 命中 /boot/vmlinuz,不命中 /bootleg/x。
+	criticalLandingPrefixes = []string{
+		"/boot",             // 内核与引导器
+		"/lib/modules",      // 内核模块
+		"/usr/lib/modules",  // 内核模块(Debian/Ubuntu 布局)
+		"/usr/lib/firmware", // 固件
+	}
+	// 精确项只认路径本身。
+	criticalLandingExact = []string{
+		"/lib/systemd/systemd",     // init
+		"/usr/lib/systemd/systemd", // init(Debian/Ubuntu 布局)
+	}
+)
+
+// criticalLandingHit 判定落点清单里有没有要害路径,返回**第一个**命中的
+// 路径(用于拒绝文案与审计)与是否命中。
+//
+// 匹配按路径分量,不是 strings.HasPrefix:/boot 是目录,不是 /bootleg 的
+// 前缀。包里的普通数据文件(sysctl 片段、unit 文件、可执行文件)一律放行。
+func criticalLandingHit(paths []string) (string, bool) {
+	for _, p := range paths {
+		for _, exact := range criticalLandingExact {
+			if p == exact {
+				return p, true
+			}
+		}
+		for _, prefix := range criticalLandingPrefixes {
+			if p == prefix || strings.HasPrefix(p, prefix+"/") {
+				return p, true
+			}
+		}
+	}
+	return "", false
+}
+
 // isToolMissing 报告命令输出是不是"这台机器上根本没有这个子命令"。
 //
 // 这类失败是**宿主环境**问题(dnf download 来自 dnf-plugins-core),与
