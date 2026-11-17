@@ -24,6 +24,12 @@ Building a `dist/` tarball by hand (`go build` + `tar`) is **deprecated**. Such 
 `0.1.0-dev` with no `commit=`, so nothing downstream — human or script — can tell it apart from a
 dev build.
 
+**Build dependency pinning.** The SDK version lives in `go.mod`'s `require`. `scripts/sdk-pin.sh`
+derives the checkout ref from it and **fails closed** on a placeholder/missing version — both
+`release.yml` and `ci.yml` run it before checking out the SDK, so no build can silently consume
+the SDK default branch. An attested tarball is only worth something if the same commit can rebuild
+it; bumping the SDK means editing `go.mod` and cutting a new agent release.
+
 ## Install on a machine (from a release)
 
 The only supported install path is a release asset. Nothing is shipped to a host by hand.

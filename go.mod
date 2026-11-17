@@ -3,7 +3,7 @@ module github.com/Daedalusys/daedalus-agent
 go 1.25.0
 
 require (
-	github.com/Daedalusys/daedalus-sdk v0.0.0-00010101000000-000000000000
+	github.com/Daedalusys/daedalus-sdk v0.1.3
 	github.com/spf13/cobra v1.10.2
 	google.golang.org/protobuf v1.36.12
 	gopkg.in/yaml.v3 v3.0.1
