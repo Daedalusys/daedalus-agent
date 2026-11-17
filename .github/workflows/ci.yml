@@ -35,12 +35,19 @@ jobs:
           # .git/config 的 http.extraheader 取凭据,不留跨 step 存活的 token。
           persist-credentials: false
           path: daedalus-agent
+      - name: Resolve SDK pin
+        # 构建依赖必须钉版本:占位伪版本/缺失时 fail-closed,不回落默认分支。
+        id: sdk-pin
+        shell: bash
+        working-directory: daedalus-agent
+        run: echo "ref=$(bash scripts/sdk-pin.sh)" >> "$GITHUB_OUTPUT"
       - name: Checkout SDK (sibling; go.mod 的 replace => ../daedalus-sdk)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           repository: Daedalusys/daedalus-sdk
           path: daedalus-sdk
+          ref: ${{ steps.sdk-pin.outputs.ref }}
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:

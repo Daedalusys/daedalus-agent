@@ -47,12 +47,21 @@ jobs:
           # SDK 必须落在平级位置,否则 go build 直接解析不到。
           path: daedalus-agent
 
+      - name: Resolve SDK pin
+        # 出货构建必须钉住 SDK:ref 取自 go.mod,占位/缺失即 fail-closed。
+        # 否则「attestation 证明过的 tarball」无法由同一 commit 重建。
+        id: sdk-pin
+        shell: bash
+        working-directory: daedalus-agent
+        run: echo "ref=$(bash scripts/sdk-pin.sh)" >> "$GITHUB_OUTPUT"
+
       - name: Checkout SDK (sibling; go.mod 的 replace => ../daedalus-sdk)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           repository: Daedalusys/daedalus-sdk
           path: daedalus-sdk
+          ref: ${{ steps.sdk-pin.outputs.ref }}
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
