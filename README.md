@@ -233,8 +233,6 @@ Open issues in this repository, so "has this been done yet?" is answerable by nu
 
 | Issue | Scope |
 |---|---|
-| [#6](https://github.com/Daedalusys/daedalus-agent/issues/6) | `Register` returns the real sha256 of the active policy file instead of the `unhashed-policy-v0` placeholder — closed by [PR #11](https://github.com/Daedalusys/daedalus-agent/pull/11) |
-| [#7](https://github.com/Daedalusys/daedalus-agent/issues/7) | `ApplyIntent` outcome events move from plain log lines into the JSONL audit hash chain |
-| [#8](https://github.com/Daedalusys/daedalus-agent/issues/8) | Rollback backend: add LVM-snap / snapper (today only btrfs subvolume + rsync target are probed and selectable) |
-| [#9](https://github.com/Daedalusys/daedalus-agent/issues/9) | `Heartbeat` returns the real `pending_intents` count (today hardcoded to `0`) |
-| [#10](https://github.com/Daedalusys/daedalus-agent/issues/10) | Agent outbound gRPC client: `register` / `apply` / `report` now dial the peer over mTLS via `internal/agentclient` (closed; `--addr` overrides `control_plane_addr`) |
+| [#26](https://github.com/Daedalusys/daedalus-agent/issues/26) | dnf5 `history --json` branch still lacks real-machine coverage (RHEL 10.3 ships dnf 4.20) |
+
+Closed issues are not listed, so a stale row cannot mislead "has this been done yet?": #6, #7, #8, #9 and #10 were all closed between 2026-11-05 and 2026-11-12.
