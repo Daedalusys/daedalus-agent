@@ -101,6 +101,16 @@ func newFakeServer() *mcp.Server {
 			Content: []mcp.Content{&mcp.TextContent{Text: "written"}},
 		}, nil
 	})
+	// 故意不写 Annotations:ReadOnlyHint 缺省 false,必须被拒。
+	srv.AddTool(&mcp.Tool{
+		Name:        "no_annotations",
+		Description: "不自报只读的工具",
+		InputSchema: schema,
+	}, func(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: "unexpected"}},
+		}, nil
+	})
 	return srv
 }
 
@@ -114,6 +124,13 @@ func (d *selectiveDialer) Dial(ctx context.Context, pluginID string) (Session, e
 		return nil, errors.New("插件进程起不来")
 	}
 	return dialInMemory(ctx)
+}
+
+// alwaysFailDialer 模拟所有白名单插件都起不来。
+type alwaysFailDialer struct{}
+
+func (alwaysFailDialer) Dial(context.Context, string) (Session, error) {
+	return nil, errors.New("插件进程起不来")
 }
 
 func hasName(tools []ToolInfo, name string) bool {

@@ -275,15 +275,21 @@ func startRPCServer(cfg *config.Config) (*rpc.Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("audit: %w", err)
 	}
-	// 远程工具白名单:策略文件配了却读不懂是部署事故,启动就报错;没配
-	// [remote_tools] 的节点得到空白名单,等于没有远程面。
+	// 远程工具白名单:策略文件配了却读不懂是部署事故,启动就报错;
+	// 没配 [remote_tools] 的节点得到空白名单,调用一律被拒。
 	policy, err := toolcall.LoadPolicy(cfg.PolicyPath)
 	if err != nil {
 		return nil, fmt.Errorf("加载远程工具白名单: %w", err)
 	}
 	var toolCaller *toolcall.Caller
-	if len(policy.RemoteTools) > 0 {
-		toolCaller = &toolcall.Caller{Policy: policy, Dialer: toolcall.NewSpawnDialer(version)}
+	if cfg.PolicyPath != "" {
+		// 这里的读取只做 fail-fast;Caller 每次调用前会重读同一文件,
+		// 保证 Register 上报的 digest 与实际执行的策略始终同源。
+		toolCaller = &toolcall.Caller{
+			Policy:     policy,
+			PolicyPath: cfg.PolicyPath,
+			Dialer:     toolcall.NewSpawnDialer(version),
+		}
 	}
 	rpcSrv, err := rpc.NewServer(rpc.DefaultListenAddr, tlsCfg, rpc.ServiceDeps{
 		Cfg:        cfg,

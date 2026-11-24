@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,13 +19,50 @@ import (
 	"strings"
 
 	"github.com/Daedalusys/daedalus-sdk/plugin"
+	sdkpolicy "github.com/Daedalusys/daedalus-sdk/policy"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// ErrDenied 表示调用不在白名单内,或目标工具没有自报只读。
-// 其它错误(插件进程起不来、协议失败)不是放行判定,调用方据此区分
+// ErrDenied 表示调用被放行判定拒绝。具体是哪道闸由 DenyReason 给出;
+// 插件进程起不来、协议失败等不属于放行判定,调用方据此区分
 // 「节点拒了」与「节点够不着插件」。
 var ErrDenied = errors.New("toolcall: 工具调用被拒")
+
+// ErrPolicyUnavailable 表示运行期重读策略失败。调用方必须 fail-closed:
+// 既不能用旧快照继续放行,也不能把它当成「白名单为空」。
+var ErrPolicyUnavailable = errors.New("toolcall: 远程工具白名单不可用")
+
+// DenyReason 说明被哪道闸拒的,写进审计供值班定位。
+type DenyReason string
+
+const (
+	// DenyNotAllowlisted:plugin 或工具根本不在策略白名单里。
+	DenyNotAllowlisted DenyReason = "not_allowlisted"
+	// DenyNotReadOnly:工具在插件里存在,但没自报只读(写工具走这里)。
+	DenyNotReadOnly DenyReason = "not_read_only"
+	// DenyNotExposed:工具在白名单里,但插件当前没有暴露它。
+	DenyNotExposed DenyReason = "tool_not_exposed"
+)
+
+// deniedError 让 errors.Is(err, ErrDenied) 成立,同时携带具体原因。
+type deniedError struct{ reason DenyReason }
+
+func (e *deniedError) Error() string {
+	return "toolcall: 工具调用被拒: " + string(e.reason)
+}
+
+func (e *deniedError) Is(target error) bool { return target == ErrDenied }
+
+func deny(reason DenyReason) error { return &deniedError{reason: reason} }
+
+// DenyReasonOf 提取被拒原因;不是放行判定错误时返回空串。
+func DenyReasonOf(err error) DenyReason {
+	var de *deniedError
+	if errors.As(err, &de) {
+		return de.reason
+	}
+	return ""
+}
 
 // ToolInfo 是一条工具元信息。PluginID 由 Caller.ListTools 在汇总时填上;
 // Session.ListTools 只填插件侧字段。
@@ -44,6 +82,16 @@ type ToolResult struct {
 	ErrorMessage string
 }
 
+// ListToolsResult 是一次工具集汇总的结果。
+type ListToolsResult struct {
+	Tools []ToolInfo
+	// SkippedPlugins 是 dial / 列工具失败、被跳过的插件数。控制面据此
+	// 判断这份清单是否完整。
+	SkippedPlugins int
+	// LastErr 是最后一次跳过的错误,只用于审计与日志定位。
+	LastErr error
+}
+
 // Session 是一条已建立的插件 MCP 会话。
 type Session interface {
 	ListTools(ctx context.Context) ([]ToolInfo, error)
@@ -58,34 +106,62 @@ type Dialer interface {
 
 // Caller 是叠加白名单与只读判定后的工具调用入口。
 type Caller struct {
+	// Policy 是静态策略快照,只在 PolicyPath 为空(测试 / 静态注入)时生效。
 	Policy Policy
-	Dialer Dialer
+	// PolicyPath 非空时每次调用前重读该文件。Register 上报的 digest 也来自
+	// 同一文件的当前内容,重读保证「上报的策略 = 执行的策略」,撤销不必
+	// 等重启。启动时的那次读取只做 fail-fast 校验。
+	PolicyPath string
+	Dialer     Dialer
+}
+
+// currentPolicy 返回本次调用应执行的策略。路径配置了就现读现用:
+// 读不到或解析失败一律返回 ErrPolicyUnavailable,绝不回落到旧快照。
+func (c *Caller) currentPolicy() (Policy, error) {
+	if c.PolicyPath == "" {
+		return c.Policy, nil
+	}
+	pol, err := LoadPolicy(c.PolicyPath)
+	if err != nil {
+		return Policy{}, fmt.Errorf("%w: %w", ErrPolicyUnavailable, err)
+	}
+	return pol, nil
 }
 
 // ListTools 汇总所有白名单插件里可远程调用的工具(白名单 ∩ 只读)。
 //
 // 单个插件 dial 或列工具失败时跳过它:一个插件坏了不该让整台机器的工具集
-// 变空,更不能因此让巡检整体失败。排序只为让输出稳定(便于控制面 diff)。
-func (c *Caller) ListTools(ctx context.Context) ([]ToolInfo, error) {
-	var all []ToolInfo
-	for pluginID := range c.Policy.RemoteTools {
-		tools, err := c.listPluginTools(ctx, pluginID)
+// 变空。但「全部白名单插件都失败」必须返回错误 —— 否则控制面看到的是
+// tools=[] 的成功结果,与「本来就没有可远程调用的工具」无法区分。
+func (c *Caller) ListTools(ctx context.Context) (ListToolsResult, error) {
+	pol, err := c.currentPolicy()
+	if err != nil {
+		return ListToolsResult{}, err
+	}
+	var result ListToolsResult
+	for pluginID := range pol.RemoteTools {
+		tools, err := c.listPluginTools(ctx, pluginID, pol)
 		if err != nil {
+			result.SkippedPlugins++
+			result.LastErr = err
 			continue
 		}
-		all = append(all, tools...)
+		result.Tools = append(result.Tools, tools...)
 	}
-	sort.Slice(all, func(i, j int) bool {
-		if all[i].PluginID != all[j].PluginID {
-			return all[i].PluginID < all[j].PluginID
+	sort.Slice(result.Tools, func(i, j int) bool {
+		if result.Tools[i].PluginID != result.Tools[j].PluginID {
+			return result.Tools[i].PluginID < result.Tools[j].PluginID
 		}
-		return all[i].Name < all[j].Name
+		return result.Tools[i].Name < result.Tools[j].Name
 	})
-	return all, nil
+	if len(result.Tools) == 0 && result.SkippedPlugins > 0 {
+		return result, fmt.Errorf("toolcall: 白名单插件全部不可用(跳过 %d 个): %w", result.SkippedPlugins, result.LastErr)
+	}
+	return result, nil
 }
 
 // listPluginTools 列出单个插件里既在白名单内、又自报只读的工具。
-func (c *Caller) listPluginTools(ctx context.Context, pluginID string) ([]ToolInfo, error) {
+func (c *Caller) listPluginTools(ctx context.Context, pluginID string, pol Policy) ([]ToolInfo, error) {
 	if c.Dialer == nil {
 		return nil, fmt.Errorf("toolcall: 未装配 Dialer")
 	}
@@ -93,13 +169,17 @@ func (c *Caller) listPluginTools(ctx context.Context, pluginID string) ([]ToolIn
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = sess.Close() }()
+	defer func() {
+		if cerr := sess.Close(); cerr != nil {
+			log.Printf("toolcall: 关闭插件 %s 会话失败: %v", pluginID, cerr)
+		}
+	}()
 
 	infos, err := sess.ListTools(ctx)
 	if err != nil {
 		return nil, err
 	}
-	allowed := c.Policy.RemoteTools[pluginID]
+	allowed := pol.RemoteTools[pluginID]
 	out := make([]ToolInfo, 0, len(infos))
 	for _, info := range infos {
 		if !info.ReadOnly {
@@ -114,14 +194,18 @@ func (c *Caller) listPluginTools(ctx context.Context, pluginID string) ([]ToolIn
 	return out, nil
 }
 
-// CallTool 按固定顺序做三步判定:白名单 → 插件自报只读 → 执行。
+// CallTool 按固定顺序做三步判定:白名单 → 插件暴露且自报只读 → 执行。
 //
 // 第二步必须重新问插件要工具清单,而不是信任白名单:白名单里混进写工具
 // (人工维护失误、插件升级新增写工具)也会在这里被拒,写工具因此不需要
 // 额外的黑名单。
 func (c *Caller) CallTool(ctx context.Context, pluginID, toolName, argsJSON string) (ToolResult, error) {
-	if !c.Policy.Allows(pluginID, toolName) {
-		return ToolResult{}, ErrDenied
+	pol, err := c.currentPolicy()
+	if err != nil {
+		return ToolResult{}, err
+	}
+	if !pol.Allows(pluginID, toolName) {
+		return ToolResult{}, deny(DenyNotAllowlisted)
 	}
 	if c.Dialer == nil {
 		return ToolResult{}, fmt.Errorf("toolcall: 未装配 Dialer")
@@ -130,21 +214,28 @@ func (c *Caller) CallTool(ctx context.Context, pluginID, toolName, argsJSON stri
 	if err != nil {
 		return ToolResult{}, fmt.Errorf("toolcall: 连接插件 %s: %w", pluginID, err)
 	}
-	defer func() { _ = sess.Close() }()
+	defer func() {
+		if cerr := sess.Close(); cerr != nil {
+			log.Printf("toolcall: 关闭插件 %s 会话失败: %v", pluginID, cerr)
+		}
+	}()
 
 	infos, err := sess.ListTools(ctx)
 	if err != nil {
 		return ToolResult{}, fmt.Errorf("toolcall: 列出插件 %s 的工具: %w", pluginID, err)
 	}
-	readOnly := false
+	var found, readOnly bool
 	for _, info := range infos {
 		if info.Name == toolName {
-			readOnly = info.ReadOnly
+			found, readOnly = true, info.ReadOnly
 			break
 		}
 	}
+	if !found {
+		return ToolResult{}, deny(DenyNotExposed)
+	}
 	if !readOnly {
-		return ToolResult{}, ErrDenied
+		return ToolResult{}, deny(DenyNotReadOnly)
 	}
 
 	res, err := sess.CallTool(ctx, toolName, argsJSON)
@@ -221,16 +312,52 @@ func (d *spawnDialer) command(ctx context.Context, pluginID string) (*exec.Cmd, 
 		return nil, fmt.Errorf("toolcall: 插件 %s: %w", pluginID, err)
 	}
 	absExec := filepath.Join(dir, m.Executable)
+	var cmd *exec.Cmd
 	switch m.Runtime {
 	case plugin.RuntimeDeno:
 		args := append([]string{"run"}, m.Entrypoint...)
 		args = append(args, absExec)
-		return exec.CommandContext(ctx, denoBinary, args...), nil
+		cmd = exec.CommandContext(ctx, denoBinary, args...)
 	case plugin.RuntimeNative:
-		return exec.CommandContext(ctx, absExec, m.Entrypoint...), nil
+		cmd = exec.CommandContext(ctx, absExec, m.Entrypoint...)
 	default:
 		return nil, fmt.Errorf("toolcall: 插件 %s 的 runtime %q 不受支持", pluginID, m.Runtime)
 	}
+	// 不接 stderr 等于把它丢进 /dev/null:MCP 握手失败时插件自己的崩溃
+	// 原因就再也看不到了。逐块转进本进程日志,并带 plugin id 前缀。
+	cmd.Stderr = &pluginStderr{pluginID: pluginID}
+	cmd.Dir = dir
+	cmd.Env = pluginEnv(d.root)
+	return cmd, nil
+}
+
+// pluginEnv 返回插件子进程的干净环境。
+//
+// 不能 os.Environ() 透传:ALLOW_COMMANDS 是 REPLACE 语义,agent 环境里带着
+// 它就会给插件一套不同于其 systemd 单元的命令白名单,等于从 agent 环境旁路
+// 插件策略。只给运行必需项:PATH、插件根目录,以及显式配置的策略路径与
+// 语言变量;ALLOW_COMMANDS / DAEDALUS_POLICY_MODE 一律不带。
+func pluginEnv(root string) []string {
+	env := []string{
+		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+		"DAEDALUS_PLUGIN_DIR=" + root,
+	}
+	for _, key := range []string{sdkpolicy.EnvPolicyPath, "LANG", "LC_ALL"} {
+		if v := os.Getenv(key); v != "" {
+			env = append(env, key+"="+v)
+		}
+	}
+	return env
+}
+
+// pluginStderr 把插件 stderr 转发到 agent 日志。
+type pluginStderr struct{ pluginID string }
+
+func (w *pluginStderr) Write(p []byte) (int, error) {
+	if line := strings.TrimRight(string(p), "\n"); line != "" {
+		log.Printf("plugin %s stderr: %s", w.pluginID, line)
+	}
+	return len(p), nil
 }
 
 // mcpSession 把 SDK 的 *mcp.ClientSession 适配成本包的 Session。

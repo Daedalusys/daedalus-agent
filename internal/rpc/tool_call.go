@@ -3,11 +3,16 @@
 // handler 只做协议映射与留痕:白名单与 ReadOnlyHint 两道闸在
 // internal/toolcall 完成,这里不重复实现策略,也不替插件做参数校验 ——
 // 入参原样透传,插件自己的 shellpolicy / pathguard 仍然生效。
+//
+// 审计 outcome 沿用仓内既有词表:成功 `ok`;放行判定拒绝
+// `refused: <reason>`;执行失败 `<kind>: <detail>`(kind 为 list_failed /
+// plugin_unavailable / policy_unavailable / tool_failed)。
 package rpc
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"strconv"
 
@@ -32,26 +37,36 @@ const auditIdentityToolCall = "control-plane"
 // ListTools 返回节点上既在白名单内、又自报只读的工具。
 //
 // 未配置工具调用面(ToolCaller == nil)时返回空工具集而不是错误:节点没有
-// 远程面是正常形态,列出来是空集合;真正硬调工具时才会被 CallTool 拒。
+// 远程面是正常形态,RPC 成功,审计也记成功(带 reason 便于区分「空白名单」
+// 与「清单不完整」)。
 func (s *agentService) ListTools(ctx context.Context, _ *agentv1.ListToolsRequest) (*agentv1.ListToolsResponse, error) {
 	if s.toolCaller == nil {
-		seq := s.recordToolCallEvent(auditToolCallListTools, "denied", map[string]string{
+		seq := s.recordToolCallEvent(auditToolCallListTools, "ok", map[string]string{
+			"count":  "0",
 			"reason": "no_remote_surface",
 		})
 		return &agentv1.ListToolsResponse{AuditSeq: seq}, nil
 	}
 
-	tools, err := s.toolCaller.ListTools(ctx)
+	result, err := s.toolCaller.ListTools(ctx)
 	if err != nil {
-		s.recordToolCallEvent(auditToolCallListTools, "failure", map[string]string{
-			"reason": "list_failed",
-		})
+		args := map[string]string{
+			"skipped": strconv.Itoa(result.SkippedPlugins),
+		}
+		if errors.Is(err, toolcall.ErrPolicyUnavailable) {
+			args["reason"] = "policy_unavailable"
+			s.recordToolCallEvent(auditToolCallListTools, fmt.Sprintf("policy_unavailable: %v", err), args)
+			log.Printf("agent: ListTools 策略不可用: %v", err)
+			return nil, status.Error(codes.FailedPrecondition, "节点远程工具白名单不可用")
+		}
+		args["reason"] = "list_failed"
+		s.recordToolCallEvent(auditToolCallListTools, fmt.Sprintf("list_failed: %v", err), args)
 		log.Printf("agent: ListTools failed: %v", err)
 		return nil, status.Error(codes.Unavailable, "列出节点工具失败")
 	}
 
-	out := make([]*agentv1.ToolDescriptor, 0, len(tools))
-	for _, tool := range tools {
+	out := make([]*agentv1.ToolDescriptor, 0, len(result.Tools))
+	for _, tool := range result.Tools {
 		out = append(out, &agentv1.ToolDescriptor{
 			PluginId:        tool.PluginID,
 			ToolName:        tool.Name,
@@ -60,8 +75,9 @@ func (s *agentService) ListTools(ctx context.Context, _ *agentv1.ListToolsReques
 			ReadOnly:        tool.ReadOnly,
 		})
 	}
-	seq := s.recordToolCallEvent(auditToolCallListTools, "success", map[string]string{
-		"count": strconv.Itoa(len(out)),
+	seq := s.recordToolCallEvent(auditToolCallListTools, "ok", map[string]string{
+		"count":   strconv.Itoa(len(out)),
+		"skipped": strconv.Itoa(result.SkippedPlugins),
 	})
 	return &agentv1.ListToolsResponse{Tools: out, AuditSeq: seq}, nil
 }
@@ -69,7 +85,7 @@ func (s *agentService) ListTools(ctx context.Context, _ *agentv1.ListToolsReques
 // CallTool 远程调用一个只读工具。每次调用(含被拒)都落一条审计。
 //
 // 错误码与控制面的分类约定一一对应:
-//   - FailedPrecondition:节点没配工具调用面;
+//   - FailedPrecondition:节点没配工具调用面,或策略文件当前读不懂;
 //   - PermissionDenied:白名单或只读判定不通过;
 //   - Unavailable:插件进程起不来 / 协议失败(节点够不着插件)。
 //
@@ -86,25 +102,39 @@ func (s *agentService) CallTool(ctx context.Context, req *agentv1.CallToolReques
 
 	if s.toolCaller == nil {
 		args["reason"] = "no_remote_surface"
-		s.recordToolCallEvent(auditToolCall, "denied", args)
+		s.recordToolCallEvent(auditToolCall, "refused: no_remote_surface", args)
 		return nil, status.Error(codes.FailedPrecondition, "节点未配置只读工具调用面")
 	}
 
 	res, err := s.toolCaller.CallTool(ctx, req.GetPluginId(), req.GetToolName(), req.GetArgumentsJson())
+	if errors.Is(err, toolcall.ErrPolicyUnavailable) {
+		args["reason"] = "policy_unavailable"
+		s.recordToolCallEvent(auditToolCall, "refused: policy_unavailable", args)
+		log.Printf("agent: CallTool 策略不可用: %v", err)
+		return nil, status.Error(codes.FailedPrecondition, "节点远程工具白名单不可用")
+	}
 	if errors.Is(err, toolcall.ErrDenied) {
-		args["reason"] = "not_allowlisted_or_not_read_only"
-		s.recordToolCallEvent(auditToolCall, "denied", args)
-		return nil, status.Error(codes.PermissionDenied, "工具不在远程白名单内,或未自报只读")
+		reason := string(toolcall.DenyReasonOf(err))
+		if reason == "" {
+			reason = "denied"
+		}
+		args["reason"] = reason
+		s.recordToolCallEvent(auditToolCall, "refused: "+reason, args)
+		return nil, status.Error(codes.PermissionDenied, "工具调用被拒: "+reason)
 	}
 	if err != nil {
 		args["reason"] = "plugin_unavailable"
-		s.recordToolCallEvent(auditToolCall, "failure", args)
+		s.recordToolCallEvent(auditToolCall, fmt.Sprintf("plugin_unavailable: %v", err), args)
 		log.Printf("agent: CallTool %s/%s failed: %v", req.GetPluginId(), req.GetToolName(), err)
 		return nil, status.Error(codes.Unavailable, "调用节点工具失败")
 	}
 
 	if res.IsError {
-		seq := s.recordToolCallEvent(auditToolCall, "failure", args)
+		outcome := "tool_failed"
+		if res.ErrorMessage != "" {
+			outcome = fmt.Sprintf("tool_failed: %s", res.ErrorMessage)
+		}
+		seq := s.recordToolCallEvent(auditToolCall, outcome, args)
 		return &agentv1.CallToolResponse{
 			IsError:      true,
 			ContentJson:  res.ContentJSON,
@@ -112,7 +142,7 @@ func (s *agentService) CallTool(ctx context.Context, req *agentv1.CallToolReques
 			AuditSeq:     seq,
 		}, nil
 	}
-	seq := s.recordToolCallEvent(auditToolCall, "success", args)
+	seq := s.recordToolCallEvent(auditToolCall, "ok", args)
 	return &agentv1.CallToolResponse{
 		IsError:     false,
 		ContentJson: res.ContentJSON,

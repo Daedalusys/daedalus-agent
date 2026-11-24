@@ -3,6 +3,7 @@ package rpc_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -42,16 +43,21 @@ func (s *toolStubSession) Close() error {
 	return nil
 }
 
-// toolStubDialer 把插件 id 记下来,dial 成功/失败由 err 决定。
+// toolStubDialer 把插件 id 记下来;failPlugins 里的插件 dial 失败。
 type toolStubDialer struct {
 	session *toolStubSession
 	err     error
+	// failPlugins 是 dial 失败的插件 id 集合,用来模拟部分插件起不来。
+	failPlugins map[string]bool
 
 	gotPlugin string
 }
 
 func (d *toolStubDialer) Dial(_ context.Context, pluginID string) (toolcall.Session, error) {
 	d.gotPlugin = pluginID
+	if d.failPlugins[pluginID] {
+		return nil, errors.New("插件进程起不来")
+	}
 	if d.err != nil {
 		return nil, d.err
 	}
@@ -69,21 +75,28 @@ func remotePolicy(pluginID string, tools ...string) toolcall.Policy {
 // startToolRig 起一个注入了 ToolCaller 的 rig。
 func startToolRig(t *testing.T, pol toolcall.Policy, dialer toolcall.Dialer) *testRig {
 	t.Helper()
+	return startToolCallerRig(t, &toolcall.Caller{Policy: pol, Dialer: dialer})
+}
+
+// startToolCallerRig 起一个注入了指定 Caller 的 rig。
+func startToolCallerRig(t *testing.T, caller *toolcall.Caller) *testRig {
+	t.Helper()
 	return startTestServerFull(t, agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_RSYNC_TARGET, nil,
 		func(deps *rpc.ServiceDeps) {
-			deps.ToolCaller = &toolcall.Caller{Policy: pol, Dialer: dialer}
+			deps.ToolCaller = caller
 		})
 }
 
-// findAudit 在审计链里找第一条匹配 (tool, outcome) 的记录。
-func findAudit(t *testing.T, chain *audit.Local, tool, outcome string) (audit.Record, bool) {
+// findAudit 在审计链里找第一条 tool 相同、outcome 以 want 开头的记录。
+// outcome 带前缀匹配:既有词表里失败结局都带 ": <detail>"。
+func findAudit(t *testing.T, chain *audit.Local, tool, want string) (audit.Record, bool) {
 	t.Helper()
 	records, _, err := chain.Since(0)
 	if err != nil {
 		t.Fatalf("audit Since: %v", err)
 	}
 	for _, rec := range records {
-		if rec.Tool == tool && rec.Outcome == outcome {
+		if rec.Tool == tool && strings.HasPrefix(rec.Outcome, want) {
 			return rec, true
 		}
 	}
@@ -103,8 +116,8 @@ func TestCallTool_DeniedWhenNoRemoteSurface(t *testing.T) {
 	if code := status.Code(err); code != codes.FailedPrecondition {
 		t.Errorf("code = %v, want FailedPrecondition", code)
 	}
-	if _, ok := findAudit(t, rig.Audit, "tool_call", "denied"); !ok {
-		t.Error("被拒的调用必须落 denied 审计")
+	if _, ok := findAudit(t, rig.Audit, "tool_call", "refused: no_remote_surface"); !ok {
+		t.Error("被拒的调用必须落 refused 审计")
 	}
 }
 
@@ -125,8 +138,12 @@ func TestCallTool_PermissionDeniedWhenNotAllowlisted(t *testing.T) {
 	if dialer.gotPlugin != "" {
 		t.Error("白名单判定不通过时不应该去 dial 插件")
 	}
-	if _, ok := findAudit(t, rig.Audit, "tool_call", "denied"); !ok {
-		t.Error("被拒的调用必须落 denied 审计")
+	record, ok := findAudit(t, rig.Audit, "tool_call", "refused: ")
+	if !ok {
+		t.Fatal("被拒的调用必须落 refused 审计")
+	}
+	if record.Args["reason"] != "not_allowlisted" {
+		t.Errorf("审计 reason = %q, want not_allowlisted", record.Args["reason"])
 	}
 }
 
@@ -146,8 +163,58 @@ func TestCallTool_PermissionDeniedForWriteToolEvenIfAllowlisted(t *testing.T) {
 	if code := status.Code(err); code != codes.PermissionDenied {
 		t.Errorf("code = %v, want PermissionDenied", code)
 	}
-	if _, ok := findAudit(t, rig.Audit, "tool_call", "denied"); !ok {
-		t.Error("被拒的调用必须落 denied 审计")
+	record, ok := findAudit(t, rig.Audit, "tool_call", "refused: ")
+	if !ok {
+		t.Fatal("被拒的调用必须落 refused 审计")
+	}
+	if record.Args["reason"] != "not_read_only" {
+		t.Errorf("审计 reason = %q, want not_read_only", record.Args["reason"])
+	}
+}
+
+func TestCallTool_PermissionDeniedWhenToolNotExposed(t *testing.T) {
+	// 白名单里有,但插件当前没有暴露这个工具:与「写工具」必须是不同 reason。
+	dialer := &toolStubDialer{session: &toolStubSession{tools: []toolcall.ToolInfo{
+		{Name: "read_file", ReadOnly: true},
+	}}}
+	rig := startToolRig(t, remotePolicy("daedalus.shell", "ghost_tool"), dialer)
+	defer rig.Cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := rig.Client.CallTool(ctx, &agentv1.CallToolRequest{PluginId: "daedalus.shell", ToolName: "ghost_tool"})
+	if err == nil {
+		t.Fatal("插件没暴露的工具必须被拒")
+	}
+	if code := status.Code(err); code != codes.PermissionDenied {
+		t.Errorf("code = %v, want PermissionDenied", code)
+	}
+	record, ok := findAudit(t, rig.Audit, "tool_call", "refused: ")
+	if !ok {
+		t.Fatal("被拒的调用必须落 refused 审计")
+	}
+	if record.Args["reason"] != "tool_not_exposed" {
+		t.Errorf("审计 reason = %q, want tool_not_exposed", record.Args["reason"])
+	}
+}
+
+func TestCallTool_FailedPreconditionWhenPolicyUnavailable(t *testing.T) {
+	// 策略文件读不到 = fail-closed,不能用旧快照继续放行。
+	caller := &toolcall.Caller{PolicyPath: t.TempDir() + "/missing.toml"}
+	rig := startToolCallerRig(t, caller)
+	defer rig.Cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := rig.Client.CallTool(ctx, &agentv1.CallToolRequest{PluginId: "daedalus.shell", ToolName: "shell_exec"})
+	if err == nil {
+		t.Fatal("策略不可用时必须拒绝")
+	}
+	if code := status.Code(err); code != codes.FailedPrecondition {
+		t.Errorf("code = %v, want FailedPrecondition", code)
+	}
+	if _, ok := findAudit(t, rig.Audit, "tool_call", "refused: policy_unavailable"); !ok {
+		t.Error("策略不可用必须落 refused 审计")
 	}
 }
 
@@ -188,8 +255,8 @@ func TestCallTool_SuccessReturnsContentAndAudits(t *testing.T) {
 	if !session.closed {
 		t.Error("调用结束后必须关闭插件会话")
 	}
-	if _, ok := findAudit(t, rig.Audit, "tool_call", "success"); !ok {
-		t.Error("成功调用必须落 success 审计")
+	if _, ok := findAudit(t, rig.Audit, "tool_call", "ok"); !ok {
+		t.Error("成功调用必须落 ok 审计")
 	}
 }
 
@@ -220,8 +287,8 @@ func TestCallTool_PluginErrorIsNotRPCError(t *testing.T) {
 	if resp.GetAuditSeq() == 0 {
 		t.Error("失败的调用同样要落审计并返回 seq")
 	}
-	if _, ok := findAudit(t, rig.Audit, "tool_call", "failure"); !ok {
-		t.Error("插件自报错误必须记成 failure 审计")
+	if _, ok := findAudit(t, rig.Audit, "tool_call", "tool_failed: "); !ok {
+		t.Error("插件自报错误必须记成 tool_failed 审计")
 	}
 }
 
@@ -239,8 +306,8 @@ func TestCallTool_UnavailableWhenPluginCannotStart(t *testing.T) {
 	if code := status.Code(err); code != codes.Unavailable {
 		t.Errorf("code = %v, want Unavailable", code)
 	}
-	if _, ok := findAudit(t, rig.Audit, "tool_call", "failure"); !ok {
-		t.Error("插件不可达必须落 failure 审计")
+	if _, ok := findAudit(t, rig.Audit, "tool_call", "plugin_unavailable: "); !ok {
+		t.Error("插件不可达必须落 plugin_unavailable 审计")
 	}
 }
 
@@ -256,6 +323,92 @@ func TestListTools_ReturnsEmptyWhenNoRemoteSurface(t *testing.T) {
 	}
 	if len(resp.GetTools()) != 0 {
 		t.Errorf("tools = %v, want 空", resp.GetTools())
+	}
+	// RPC 成功,审计就不能记成拒绝事件。
+	record, ok := findAudit(t, rig.Audit, "tool_call_list_tools", "ok")
+	if !ok {
+		t.Fatal("无远程面时 ListTools 必须落 ok 审计")
+	}
+	if record.Args["reason"] != "no_remote_surface" {
+		t.Errorf("审计 reason = %q, want no_remote_surface", record.Args["reason"])
+	}
+}
+
+func TestListTools_UnavailableWhenAllPluginsFail(t *testing.T) {
+	dialer := &toolStubDialer{err: errors.New("插件进程起不来")}
+	pol := toolcall.Policy{RemoteTools: map[string]map[string]struct{}{
+		"daedalus.shell": {"shell_exec": {}},
+	}}
+	rig := startToolRig(t, pol, dialer)
+	defer rig.Cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := rig.Client.ListTools(ctx, &agentv1.ListToolsRequest{})
+	if err == nil {
+		t.Fatal("全部插件不可用时 ListTools 必须报错,不能伪装成空工具集")
+	}
+	if code := status.Code(err); code != codes.Unavailable {
+		t.Errorf("code = %v, want Unavailable", code)
+	}
+	record, ok := findAudit(t, rig.Audit, "tool_call_list_tools", "list_failed: ")
+	if !ok {
+		t.Fatal("全部插件失败必须落 list_failed 审计")
+	}
+	if record.Args["skipped"] != "1" {
+		t.Errorf("审计 skipped = %q, want 1", record.Args["skipped"])
+	}
+}
+
+func TestListTools_PartialFailureReportsSkipped(t *testing.T) {
+	dialer := &toolStubDialer{
+		session:     &toolStubSession{tools: []toolcall.ToolInfo{{Name: "shell_exec", ReadOnly: true}}},
+		failPlugins: map[string]bool{"daedalus.broken": true},
+	}
+	pol := toolcall.Policy{RemoteTools: map[string]map[string]struct{}{
+		"daedalus.broken": {"shell_exec": {}},
+		"daedalus.shell":  {"shell_exec": {}},
+	}}
+	rig := startToolRig(t, pol, dialer)
+	defer rig.Cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := rig.Client.ListTools(ctx, &agentv1.ListToolsRequest{})
+	if err != nil {
+		t.Fatalf("部分插件失败时 ListTools 仍应成功: %v", err)
+	}
+	if len(resp.GetTools()) != 1 {
+		t.Errorf("tools = %v, want 1 条", resp.GetTools())
+	}
+	record, ok := findAudit(t, rig.Audit, "tool_call_list_tools", "ok")
+	if !ok {
+		t.Fatal("部分失败仍应落 ok 审计")
+	}
+	if record.Args["skipped"] != "1" {
+		t.Errorf("审计 skipped = %q, want 1", record.Args["skipped"])
+	}
+	if record.Args["count"] != "1" {
+		t.Errorf("审计 count = %q, want 1", record.Args["count"])
+	}
+}
+
+func TestListTools_FailedPreconditionWhenPolicyUnavailable(t *testing.T) {
+	caller := &toolcall.Caller{PolicyPath: t.TempDir() + "/missing.toml"}
+	rig := startToolCallerRig(t, caller)
+	defer rig.Cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := rig.Client.ListTools(ctx, &agentv1.ListToolsRequest{})
+	if err == nil {
+		t.Fatal("策略不可用时 ListTools 必须失败")
+	}
+	if code := status.Code(err); code != codes.FailedPrecondition {
+		t.Errorf("code = %v, want FailedPrecondition", code)
+	}
+	if _, ok := findAudit(t, rig.Audit, "tool_call_list_tools", "policy_unavailable: "); !ok {
+		t.Error("策略不可用必须落 policy_unavailable 审计")
 	}
 }
 
@@ -290,11 +443,14 @@ func TestListTools_MapsOnlyReadOnlyAllowlistedTools(t *testing.T) {
 	if resp.GetAuditSeq() == 0 {
 		t.Error("列出工具同样要落审计并返回 seq")
 	}
-	record, ok := findAudit(t, rig.Audit, "tool_call_list_tools", "success")
+	record, ok := findAudit(t, rig.Audit, "tool_call_list_tools", "ok")
 	if !ok {
-		t.Fatal("ListTools 必须落 success 审计")
+		t.Fatal("ListTools 必须落 ok 审计")
 	}
 	if record.Args["count"] != "1" {
 		t.Errorf("审计 count = %q, want 1", record.Args["count"])
+	}
+	if record.Args["skipped"] != "0" {
+		t.Errorf("审计 skipped = %q, want 0", record.Args["skipped"])
 	}
 }

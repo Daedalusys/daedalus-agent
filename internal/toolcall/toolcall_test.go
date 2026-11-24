@@ -156,47 +156,74 @@ func TestCaller_CallTool_EmptyArgumentsAreAllowed(t *testing.T) {
 
 func TestCaller_ListTools_OnlyReturnsReadOnly(t *testing.T) {
 	c := newFakeCaller(t, policyWith("daedalus.fs", "read_file", "write_file"))
-	tools, err := c.ListTools(context.Background())
+	result, err := c.ListTools(context.Background())
 	if err != nil {
 		t.Fatalf("ListTools: %v", err)
 	}
-	for _, tool := range tools {
+	for _, tool := range result.Tools {
 		if tool.PluginID != "daedalus.fs" {
 			t.Errorf("ToolInfo.PluginID = %q, want daedalus.fs", tool.PluginID)
 		}
 	}
-	if !hasName(tools, "read_file") {
+	if !hasName(result.Tools, "read_file") {
 		t.Error("只读工具必须在清单里")
 	}
-	if hasName(tools, "write_file") {
+	if hasName(result.Tools, "write_file") {
 		t.Error("写工具不能出现在远程工具集里")
+	}
+	if result.SkippedPlugins != 0 {
+		t.Errorf("SkippedPlugins = %d, want 0", result.SkippedPlugins)
 	}
 }
 
 func TestCaller_ListTools_SkipsReadOnlyToolsOutsideWhitelist(t *testing.T) {
 	// 插件自报只读但不在白名单内,同样不可远程调用,列出来只会误导网关。
 	c := newFakeCaller(t, policyWith("daedalus.shell", "shell_exec"))
-	tools, err := c.ListTools(context.Background())
+	result, err := c.ListTools(context.Background())
 	if err != nil {
 		t.Fatalf("ListTools: %v", err)
 	}
-	if len(tools) != 1 || tools[0].Name != "shell_exec" {
-		t.Errorf("工具集 = %v, want 仅 shell_exec", tools)
+	if len(result.Tools) != 1 || result.Tools[0].Name != "shell_exec" {
+		t.Errorf("工具集 = %v, want 仅 shell_exec", result.Tools)
 	}
 }
 
-func TestCaller_ListTools_SkipsUnreachablePlugin(t *testing.T) {
+func TestCaller_ListTools_PartialFailureReportsSkipped(t *testing.T) {
 	pol := Policy{RemoteTools: map[string]map[string]struct{}{
 		"daedalus.broken": {"read_file": {}},
 		"daedalus.shell":  {"shell_exec": {}},
 	}}
 	c := &Caller{Policy: pol, Dialer: &selectiveDialer{broken: "daedalus.broken"}}
-	tools, err := c.ListTools(context.Background())
+	result, err := c.ListTools(context.Background())
 	if err != nil {
 		t.Fatalf("ListTools 不应因为单个插件坏掉而失败: %v", err)
 	}
-	if len(tools) != 1 || tools[0].PluginID != "daedalus.shell" {
-		t.Errorf("工具集 = %v, want 仅 daedalus.shell 的工具", tools)
+	if len(result.Tools) != 1 || result.Tools[0].PluginID != "daedalus.shell" {
+		t.Errorf("工具集 = %v, want 仅 daedalus.shell 的工具", result.Tools)
+	}
+	if result.SkippedPlugins != 1 {
+		t.Errorf("SkippedPlugins = %d, want 1(控制面要能看出清单不完整)", result.SkippedPlugins)
+	}
+	if result.LastErr == nil {
+		t.Error("跳过插件时必须留下最后一层错误")
+	}
+}
+
+func TestCaller_ListTools_AllPluginsFailedReturnsError(t *testing.T) {
+	pol := Policy{RemoteTools: map[string]map[string]struct{}{
+		"daedalus.a": {"read_file": {}},
+		"daedalus.b": {"shell_exec": {}},
+	}}
+	c := &Caller{Policy: pol, Dialer: &alwaysFailDialer{}}
+	result, err := c.ListTools(context.Background())
+	if err == nil {
+		t.Fatal("全部白名单插件都起不来时必须报错,不能伪装成空工具集成功")
+	}
+	if len(result.Tools) != 0 {
+		t.Errorf("工具集 = %v, want 空", result.Tools)
+	}
+	if result.SkippedPlugins != 2 {
+		t.Errorf("SkippedPlugins = %d, want 2", result.SkippedPlugins)
 	}
 }
 
@@ -208,6 +235,110 @@ func TestCaller_CallTool_DialFailureIsNotDenied(t *testing.T) {
 	}
 	if errors.Is(err, ErrDenied) {
 		t.Error("插件不可达不是放行判定被拒,错误类型必须能区分")
+	}
+}
+
+func TestCaller_CallTool_DenyReasonsAreDistinct(t *testing.T) {
+	cases := []struct {
+		name   string
+		plugin string
+		tool   string
+		pol    Policy
+		want   DenyReason
+	}{
+		{
+			name:   "白名单未命中",
+			plugin: "daedalus.shell",
+			tool:   "write_file",
+			pol:    policyWith("daedalus.shell", "shell_exec"),
+			want:   DenyNotAllowlisted,
+		},
+		{
+			name:   "插件自报非只读",
+			plugin: "daedalus.fs",
+			tool:   "write_file",
+			pol:    policyWith("daedalus.fs", "write_file"),
+			want:   DenyNotReadOnly,
+		},
+		{
+			name:   "插件未暴露该工具",
+			plugin: "daedalus.shell",
+			tool:   "ghost_tool",
+			pol:    policyWith("daedalus.shell", "ghost_tool"),
+			want:   DenyNotExposed,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Caller{Policy: tc.pol, Dialer: &fakeDialer{t: t}}
+			_, err := c.CallTool(context.Background(), tc.plugin, tc.tool, `{}`)
+			if !errors.Is(err, ErrDenied) {
+				t.Fatalf("必须被拒,得到 %v", err)
+			}
+			if got := DenyReasonOf(err); got != tc.want {
+				t.Errorf("reason = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCaller_CallTool_DeniedWhenAnnotationsMissing(t *testing.T) {
+	// 插件不自报 Annotations 时 ReadOnlyHint 缺省 false,必须按写工具拒绝。
+	c := newFakeCaller(t, policyWith("daedalus.shell", "no_annotations"))
+	_, err := c.CallTool(context.Background(), "daedalus.shell", "no_annotations", `{}`)
+	if !errors.Is(err, ErrDenied) {
+		t.Fatalf("无 Annotations 的工具必须被拒,得到 %v", err)
+	}
+	if got := DenyReasonOf(err); got != DenyNotReadOnly {
+		t.Errorf("reason = %q, want %q", got, DenyNotReadOnly)
+	}
+}
+
+func TestCaller_PolicyReloadRevokesTool(t *testing.T) {
+	// Register 每次重读策略文件算 digest;执行侧也必须重读,否则撤销要等重启。
+	path := filepath.Join(t.TempDir(), "policy.toml")
+	writePolicy := func(body string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatalf("写策略: %v", err)
+		}
+	}
+	writePolicy("schema = \"daedalus.policy/v0\"\n\n[remote_tools]\n\"daedalus.shell\" = [\"shell_exec\"]\n")
+	c := &Caller{PolicyPath: path, Dialer: &fakeDialer{t: t}}
+
+	result, err := c.ListTools(context.Background())
+	if err != nil || len(result.Tools) != 1 {
+		t.Fatalf("撤销前应列出 shell_exec,得到 %v / %v", result.Tools, err)
+	}
+	if _, err := c.CallTool(context.Background(), "daedalus.shell", "shell_exec", `{}`); err != nil {
+		t.Fatalf("撤销前应放行: %v", err)
+	}
+
+	// 运维从白名单删掉工具,不重启 agent。
+	writePolicy("schema = \"daedalus.policy/v0\"\n")
+	result, err = c.ListTools(context.Background())
+	if err != nil || len(result.Tools) != 0 {
+		t.Fatalf("撤销后工具集应为空,得到 %v / %v", result.Tools, err)
+	}
+	_, err = c.CallTool(context.Background(), "daedalus.shell", "shell_exec", `{}`)
+	if !errors.Is(err, ErrDenied) {
+		t.Fatalf("撤销后必须立即拒绝,得到 %v", err)
+	}
+	if got := DenyReasonOf(err); got != DenyNotAllowlisted {
+		t.Errorf("reason = %q, want %q", got, DenyNotAllowlisted)
+	}
+}
+
+func TestCaller_PolicyUnavailableFailsClosed(t *testing.T) {
+	c := &Caller{
+		PolicyPath: filepath.Join(t.TempDir(), "missing.toml"),
+		Dialer:     &fakeDialer{t: t},
+	}
+	if _, err := c.ListTools(context.Background()); !errors.Is(err, ErrPolicyUnavailable) {
+		t.Errorf("ListTools: 策略读不到必须 fail-closed,得到 %v", err)
+	}
+	if _, err := c.CallTool(context.Background(), "daedalus.shell", "shell_exec", `{}`); !errors.Is(err, ErrPolicyUnavailable) {
+		t.Errorf("CallTool: 策略读不到必须 fail-closed,得到 %v", err)
 	}
 }
 
@@ -274,6 +405,40 @@ func TestSpawnDialer_RejectsPathEscapes(t *testing.T) {
 	}
 	if _, err := d.(*spawnDialer).command(context.Background(), "../daedalus.evil"); err == nil {
 		t.Error("非法 plugin id 必须报错")
+	}
+}
+
+func TestSpawnDialer_ChildEnvIsIsolated(t *testing.T) {
+	root := t.TempDir()
+	writePluginManifest(t, root, "daedalus.shell", `{
+		"id": "daedalus.shell",
+		"executable": "bin/daedalus-shell",
+		"runtime": {"name": "native"}
+	}`)
+	t.Setenv(pluginDirEnv, root)
+	// agent 环境里的 ALLOW_COMMANDS(REPLACE 语义)绝不能漏进插件。
+	t.Setenv("ALLOW_COMMANDS", "rm")
+	t.Setenv("DAEDALUS_POLICY_PATH", "/tmp/agent-policy.toml")
+
+	cmd, err := NewSpawnDialer("test").(*spawnDialer).command(context.Background(), "daedalus.shell")
+	if err != nil {
+		t.Fatalf("command: %v", err)
+	}
+	if want := filepath.Join(root, "daedalus.shell"); cmd.Dir != want {
+		t.Errorf("Dir = %q, want %q", cmd.Dir, want)
+	}
+	env := strings.Join(cmd.Env, "\n")
+	for _, want := range []string{
+		"PATH=",
+		"DAEDALUS_PLUGIN_DIR=" + root,
+		"DAEDALUS_POLICY_PATH=/tmp/agent-policy.toml",
+	} {
+		if !strings.Contains(env, want) {
+			t.Errorf("子进程环境缺 %q,得到:\n%s", want, env)
+		}
+	}
+	if strings.Contains(env, "ALLOW_COMMANDS") {
+		t.Errorf("子进程环境不得继承 ALLOW_COMMANDS:\n%s", env)
 	}
 }
 

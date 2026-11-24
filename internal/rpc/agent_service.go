@@ -1,17 +1,11 @@
-// agent_service.go owns the agentService struct and the shared
-// helpers behind its RPC handlers.
+// agent_service.go 组装 agentService,并放置各 RPC 共用的助手。
 //
-// Each RPC handler lives in its own file (register.go,
-// heartbeat.go, apply_intent.go, snapshot_request.go,
-// report_status.go, rollback_intent.go, tool_call.go) — this
-// file is the struct composition + shared helpers + the
-// per-handler wiring.
+// 每条 RPC 的 handler 各占一个文件(register / heartbeat / apply_intent /
+// snapshot_request / report_status / rollback_intent / tool_call);本文件
+// 只做结构体组合与共享逻辑。
 //
-// We embed agentv1.UnimplementedAgentServiceServer so that a
-// proto change compiles without touching this file. 注意:内嵌桩
-// 会让新增 RPC **编译照常通过**并在运行时静默返回
-// codes.Unimplemented —— 新方法必须自己落实现并加测试,不能指望
-// 编译器提醒。
+// 内嵌 UnimplementedAgentServiceServer 让 proto 增长时编译不破,但新增 RPC
+// 会静默返回 codes.Unimplemented —— 必须自己落实现并加测试。
 package rpc
 
 import (
@@ -63,48 +57,34 @@ type agentService struct {
 
 	mu sync.Mutex // 保护 nodeID(首次 Register 时写入一次)与 pending
 
-	// cfg is the daemon's runtime config (agent_id, cert
-	// paths, etc.). The Register handler reads agent_id and
-	// PolicyPath from here: PolicyPath is read from disk to
-	// compute the response's policy_hash. The cert paths in cfg
-	// are consumed by main() to construct the TLS config.
+	// cfg 是守护进程的运行配置(agent_id、证书路径等)。Register handler 从
+	// 这里读 agent_id 与 PolicyPath:PolicyPath 要落盘读一遍算 policy_hash;
+	// cfg 里的证书路径由 main() 消费来构造 TLS 配置。
 	cfg *config.Config
 
-	// certInfo carries the cert's NotAfter + SHA-256
-	// fingerprint for the Register response. nil is acceptable
-	// for tests that don't care about the cert metadata; the
-	// Register handler emits CertValidUntilUnix=0 and an empty
-	// fingerprint in that case (the proto permits both).
+	// certInfo 带证书的 NotAfter 与 SHA-256 指纹,供 Register 响应使用。
+	// nil 可接受(不关心证书元信息的测试):此时 Register 回
+	// CertValidUntilUnix=0 与空指纹,proto 允许这种形态。
 	certInfo *cert.Info
 
-	// snapshot is the agent's snapshot-capability probe.
-	// Register reads it; ApplyIntent consults it to pick the
-	// rollback backend. SnapshotRequest no longer uses it (it
-	// carries no target path, so it refuses unconditionally).
+	// snapshot 是节点的快照能力探测器。Register 读它;ApplyIntent 用它选
+	// 回滚后端。SnapshotRequest 不用它(请求不带目标路径,一律拒绝)。
 	snapshot *snapshot.Detector
 
-	// auditSeq is the per-process monotonic audit sequence
-	// counter. ApplyIntent (via the tx state machine) bumps it
-	// on each tx outcome (success / transient / persistent).
-	// nil is permitted only in tests that don't reach
-	// ApplyIntent; the constructor seeds a private counter
-	// otherwise.
+	// auditSeq 是进程内单调递增的审计序号。ApplyIntent 经事务状态机在每次
+	// 结局时推进它。只有不走到 ApplyIntent 的测试才允许传 nil,构造器会
+	// 分配私有计数器。
 	auditSeq *atomic.Uint64
 
-	// audit is the per-process hash-chained audit log (T7).
-	// ReportStatus streams events from it; tx.Local writes
-	// success / failure events to it on every ApplyIntent
-	// outcome. nil is permitted for tests that don't
-	// exercise ReportStatus / ApplyIntent; the
-	// report_status handler then returns an empty response
-	// (the documented "no audit yet" wire shape).
+	// audit 是进程级哈希链审计日志。ReportStatus 从它取事件;事务在每次
+	// ApplyIntent 结局时写入成功 / 失败事件。不跑 ReportStatus /
+	// ApplyIntent 的测试允许传 nil,此时 report_status handler 返回空响应
+	// (即「还没有审计」的既有线格式)。
 	audit *audit.Local
 
-	// backend is an optional override for the per-RPC backend
-	// selection. If non-nil, it is used as-is by ApplyIntent
-	// (skipping SelectBackend). Production leaves this nil;
-	// tests inject a mock backend so the handler exercises the
-	// wired-up state machine without touching the host.
+	// backend 是每次 RPC 选回滚后端时的可选覆盖。非 nil 时 ApplyIntent
+	// 直接用它(跳过 SelectBackend)。生产留 nil;测试注入假后端,让 handler
+	// 走通状态机而不碰宿主。
 	backend rollback.Backend
 
 	// txFactory 非 nil 时用来替代 tx.New 构造每次 ApplyIntent 的事务;
@@ -119,12 +99,9 @@ type agentService struct {
 	// 命令都没执行"。
 	rollbackRunner RollbackRunner
 
-	// nodeID is the control-plane-assigned identifier for
-	// this agent. It is empty until the first successful
-	// Register, then stable for the daemon's lifetime. The
-	// Heartbeat handler rejects requests whose node_id does
-	// not match — preventing a stale client from driving an
-	// old agent registration.
+	// nodeID 是控制面分配的节点标识。首次 Register 成功后写一次,此后在进程
+	// 生命周期内不变。Heartbeat handler 拒绝 node_id 不匹配的请求,避免陈旧
+	// 客户端驱动旧注册。
 	nodeID string
 
 	// toolCaller 是节点侧只读工具调用面。nil 表示未配置:ListTools
@@ -139,9 +116,8 @@ type agentService struct {
 	// 的那次不能把仍在跑的那次一起抹掉(否则计数会少报)。
 	pending map[string]int
 
-	// startedAt is the wall-clock the service was constructed.
-	// It is informational only in T5 (a future health-check
-	// RPC could surface uptime); not yet surfaced.
+	// startedAt 是服务构造时的墙钟时间。目前只作信息保留(将来的健康检查
+	// RPC 可以据此暴露 uptime),尚未对外。
 	startedAt time.Time
 }
 
