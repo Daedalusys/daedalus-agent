@@ -51,7 +51,7 @@ func TestApplyIntent_PointNoneSkipsBackendSelectionAndRuns(t *testing.T) {
 	det := snapshot.NewDetector()
 	det.SetCapability(agentv1.SnapshotCapability(99))
 	var got *agentv1.ApplyIntentRequest
-	svc := newAgentService(&config.Config{DataDir: dir}, nil, det, nil, nil, stubTxFactory(&got), auditLog)
+	svc := newAgentService(&config.Config{DataDir: dir}, nil, det, nil, nil, stubTxFactory(&got), auditLog, nil)
 
 	resp, err := svc.ApplyIntent(context.Background(), &agentv1.ApplyIntentRequest{
 		IntentId: "intent-point-none", Kind: "service", Target: "nginx.service",
@@ -86,7 +86,7 @@ func TestApplyIntent_PointNoneNilAuditDoesNotPanic(t *testing.T) {
 	det := snapshot.NewDetector()
 	det.SetCapability(agentv1.SnapshotCapability(99))
 	var got *agentv1.ApplyIntentRequest
-	svc := newAgentService(&config.Config{DataDir: t.TempDir()}, nil, det, nil, nil, stubTxFactory(&got), nil)
+	svc := newAgentService(&config.Config{DataDir: t.TempDir()}, nil, det, nil, nil, stubTxFactory(&got), nil, nil)
 
 	resp, err := svc.ApplyIntent(context.Background(), &agentv1.ApplyIntentRequest{
 		IntentId: "intent-point-none-nil-audit", Kind: "service", Target: "nginx.service",
@@ -108,7 +108,7 @@ func TestApplyIntent_PointNoneNilAuditDoesNotPanic(t *testing.T) {
 func TestSelectedBackend_RefusesUnknownCapabilityForVolume(t *testing.T) {
 	det := snapshot.NewDetector()
 	det.SetCapability(agentv1.SnapshotCapability(99))
-	svc := newAgentService(&config.Config{DataDir: t.TempDir()}, nil, det, nil, nil, nil, nil)
+	svc := newAgentService(&config.Config{DataDir: t.TempDir()}, nil, det, nil, nil, nil, nil, nil)
 
 	if _, err := svc.selectedBackend(rollback.PointVolume); err == nil {
 		t.Fatal("selectedBackend(PointVolume, unknown): nil err; want refusal")

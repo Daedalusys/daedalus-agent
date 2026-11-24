@@ -24,7 +24,7 @@ func (noopBackend) Restore(string, string) error        { return nil }
 // node_id 与 pending 集合,不需要 cert / snapshot 真值)。
 func heartbeatTestService(t *testing.T) *agentService {
 	t.Helper()
-	svc := newAgentService(&config.Config{DataDir: t.TempDir()}, nil, snapshot.NewDetector(), nil, nil, nil, nil)
+	svc := newAgentService(&config.Config{DataDir: t.TempDir()}, nil, snapshot.NewDetector(), nil, nil, nil, nil, nil)
 	svc.nodeID = "node-1"
 	return svc
 }
@@ -93,7 +93,7 @@ func (r *recordingTx) Run(_ context.Context, _ *agentv1.ApplyIntentRequest) (*ag
 func TestApplyIntent_MarksPendingDuringRun(t *testing.T) {
 	det := snapshot.NewDetector()
 	det.SetCapability(agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_BTRFS_SUBVOLUME)
-	svc := newAgentService(&config.Config{DataDir: t.TempDir()}, nil, det, nil, noopBackend{}, nil, nil)
+	svc := newAgentService(&config.Config{DataDir: t.TempDir()}, nil, det, nil, noopBackend{}, nil, nil, nil)
 
 	rt := &recordingTx{svc: svc}
 	svc.txFactory = func(rollback.Backend, string, *atomic.Uint64, *audit.Local) tx.Tx { return rt }

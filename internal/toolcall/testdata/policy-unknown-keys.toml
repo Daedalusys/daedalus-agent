@@ -1,0 +1,8 @@
+# 顶层未知键夹具:新增键由控制面演进引入,agent 必须忽略而不是报错。
+schema = "daedalus.policy/v0"
+mode = "enforce"
+future_knob = "ignored"
+future_section = { enabled = true }
+
+[remote_tools]
+"daedalus.shell" = ["shell_exec"]

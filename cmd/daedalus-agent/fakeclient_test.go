@@ -81,6 +81,8 @@ type fakeAgentClient struct {
 	heartbeatFn func(context.Context, *agentv1.HeartbeatRequest, ...grpc.CallOption) (*agentv1.HeartbeatResponse, error)
 	snapshotFn  func(context.Context, *agentv1.SnapshotRequestRequest, ...grpc.CallOption) (*agentv1.SnapshotResponse, error)
 	rollbackFn  func(context.Context, *agentv1.RollbackIntentRequest, ...grpc.CallOption) (*agentv1.RollbackIntentResponse, error)
+	listToolsFn func(context.Context, *agentv1.ListToolsRequest, ...grpc.CallOption) (*agentv1.ListToolsResponse, error)
+	callToolFn  func(context.Context, *agentv1.CallToolRequest, ...grpc.CallOption) (*agentv1.CallToolResponse, error)
 }
 
 func (f *fakeAgentClient) Register(ctx context.Context, in *agentv1.RegisterRequest, opts ...grpc.CallOption) (*agentv1.RegisterResponse, error) {
@@ -123,6 +125,20 @@ func (f *fakeAgentClient) RollbackIntent(ctx context.Context, in *agentv1.Rollba
 		return nil, status.Error(codes.Unimplemented, "stub 未设置")
 	}
 	return f.rollbackFn(ctx, in, opts...)
+}
+
+func (f *fakeAgentClient) ListTools(ctx context.Context, in *agentv1.ListToolsRequest, opts ...grpc.CallOption) (*agentv1.ListToolsResponse, error) {
+	if f.listToolsFn == nil {
+		return nil, status.Error(codes.Unimplemented, "stub 未设置")
+	}
+	return f.listToolsFn(ctx, in, opts...)
+}
+
+func (f *fakeAgentClient) CallTool(ctx context.Context, in *agentv1.CallToolRequest, opts ...grpc.CallOption) (*agentv1.CallToolResponse, error) {
+	if f.callToolFn == nil {
+		return nil, status.Error(codes.Unimplemented, "stub 未设置")
+	}
+	return f.callToolFn(ctx, in, opts...)
 }
 
 // dialRecorder 记录 dialClient 被调用时收到的配置与调用次数。

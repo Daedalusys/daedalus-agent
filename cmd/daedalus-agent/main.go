@@ -27,6 +27,7 @@ import (
 	"github.com/Daedalusys/daedalus-agent/internal/daemon"
 	"github.com/Daedalusys/daedalus-agent/internal/rpc"
 	"github.com/Daedalusys/daedalus-agent/internal/snapshot"
+	"github.com/Daedalusys/daedalus-agent/internal/toolcall"
 )
 
 // 版本自证:三个变量都由构建期 -ldflags "-X main.<name>=…" 注入,
@@ -274,11 +275,22 @@ func startRPCServer(cfg *config.Config) (*rpc.Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("audit: %w", err)
 	}
+	// 远程工具白名单:策略文件配了却读不懂是部署事故,启动就报错;没配
+	// [remote_tools] 的节点得到空白名单,等于没有远程面。
+	policy, err := toolcall.LoadPolicy(cfg.PolicyPath)
+	if err != nil {
+		return nil, fmt.Errorf("toolcall: %w", err)
+	}
+	var toolCaller *toolcall.Caller
+	if len(policy.RemoteTools) > 0 {
+		toolCaller = &toolcall.Caller{Policy: policy, Dialer: toolcall.NewSpawnDialer(version)}
+	}
 	rpcSrv, err := rpc.NewServer(rpc.DefaultListenAddr, tlsCfg, rpc.ServiceDeps{
-		Cfg:      cfg,
-		CertInfo: info,
-		Snapshot: snapshot.NewDetector(),
-		Audit:    auditLog,
+		Cfg:        cfg,
+		CertInfo:   info,
+		Snapshot:   snapshot.NewDetector(),
+		Audit:      auditLog,
+		ToolCaller: toolCaller,
 	})
 	if err != nil {
 		return nil, err

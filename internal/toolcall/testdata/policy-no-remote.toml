@@ -1,0 +1,3 @@
+# 没有任何远程面的策略夹具:只有既有顶层键,没有 [remote_tools]。
+schema = "daedalus.policy/v0"
+mode = "enforce"

@@ -1,0 +1,6 @@
+# 形状非法的策略夹具:[remote_tools] 的值是字符串,不是字符串数组。
+schema = "daedalus.policy/v0"
+mode = "enforce"
+
+[remote_tools]
+"daedalus.shell" = "shell_exec"

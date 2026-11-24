@@ -18,7 +18,7 @@ import (
 // 就拍不出有意义的快照。按 kind 划分的快照点在 ApplyIntent 里建;在这里
 // 猜一个目录拍下去,只会产出一份与 intent 无关的副本。
 func TestSnapshotRequest_RefusedNoTarget(t *testing.T) {
-	svc := newAgentService(&config.Config{DataDir: t.TempDir()}, nil, snapshot.NewDetector(), nil, noopBackend{}, nil, nil)
+	svc := newAgentService(&config.Config{DataDir: t.TempDir()}, nil, snapshot.NewDetector(), nil, noopBackend{}, nil, nil, nil)
 
 	_, err := svc.SnapshotRequest(context.Background(), &agentv1.SnapshotRequestRequest{Reason: "manual"})
 	if err == nil {

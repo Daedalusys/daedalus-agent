@@ -26,7 +26,7 @@ func TestApplyIntent_TreeUsesPathSetBackend(t *testing.T) {
 	}
 
 	svc := newAgentService(&config.Config{DataDir: dataDir}, nil, snapshot.NewDetector(), nil,
-		rollback.NewTreeBackend(dataDir), nil, nil)
+		rollback.NewTreeBackend(dataDir), nil, nil, nil)
 
 	resp, err := svc.ApplyIntent(context.Background(), &agentv1.ApplyIntentRequest{
 		IntentId:  "intent-tree",
@@ -72,7 +72,7 @@ func TestApplyIntent_TreeRejectsEscape(t *testing.T) {
 	}
 
 	svc := newAgentService(&config.Config{DataDir: dataDir}, nil, snapshot.NewDetector(), nil,
-		rollback.NewTreeBackend(dataDir), nil, nil)
+		rollback.NewTreeBackend(dataDir), nil, nil, nil)
 
 	resp, err := svc.ApplyIntent(context.Background(), &agentv1.ApplyIntentRequest{
 		IntentId:  "intent-escape",
@@ -110,7 +110,7 @@ func TestApplyIntent_LegacyFileUnchanged(t *testing.T) {
 	}
 
 	svc := newAgentService(&config.Config{DataDir: dataDir}, nil, snapshot.NewDetector(), nil,
-		&rollback.CopyBackend{}, nil, nil)
+		&rollback.CopyBackend{}, nil, nil, nil)
 
 	resp, err := svc.ApplyIntent(context.Background(), &agentv1.ApplyIntentRequest{
 		IntentId:  "intent-legacy",

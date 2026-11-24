@@ -1,0 +1,7 @@
+# 远程工具白名单夹具:一个 plugin 一个工具,用来锁「白名单内的放行、
+# 白名单外与别的 plugin 不串」。
+schema = "daedalus.policy/v0"
+mode = "enforce"
+
+[remote_tools]
+"daedalus.shell" = ["shell_exec"]

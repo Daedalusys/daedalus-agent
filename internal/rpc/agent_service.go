@@ -1,16 +1,17 @@
-// agent_service.go owns the agentService struct and its 5 RPC
-// handlers. T3 left an Unimplemented stub here; T5 wires the
-// real handlers on top of it.
+// agent_service.go owns the agentService struct and the shared
+// helpers behind its RPC handlers.
 //
 // Each RPC handler lives in its own file (register.go,
 // heartbeat.go, apply_intent.go, snapshot_request.go,
-// report_status.go) — this file is the struct composition +
-// shared helpers + the per-handler wiring.
+// report_status.go, rollback_intent.go, tool_call.go) — this
+// file is the struct composition + shared helpers + the
+// per-handler wiring.
 //
-// We embed agentv1.UnimplementedAgentServiceServer, which
-// provides default implementations that return codes.Unimplemented
-// for any future RPC the proto grows. T5 implements the 5 RPCs
-// in the spec; the embed is forward-compat for additions.
+// We embed agentv1.UnimplementedAgentServiceServer so that a
+// proto change compiles without touching this file. 注意:内嵌桩
+// 会让新增 RPC **编译照常通过**并在运行时静默返回
+// codes.Unimplemented —— 新方法必须自己落实现并加测试,不能指望
+// 编译器提醒。
 package rpc
 
 import (
@@ -31,6 +32,7 @@ import (
 	"github.com/Daedalusys/daedalus-agent/internal/exec"
 	"github.com/Daedalusys/daedalus-agent/internal/rollback"
 	"github.com/Daedalusys/daedalus-agent/internal/snapshot"
+	"github.com/Daedalusys/daedalus-agent/internal/toolcall"
 	"github.com/Daedalusys/daedalus-agent/internal/tx"
 )
 
@@ -48,10 +50,9 @@ import (
 // if the control plane flags false-positive dead nodes.
 const heartbeatIntervalSeconds = 30
 
-// agentService is the T5 production implementation of
-// agentv1.AgentServiceServer. All five RPCs are real handlers
-// (each in its own file); the embed keeps us forward-compatible
-// if the proto grows new RPCs.
+// agentService 是 agentv1.AgentServiceServer 的生产实现。每条 RPC 都有
+// 自己的 handler 文件;内嵌桩只负责让 proto 增长时编译不破,不提供任何
+// 真实行为。
 //
 // 并发:agentService 的可变状态(nodeID、pending)由 mu 保护。nodeID 在
 // Register 时写一次、之后只读;pending 在每次 ApplyIntent 前后成对变更。
@@ -126,6 +127,10 @@ type agentService struct {
 	// old agent registration.
 	nodeID string
 
+	// toolCaller 是节点侧只读工具调用面。nil 表示未配置:ListTools
+	// 返回空工具集,CallTool 一律 FailedPrecondition。
+	toolCaller *toolcall.Caller
+
 	// pending 按 intent_id 记"已受理但未完成"的 ApplyIntent 次数。
 	// Heartbeat 把它的总和回报成 pending_intents,让控制面看到真实的
 	// 在途工作量,而不是硬编码的 0。由 mu 保护。
@@ -140,10 +145,12 @@ type agentService struct {
 	startedAt time.Time
 }
 
-// Compile-time assertion that *agentService satisfies the
-// interface. If agentv1.AgentServiceServer grows a method
-// (forward-compat), the build will fail at this line — which is
-// exactly the signal we want: a proto change we must handle.
+// 编译期断言:*agentService 满足 agentv1.AgentServiceServer。
+//
+// 它**不**能发现 proto 新增方法:内嵌的 UnimplementedAgentServiceServer
+// 已经满足新方法,编译照常通过,节点在运行时对未实现的方法静默回
+// codes.Unimplemented。新增 RPC 必须自己补 handler 与测试 —— 这里只
+// 兜「接口本身被改签名」这一类编译期错误。
 var _ agentv1.AgentServiceServer = (*agentService)(nil)
 
 // RollbackRunner 执行一份回滚计划。
@@ -206,32 +213,18 @@ func (s *agentService) initRollbackTokens() error {
 	return nil
 }
 
-// newAgentService constructs a fresh agentService with the
-// supplied dependencies. main() (or a test helper) calls this
-// when bringing up the RPC server.
+// newAgentService 用注入的依赖构造 agentService。main() 与测试的 rig
+// 都走这里;所有可选依赖都用零值表达「未配置」。
 //
-// T6 adds auditSeq / backend / txFactory:
-//   - auditSeq is bumped by tx.Local on every ApplyIntent outcome
-//     (success / transient / persistent). Tests may pass nil —
-//     the agentService seeds a private counter in that case.
-//   - backend is an optional override for ApplyIntent. Production
-//     passes nil and the handler selects via rollback.SelectBackend
-//     per RPC. Tests pass a fake that records invocations without
-//     touching the host.
-//   - txFactory 是 ApplyIntent 事务构造的注入点。生产传 nil,handler 走
-//     默认的 tx.New + internal/exec 分派器;测试可换成 fake。
+// 参数语义:
+//   - auditSeq 由事务在每次 ApplyIntent 结局时推进;nil 时分配私有计数器。
+//   - backend 非 nil 时覆盖 ApplyIntent 的回滚后端选择(测试注入用)。
+//   - txFactory 非 nil 时替代 tx.New 构造事务;生产传 nil 走真实执行器。
+//   - auditLog 是进程级哈希链;nil 时 ReportStatus 返回空、事务不落链。
+//   - toolCaller 是只读工具调用面;nil 表示节点没有远程面。
 //
-// T7 adds audit:
-//   - audit is the per-process hash-chained audit log. nil
-//     is permitted for tests that don't exercise
-//     ReportStatus / ApplyIntent; the corresponding handlers
-//     then return empty responses (or no audit writes,
-//     respectively).
-//
-// startedAt is captured here so uptime is measured from
-// construction (which is shortly before serve, modulo
-// listener-bind time).
-func newAgentService(cfg *config.Config, certInfo *cert.Info, det *snapshot.Detector, auditSeq *atomic.Uint64, backend rollback.Backend, txFactory TxFactory, auditLog *audit.Local) *agentService {
+// startedAt 在构造时记下,uptime 从构造开始算(与实际监听只差 bind 时间)。
+func newAgentService(cfg *config.Config, certInfo *cert.Info, det *snapshot.Detector, auditSeq *atomic.Uint64, backend rollback.Backend, txFactory TxFactory, auditLog *audit.Local, toolCaller *toolcall.Caller) *agentService {
 	if auditSeq == nil {
 		auditSeq = new(atomic.Uint64)
 	}
@@ -243,6 +236,7 @@ func newAgentService(cfg *config.Config, certInfo *cert.Info, det *snapshot.Dete
 		backend:        backend,
 		txFactory:      txFactory,
 		audit:          auditLog,
+		toolCaller:     toolCaller,
 		rollbackRunner: rollback.NewStepRunner(),
 		pending:        map[string]int{},
 		startedAt:      time.Now().UTC(),
