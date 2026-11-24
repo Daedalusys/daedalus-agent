@@ -29,7 +29,7 @@ func TestApplyIntent_RefusalWritesAuditEvent(t *testing.T) {
 	}
 	det := snapshot.NewDetector()
 	det.SetCapability(agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE)
-	svc := newAgentService(&config.Config{DataDir: dir}, nil, det, nil, nil, stubTxFactory(nil), auditLog)
+	svc := newAgentService(&config.Config{DataDir: dir}, nil, det, nil, nil, stubTxFactory(nil), auditLog, nil)
 
 	resp, err := svc.ApplyIntent(context.Background(), &agentv1.ApplyIntentRequest{
 		IntentId: "intent-high-risk", Kind: "package", Target: "nginx",
@@ -81,7 +81,7 @@ func TestApplyIntent_UnknownKindRefusalWritesAuditEvent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("audit.New: %v", err)
 	}
-	svc := newAgentService(&config.Config{DataDir: dir}, nil, snapshot.NewDetector(), nil, nil, nil, auditLog)
+	svc := newAgentService(&config.Config{DataDir: dir}, nil, snapshot.NewDetector(), nil, nil, nil, auditLog, nil)
 
 	if _, err := svc.ApplyIntent(context.Background(), &agentv1.ApplyIntentRequest{
 		IntentId: "intent-unknown-kind", Kind: "widget", Target: "w-1",
@@ -104,7 +104,7 @@ func TestApplyIntent_UnknownKindRefusalWritesAuditEvent(t *testing.T) {
 func TestApplyIntent_RefusalNilAuditDoesNotPanic(t *testing.T) {
 	det := snapshot.NewDetector()
 	det.SetCapability(agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE)
-	svc := newAgentService(&config.Config{DataDir: t.TempDir()}, nil, det, nil, nil, stubTxFactory(nil), nil)
+	svc := newAgentService(&config.Config{DataDir: t.TempDir()}, nil, det, nil, nil, stubTxFactory(nil), nil, nil)
 
 	resp, err := svc.ApplyIntent(context.Background(), &agentv1.ApplyIntentRequest{
 		IntentId: "intent-nil-audit", Kind: "package", Target: "nginx",
@@ -131,7 +131,7 @@ func TestApplyIntent_RefusalIsNotPending(t *testing.T) {
 	}
 	det := snapshot.NewDetector()
 	det.SetCapability(agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE)
-	svc := newAgentService(&config.Config{DataDir: dir}, nil, det, nil, nil, stubTxFactory(nil), auditLog)
+	svc := newAgentService(&config.Config{DataDir: dir}, nil, det, nil, nil, stubTxFactory(nil), auditLog, nil)
 
 	if _, err := svc.ApplyIntent(context.Background(), &agentv1.ApplyIntentRequest{
 		IntentId: "intent-pending", Kind: "package", Target: "nginx",
@@ -160,7 +160,7 @@ func TestApplyIntent_AuditSeqIsNotChainSeq(t *testing.T) {
 
 	det := snapshot.NewDetector()
 	det.SetCapability(agentv1.SnapshotCapability_SNAPSHOT_CAPABILITY_NONE)
-	svc := newAgentService(&config.Config{DataDir: dir}, nil, det, new(atomic.Uint64), nil, stubTxFactory(nil), auditLog)
+	svc := newAgentService(&config.Config{DataDir: dir}, nil, det, new(atomic.Uint64), nil, stubTxFactory(nil), auditLog, nil)
 
 	resp, err := svc.ApplyIntent(context.Background(), &agentv1.ApplyIntentRequest{
 		IntentId: "intent-after-restart", Kind: "package", Target: "nginx",

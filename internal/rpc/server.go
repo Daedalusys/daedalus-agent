@@ -28,6 +28,7 @@ import (
 	"github.com/Daedalusys/daedalus-agent/internal/config"
 	"github.com/Daedalusys/daedalus-agent/internal/rollback"
 	"github.com/Daedalusys/daedalus-agent/internal/snapshot"
+	"github.com/Daedalusys/daedalus-agent/internal/toolcall"
 	"github.com/Daedalusys/daedalus-agent/internal/tx"
 )
 
@@ -104,6 +105,11 @@ type ServiceDeps struct {
 	// from cfg.AuditDir / cfg.DataDir). Tests may pass nil
 	// when they don't exercise ReportStatus.
 	Audit *audit.Local
+
+	// ToolCaller 是节点侧只读工具调用面。nil 表示未配置 ——
+	// ListTools 返回空工具集,CallTool 一律 FailedPrecondition,
+	// 节点上不存在这条横向通道。
+	ToolCaller *toolcall.Caller
 }
 
 // TxFactory constructs a per-RPC ApplyIntent transaction. Tests
@@ -156,7 +162,7 @@ func NewServer(addr string, tlsCfg *tls.Config, deps ServiceDeps) (*Server, erro
 	}
 	creds := credentials.NewTLS(tlsCfg)
 	gs := grpc.NewServer(grpc.Creds(creds))
-	svc := newAgentService(deps.Cfg, deps.CertInfo, det, deps.AuditSeq, deps.Backend, deps.TxFactory, deps.Audit)
+	svc := newAgentService(deps.Cfg, deps.CertInfo, det, deps.AuditSeq, deps.Backend, deps.TxFactory, deps.Audit, deps.ToolCaller)
 	if deps.RollbackRunner != nil {
 		svc.rollbackRunner = deps.RollbackRunner
 	}

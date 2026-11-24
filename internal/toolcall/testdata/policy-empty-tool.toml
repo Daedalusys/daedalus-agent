@@ -1,0 +1,6 @@
+# 空工具名夹具:数组元素是空串,属于 [remote_tools] 内的形状违规。
+schema = "daedalus.policy/v0"
+mode = "enforce"
+
+[remote_tools]
+"daedalus.shell" = [""]

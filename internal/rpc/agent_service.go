@@ -1,16 +1,11 @@
-// agent_service.go owns the agentService struct and its 5 RPC
-// handlers. T3 left an Unimplemented stub here; T5 wires the
-// real handlers on top of it.
+// agent_service.go 组装 agentService,并放置各 RPC 共用的助手。
 //
-// Each RPC handler lives in its own file (register.go,
-// heartbeat.go, apply_intent.go, snapshot_request.go,
-// report_status.go) — this file is the struct composition +
-// shared helpers + the per-handler wiring.
+// 每条 RPC 的 handler 各占一个文件(register / heartbeat / apply_intent /
+// snapshot_request / report_status / rollback_intent / tool_call);本文件
+// 只做结构体组合与共享逻辑。
 //
-// We embed agentv1.UnimplementedAgentServiceServer, which
-// provides default implementations that return codes.Unimplemented
-// for any future RPC the proto grows. T5 implements the 5 RPCs
-// in the spec; the embed is forward-compat for additions.
+// 内嵌 UnimplementedAgentServiceServer 让 proto 增长时编译不破,但新增 RPC
+// 会静默返回 codes.Unimplemented —— 必须自己落实现并加测试。
 package rpc
 
 import (
@@ -31,6 +26,7 @@ import (
 	"github.com/Daedalusys/daedalus-agent/internal/exec"
 	"github.com/Daedalusys/daedalus-agent/internal/rollback"
 	"github.com/Daedalusys/daedalus-agent/internal/snapshot"
+	"github.com/Daedalusys/daedalus-agent/internal/toolcall"
 	"github.com/Daedalusys/daedalus-agent/internal/tx"
 )
 
@@ -48,10 +44,9 @@ import (
 // if the control plane flags false-positive dead nodes.
 const heartbeatIntervalSeconds = 30
 
-// agentService is the T5 production implementation of
-// agentv1.AgentServiceServer. All five RPCs are real handlers
-// (each in its own file); the embed keeps us forward-compatible
-// if the proto grows new RPCs.
+// agentService 是 agentv1.AgentServiceServer 的生产实现。每条 RPC 都有
+// 自己的 handler 文件;内嵌桩只负责让 proto 增长时编译不破,不提供任何
+// 真实行为。
 //
 // 并发:agentService 的可变状态(nodeID、pending)由 mu 保护。nodeID 在
 // Register 时写一次、之后只读;pending 在每次 ApplyIntent 前后成对变更。
@@ -62,48 +57,34 @@ type agentService struct {
 
 	mu sync.Mutex // 保护 nodeID(首次 Register 时写入一次)与 pending
 
-	// cfg is the daemon's runtime config (agent_id, cert
-	// paths, etc.). The Register handler reads agent_id and
-	// PolicyPath from here: PolicyPath is read from disk to
-	// compute the response's policy_hash. The cert paths in cfg
-	// are consumed by main() to construct the TLS config.
+	// cfg 是守护进程的运行配置(agent_id、证书路径等)。Register handler 从
+	// 这里读 agent_id 与 PolicyPath:PolicyPath 要落盘读一遍算 policy_hash;
+	// cfg 里的证书路径由 main() 消费来构造 TLS 配置。
 	cfg *config.Config
 
-	// certInfo carries the cert's NotAfter + SHA-256
-	// fingerprint for the Register response. nil is acceptable
-	// for tests that don't care about the cert metadata; the
-	// Register handler emits CertValidUntilUnix=0 and an empty
-	// fingerprint in that case (the proto permits both).
+	// certInfo 带证书的 NotAfter 与 SHA-256 指纹,供 Register 响应使用。
+	// nil 可接受(不关心证书元信息的测试):此时 Register 回
+	// CertValidUntilUnix=0 与空指纹,proto 允许这种形态。
 	certInfo *cert.Info
 
-	// snapshot is the agent's snapshot-capability probe.
-	// Register reads it; ApplyIntent consults it to pick the
-	// rollback backend. SnapshotRequest no longer uses it (it
-	// carries no target path, so it refuses unconditionally).
+	// snapshot 是节点的快照能力探测器。Register 读它;ApplyIntent 用它选
+	// 回滚后端。SnapshotRequest 不用它(请求不带目标路径,一律拒绝)。
 	snapshot *snapshot.Detector
 
-	// auditSeq is the per-process monotonic audit sequence
-	// counter. ApplyIntent (via the tx state machine) bumps it
-	// on each tx outcome (success / transient / persistent).
-	// nil is permitted only in tests that don't reach
-	// ApplyIntent; the constructor seeds a private counter
-	// otherwise.
+	// auditSeq 是进程内单调递增的审计序号。ApplyIntent 经事务状态机在每次
+	// 结局时推进它。只有不走到 ApplyIntent 的测试才允许传 nil,构造器会
+	// 分配私有计数器。
 	auditSeq *atomic.Uint64
 
-	// audit is the per-process hash-chained audit log (T7).
-	// ReportStatus streams events from it; tx.Local writes
-	// success / failure events to it on every ApplyIntent
-	// outcome. nil is permitted for tests that don't
-	// exercise ReportStatus / ApplyIntent; the
-	// report_status handler then returns an empty response
-	// (the documented "no audit yet" wire shape).
+	// audit 是进程级哈希链审计日志。ReportStatus 从它取事件;事务在每次
+	// ApplyIntent 结局时写入成功 / 失败事件。不跑 ReportStatus /
+	// ApplyIntent 的测试允许传 nil,此时 report_status handler 返回空响应
+	// (即「还没有审计」的既有线格式)。
 	audit *audit.Local
 
-	// backend is an optional override for the per-RPC backend
-	// selection. If non-nil, it is used as-is by ApplyIntent
-	// (skipping SelectBackend). Production leaves this nil;
-	// tests inject a mock backend so the handler exercises the
-	// wired-up state machine without touching the host.
+	// backend 是每次 RPC 选回滚后端时的可选覆盖。非 nil 时 ApplyIntent
+	// 直接用它(跳过 SelectBackend)。生产留 nil;测试注入假后端,让 handler
+	// 走通状态机而不碰宿主。
 	backend rollback.Backend
 
 	// txFactory 非 nil 时用来替代 tx.New 构造每次 ApplyIntent 的事务;
@@ -118,13 +99,14 @@ type agentService struct {
 	// 命令都没执行"。
 	rollbackRunner RollbackRunner
 
-	// nodeID is the control-plane-assigned identifier for
-	// this agent. It is empty until the first successful
-	// Register, then stable for the daemon's lifetime. The
-	// Heartbeat handler rejects requests whose node_id does
-	// not match — preventing a stale client from driving an
-	// old agent registration.
+	// nodeID 是控制面分配的节点标识。首次 Register 成功后写一次,此后在进程
+	// 生命周期内不变。Heartbeat handler 拒绝 node_id 不匹配的请求,避免陈旧
+	// 客户端驱动旧注册。
 	nodeID string
+
+	// toolCaller 是节点侧只读工具调用面。nil 表示未配置:ListTools
+	// 返回空工具集,CallTool 一律 FailedPrecondition。
+	toolCaller *toolcall.Caller
 
 	// pending 按 intent_id 记"已受理但未完成"的 ApplyIntent 次数。
 	// Heartbeat 把它的总和回报成 pending_intents,让控制面看到真实的
@@ -134,16 +116,17 @@ type agentService struct {
 	// 的那次不能把仍在跑的那次一起抹掉(否则计数会少报)。
 	pending map[string]int
 
-	// startedAt is the wall-clock the service was constructed.
-	// It is informational only in T5 (a future health-check
-	// RPC could surface uptime); not yet surfaced.
+	// startedAt 是服务构造时的墙钟时间。目前只作信息保留(将来的健康检查
+	// RPC 可以据此暴露 uptime),尚未对外。
 	startedAt time.Time
 }
 
-// Compile-time assertion that *agentService satisfies the
-// interface. If agentv1.AgentServiceServer grows a method
-// (forward-compat), the build will fail at this line — which is
-// exactly the signal we want: a proto change we must handle.
+// 编译期断言:*agentService 满足 agentv1.AgentServiceServer。
+//
+// 它**不**能发现 proto 新增方法:内嵌的 UnimplementedAgentServiceServer
+// 已经满足新方法,编译照常通过,节点在运行时对未实现的方法静默回
+// codes.Unimplemented。新增 RPC 必须自己补 handler 与测试 —— 这里只
+// 兜「接口本身被改签名」这一类编译期错误。
 var _ agentv1.AgentServiceServer = (*agentService)(nil)
 
 // RollbackRunner 执行一份回滚计划。
@@ -206,32 +189,18 @@ func (s *agentService) initRollbackTokens() error {
 	return nil
 }
 
-// newAgentService constructs a fresh agentService with the
-// supplied dependencies. main() (or a test helper) calls this
-// when bringing up the RPC server.
+// newAgentService 用注入的依赖构造 agentService。main() 与测试的 rig
+// 都走这里;所有可选依赖都用零值表达「未配置」。
 //
-// T6 adds auditSeq / backend / txFactory:
-//   - auditSeq is bumped by tx.Local on every ApplyIntent outcome
-//     (success / transient / persistent). Tests may pass nil —
-//     the agentService seeds a private counter in that case.
-//   - backend is an optional override for ApplyIntent. Production
-//     passes nil and the handler selects via rollback.SelectBackend
-//     per RPC. Tests pass a fake that records invocations without
-//     touching the host.
-//   - txFactory 是 ApplyIntent 事务构造的注入点。生产传 nil,handler 走
-//     默认的 tx.New + internal/exec 分派器;测试可换成 fake。
+// 参数语义:
+//   - auditSeq 由事务在每次 ApplyIntent 结局时推进;nil 时分配私有计数器。
+//   - backend 非 nil 时覆盖 ApplyIntent 的回滚后端选择(测试注入用)。
+//   - txFactory 非 nil 时替代 tx.New 构造事务;生产传 nil 走真实执行器。
+//   - auditLog 是进程级哈希链;nil 时 ReportStatus 返回空、事务不落链。
+//   - toolCaller 是只读工具调用面;nil 表示节点没有远程面。
 //
-// T7 adds audit:
-//   - audit is the per-process hash-chained audit log. nil
-//     is permitted for tests that don't exercise
-//     ReportStatus / ApplyIntent; the corresponding handlers
-//     then return empty responses (or no audit writes,
-//     respectively).
-//
-// startedAt is captured here so uptime is measured from
-// construction (which is shortly before serve, modulo
-// listener-bind time).
-func newAgentService(cfg *config.Config, certInfo *cert.Info, det *snapshot.Detector, auditSeq *atomic.Uint64, backend rollback.Backend, txFactory TxFactory, auditLog *audit.Local) *agentService {
+// startedAt 在构造时记下,uptime 从构造开始算(与实际监听只差 bind 时间)。
+func newAgentService(cfg *config.Config, certInfo *cert.Info, det *snapshot.Detector, auditSeq *atomic.Uint64, backend rollback.Backend, txFactory TxFactory, auditLog *audit.Local, toolCaller *toolcall.Caller) *agentService {
 	if auditSeq == nil {
 		auditSeq = new(atomic.Uint64)
 	}
@@ -243,6 +212,7 @@ func newAgentService(cfg *config.Config, certInfo *cert.Info, det *snapshot.Dete
 		backend:        backend,
 		txFactory:      txFactory,
 		audit:          auditLog,
+		toolCaller:     toolCaller,
 		rollbackRunner: rollback.NewStepRunner(),
 		pending:        map[string]int{},
 		startedAt:      time.Now().UTC(),
