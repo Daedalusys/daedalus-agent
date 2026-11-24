@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/BurntSushi/toml v1.6.0
-	github.com/Daedalusys/daedalus-sdk v0.1.3
+	github.com/Daedalusys/daedalus-sdk v0.6.0
 	github.com/modelcontextprotocol/go-sdk v1.8.0
 	github.com/spf13/cobra v1.10.2
 	google.golang.org/grpc v1.84.0

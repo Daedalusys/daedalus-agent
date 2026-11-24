@@ -44,6 +44,23 @@ func TestLoadPolicy_UnreadableFileIsError(t *testing.T) {
 	}
 }
 
+func TestLoadPolicy_ErrorIncludesPolicyPath(t *testing.T) {
+	// 值班人靠报错定位是哪个文件;路径必须在错误文本里。
+	cases := []string{
+		"testdata/policy-bad-remote.toml",
+		"testdata/does-not-exist.toml",
+	}
+	for _, path := range cases {
+		_, err := LoadPolicy(path)
+		if err == nil {
+			t.Fatalf("%s: 期望报错", path)
+		}
+		if !strings.Contains(err.Error(), path) {
+			t.Errorf("%s: 错误信息必须带策略路径,得到 %v", path, err)
+		}
+	}
+}
+
 func TestLoadPolicy_UnknownTopLevelKeysAreIgnored(t *testing.T) {
 	// 策略文件由控制面下发,顶层键会演进;多一个键不能把远程面整段打掉。
 	p, err := LoadPolicy("testdata/policy-unknown-keys.toml")

@@ -279,7 +279,7 @@ func startRPCServer(cfg *config.Config) (*rpc.Server, error) {
 	// [remote_tools] 的节点得到空白名单,等于没有远程面。
 	policy, err := toolcall.LoadPolicy(cfg.PolicyPath)
 	if err != nil {
-		return nil, fmt.Errorf("toolcall: %w", err)
+		return nil, fmt.Errorf("加载远程工具白名单: %w", err)
 	}
 	var toolCaller *toolcall.Caller
 	if len(policy.RemoteTools) > 0 {

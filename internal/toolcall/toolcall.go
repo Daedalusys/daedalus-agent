@@ -154,10 +154,10 @@ func (c *Caller) CallTool(ctx context.Context, pluginID, toolName, argsJSON stri
 	return res, nil
 }
 
-// 插件根目录与 daedalus-host 的同名环境变量保持同一套约定。
+// 插件根目录与 daedalus-host 共用同一个环境变量:镜像级只配一处。
 const (
 	defaultPluginDir = "/opt/daedalus/plugins"
-	pluginDirEnv     = "DAEDALUS_AGENT_PLUGIN_DIR"
+	pluginDirEnv     = "DAEDALUS_PLUGIN_DIR"
 	// denoBinary 与宿主渲染 systemd 单元时用的路径一致;deno 插件由
 	// entrypoint 携带权限旗标,脚本路径放在参数尾部。
 	denoBinary = "/usr/local/bin/deno"
@@ -173,8 +173,8 @@ type spawnDialer struct {
 	version string
 }
 
-// NewSpawnDialer 构造生产 Dialer。插件根目录可用 DAEDALUS_AGENT_PLUGIN_DIR
-// 覆盖,version 进 MCP 客户端自报的实现信息。
+// NewSpawnDialer 构造生产 Dialer。插件根目录可用 DAEDALUS_PLUGIN_DIR
+// 覆盖(与 daedalus-host 同一个变量),version 进 MCP 客户端自报的实现信息。
 func NewSpawnDialer(version string) Dialer {
 	root := os.Getenv(pluginDirEnv)
 	if root == "" {
